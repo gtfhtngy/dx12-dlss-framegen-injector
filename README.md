@@ -25,7 +25,7 @@ It includes automatic detection of different UE4 view-buffer layouts to improve 
 | Game            | Engine | API   | Result     | Notes                                      |
 |-----------------|--------|-------|------------|--------------------------------------------|
 | Scarlet Nexus   | UE4    | DX12  | Working    | Primary test case                          |
-| Code Vein       | UE4    | DX12  | Working    | Older UE4 view-buffer layout supported     |
+| Code Vein       | UE4    | DX12  | Working    | Older UE4 view-buffer layout supported (DX12 Makes the game crashes after the end cutscene)    |
 
 ## Installation
 
