@@ -45,7 +45,7 @@ It includes automatic detection of different UE4 view-buffer layouts to improve 
 Get the Streamline files from NVIDIA's official repository
 (https://github.com/NVIDIAGameWorks/Streamline). Use the **production**
 (not development) DLLs from the SDK's `bin/x64` folder. Use the same SDK
-version for all files. The versions I tested with: **[fill in, e.g. 2.x.x]**.
+version for all files. The versions I tested with: **2.14.1**.
 
 These files are NOT included in this repository or in the releases.
 
