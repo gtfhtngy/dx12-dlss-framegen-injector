@@ -1,0 +1,33 @@
+# Scarlet Nexus - DLSS Frame Generation (Streamline) config
+# fg        : 1 = on, 0 = off
+# mult      : 2 = 2x (1 generated frame). 3/4 need an RTX 50 series card (clamped automatically)
+# stage     : 0 = pass-through, 1 = only init Streamline + log feature support, 2 = full frame generation
+# log       : 1 = write SN_DLSSG_log.txt + Streamline log files next to the exe
+# hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)
+# hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')
+# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance
+# camauto   : 1 = (default) automatically find the camera matrices in the UE4 view buffer when projoff/noaaoff/mvoff do not match this game (log: cam-scan LOCKED ...)
+# projoff/noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 in Scarlet Nexus)
+# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)
+# warmup    : frames before frame generation is switched on
+# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)
+# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)
+# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)
+# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)
+fg=1
+mult=2
+stage=2
+log=0
+hudless=0
+hudlessdraw=2
+renderw=2000
+renderh=1124
+tol=100
+mvoff=492
+warmup=150
+reflexsleep=1
+baseFpsLimit=0
+showconsole=0
+shadercache=1
+splash=1
+sldir=
