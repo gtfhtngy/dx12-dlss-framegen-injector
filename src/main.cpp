@@ -77,6 +77,7 @@ struct Cfg {
     int warmup = 150;        // frames to wait before enabling
     int camStale = 6;        // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view)
     int farPlane = 1000000;
+    int camAuto = 1;         // 1 = if the view buffer is not found at projoff/noaaoff/mvoff, scan the buffer and lock onto the real offsets (other UE4 games)
     int reflexSleep = 1;     // 1 = call slReflexSleep every frame (needed for DLSS-G pacing)
     int baseFpsLimit = 0;    // Reflex frame limiter for the BASE frame rate (needs reflexsleep=1)
     int showConsole = 0;     // only works with the 'development' Streamline DLLs
@@ -112,7 +113,7 @@ static void LoadCfg() {
                 "# hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)\n"
                 "# hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')\n"
                 "# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance\n"
-                "# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)\n"
+                "# camauto   : 1 = (default) automatically find the camera matrices in the UE4 view buffer when projoff/noaaoff/mvoff do not match this game (log: cam-scan LOCKED ...)\n# projoff/noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 in Scarlet Nexus)\n# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)\n"
                 "# warmup    : frames before frame generation is switched on\n"
                 "# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)\n"
                 "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
@@ -133,7 +134,7 @@ static void LoadCfg() {
             else if (!strcmp(k, "renderw")) g_cfg.renderW = iv; else if (!strcmp(k, "renderh")) g_cfg.renderH = iv; else if (!strcmp(k, "tol")) g_cfg.tol = iv;
             else if (!strcmp(k, "mvoff")) g_cfg.mvOff = iv; else if (!strcmp(k, "noaaoff")) g_cfg.noAAOff = iv; else if (!strcmp(k, "projoff")) g_cfg.projOff = iv;
             else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
-            else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv;
+            else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv; else if (!strcmp(k, "camauto")) g_cfg.camAuto = iv;
             else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
             else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
             else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
@@ -290,6 +291,9 @@ static UINT g_rtvInc = 0, g_dsvInc = 0;
 static ID3D12Device* g_device = nullptr;
 static ID3D12CommandQueue* g_queue = nullptr;          // the game's direct queue (the one the swap chain was created with)
 static std::atomic<int> g_frame{0};
+static std::atomic<int> g_effW{0}, g_effH{0};   // real size of the pinned depth/velocity buffers (0 = not known yet -> cfg renderw/renderh)
+static inline int EffW() { int v = g_effW.load(); return v ? v : g_cfg.renderW; }
+static inline int EffH() { int v = g_effH.load(); return v ? v : g_cfg.renderH; }
 static ID3D12Resource* g_pinVel = nullptr; static ID3D12Resource* g_pinDepth = nullptr;
 
 static void RegisterRes(ID3D12Resource* res) {
@@ -347,23 +351,134 @@ static void RegisterUploadBuf(ID3D12Resource* r) {
     r->AddRef();
     g_bufs[r->GetGPUVirtualAddress()] = { d.Width, r, (BYTE*)ptr };
 }
+static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0}, g_projSeen{0}, g_scanRuns{0}; static std::atomic<int> g_camLocked{0};
+static int g_lastJitFrame = -1000;
+static bool IsProj(const float* m, bool loose) {
+    float ref = (float)EffW() / (float)EffH(); float asp = m[5] / m[0];
+    bool aspOk = loose ? (asp > 1.2f && asp < 2.6f) : fabsf(asp - ref) < 0.03f;
+    return m[0] > 0.2f && m[5] > 0.2f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f && m[4] == 0.f && m[6] == 0.f && m[7] == 0.f
+        && fabsf(m[11]) == 1.f && m[12] == 0.f && m[13] == 0.f && m[15] == 0.f && aspOk;
+}
+static bool LooksLikeC2P(const float* c) {
+    for (int i = 0; i < 16; i++) if (!std::isfinite(c[i]) || fabsf(c[i]) > 4.f) return false;
+    return fabsf(c[0] - 1.f) < 0.5f && fabsf(c[5] - 1.f) < 0.5f && fabsf(c[10] - 1.f) < 0.5f && fabsf(c[15] - 1.f) < 0.5f;
+}
+// Auto-detect: find ViewToClip (jittered) + ViewToClipNoAA (+16..64 floats later) + ClipToPrevClip (identity-like) in a UE4 view uniform buffer
+static void DumpViewBuf(const float* p, int avail, UINT64 off, const char* why) {
+    static int nd = 0, lastFr = -100000; int fr = g_frame.load();
+    if (nd >= 4 || fr < 300 || fr - lastFr < 300) return;
+    nd++; lastFr = fr;
+    FILE* f = _wfopen((g_dir + L"\\SN_DLSSG_viewbuf.txt").c_str(), L"a"); if (!f) return;
+    fprintf(f, "=== dump %d frame %d bufoffset %llu floats %d (%s) ===\n", nd, fr, (unsigned long long)off, avail, why);
+    for (int i = 0; i + 4 <= avail; i += 4) fprintf(f, "%4d: %.8g %.8g %.8g %.8g\n", i, p[i], p[i + 1], p[i + 2], p[i + 3]);
+    fclose(f); Log("cam-scan: wrote view-buffer dump %d to SN_DLSSG_viewbuf.txt (move/rotate the camera a bit before the next one)", nd);
+}
+static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
+    static int s_frame = -1, s_budget = 0; int fr = g_frame.load();
+    if (fr != s_frame) { s_frame = fr; s_budget = 600; } if (s_budget-- <= 0) return;
+    g_scanRuns++;
+    int ji = -1, nj = -1;
+    for (int i = 0; i + 16 <= avail && ji < 0; i += 4) {
+        if (!IsProj(p + i, true)) continue; g_projSeen++;
+        for (int j = i + 4; j <= i + 128 && j + 16 <= avail; j += 4) {
+            const float* a = p + i; const float* b = p + j;
+            if (IsProj(b, true) && fabsf(b[8]) < 1e-9f && fabsf(b[9]) < 1e-9f && fabsf(a[0] - b[0]) <= 1e-5f * fabsf(a[0]) && fabsf(a[5] - b[5]) <= 1e-5f * fabsf(a[5]) && ((a[8] != 0.f || a[9] != 0.f) || !memcmp(a, b, 64))) { ji = i; nj = j; break; }
+        }
+    }
+    if (ji < 0) {
+        static unsigned seen[16]; static int nseen = 0, nlog = 0; unsigned h = 2166136261u; int cnt = 0; char line[900]; int len = 0; line[0] = 0;
+        for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(p + i, true)) { cnt++; h = (h ^ (unsigned)i) * 16777619u; if (len < 760) len += snprintf(line + len, sizeof line - len, " [%d: m0=%.4f m5=%.4f m8=%.5f m9=%.5f m10=%.3f m11=%.1f m14=%.3f]", i, p[i], p[i + 5], p[i + 8], p[i + 9], p[i + 10], p[i + 11], p[i + 14]); }
+        int jc = 0; for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(p + i, true) && (p[i + 8] != 0.f || p[i + 9] != 0.f)) jc++;
+        if (jc >= 2) DumpViewBuf(p, avail, off, "2+ jittered projections, no NoAA pair");
+        if (cnt > 0 && nlog < 25) { bool dup = false; for (int q = 0; q < nseen; q++) if (seen[q] == h) dup = true; if (!dup) { if (nseen < 16) seen[nseen++] = h; nlog++; Log("cam-scan: no jittered/NoAA pair, but %d projection-like matrices (buffer offset %llu, avail %d floats):%s", cnt, (unsigned long long)off, avail, line); } }
+        return;
+    }
+    int k = -1; for (int q = nj + 16; q + 16 <= avail; q += 4) if (LooksLikeC2P(p + q)) { k = q; break; }
+    static int n = 0; static int li = -1, lj = -1, lk = -1, hits = 0;
+    if (k < 0) { DumpViewBuf(p, avail, off, "pair found, no ClipToPrevClip"); if (n++ < 10) Log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)off, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
+    if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (n++ < 20) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
+    if (hits >= 5) {
+        g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1;
+        Log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> put these three lines in SN_DLSSG_cfg.txt to skip the scan next time", ji, nj, k);
+    }
+}
+
+// ---- "legacy" UE4 view-buffer layout (CODE VEIN 1; found from the raw dumps): no ClipToPrevClip / ViewToClipNoAA in the buffer.
+//   float index: 16 WorldToClip(jittered) | 96 ViewToClip(jittered) | 252 PrevViewProj(prev jitter) | 456 TemporalAAJitter(cur xy, prev xy) | 472 ViewSizeAndInvSize
+//   ClipToPrevClip (no-AA) is built here: C = inverse(WorldToClip_noAA) * PrevViewProj_noAA   (row-vector convention like UE)
+static bool Inv4d(const double* m, double* out) {
+    double a[4][8]; for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { a[r][c] = m[r * 4 + c]; a[r][4 + c] = (r == c) ? 1.0 : 0.0; }
+    for (int i = 0; i < 4; i++) {
+        int piv = i; for (int r = i + 1; r < 4; r++) if (fabs(a[r][i]) > fabs(a[piv][i])) piv = r;
+        if (fabs(a[piv][i]) < 1e-30) return false;
+        if (piv != i) for (int c = 0; c < 8; c++) std::swap(a[i][c], a[piv][c]);
+        double d = 1.0 / a[i][i]; for (int c = 0; c < 8; c++) a[i][c] *= d;
+        for (int r = 0; r < 4; r++) if (r != i) { double f = a[r][i]; if (f != 0.0) for (int c = 0; c < 8; c++) a[r][c] -= f * a[i][c]; }
+    }
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][4 + c];
+    return true;
+}
+static int g_lastRealViewFrame = -100000;
+static bool TryLegacyLayout(const float* p, int availF) {
+    if (availF < 480) return false;
+    const float* a = p + 96;
+    if (!IsProj(a, false)) return false;
+    if (fabsf(p[456] - a[8]) > 1e-7f || fabsf(p[457] - a[9]) > 1e-7f) return false;                 // TemporalAAJitter must match the projection
+    if (!(p[472] >= 320.f && p[473] >= 200.f) || fabsf(p[472] / p[473] - a[5] / a[0]) > 0.05f) return false;   // ViewSizeAndInvSize consistent with the projection aspect
+    if (fabsf(p[458]) > 0.02f || fabsf(p[459]) > 0.02f || !std::isfinite(p[458]) || !std::isfinite(p[459])) return false;
+    for (int i = 0; i < 16; i++) if (!std::isfinite(p[16 + i]) || !std::isfinite(p[252 + i])) return false;
+    // main camera vs. dummy identity view (UI / default view): identity rotation + zero pre-view translation
+    static const float kRot[16] = { 0,0,1,0, 1,0,0,0, 0,1,0,0, 0,0,0,1 };
+    bool dummy = !memcmp(p + 32, kRot, sizeof kRot) && !memcmp(p, p + 16, 64);
+    int fr = g_frame.load();
+    if (!dummy) g_lastRealViewFrame = fr; else if (fr - g_lastRealViewFrame < 120) return true;   // a real view was seen recently: ignore the dummy view (return true = handled)
+    double W[16], Wp[16], Wi[16], C[16];
+    double jx = p[456], jy = p[457], pjx = p[458], pjy = p[459];
+    for (int i = 0; i < 16; i++) { W[i] = p[16 + i]; Wp[i] = p[252 + i]; }
+    for (int r = 0; r < 4; r++) { W[r * 4 + 0] -= W[r * 4 + 3] * jx; W[r * 4 + 1] -= W[r * 4 + 3] * jy; Wp[r * 4 + 0] -= Wp[r * 4 + 3] * pjx; Wp[r * 4 + 1] -= Wp[r * 4 + 3] * pjy; }
+    if (!Inv4d(W, Wi)) return true;
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { double v = 0; for (int k = 0; k < 4; k++) v += Wi[r * 4 + k] * Wp[k * 4 + c]; C[r * 4 + c] = v; }
+    float c2p[16], vtc[16]; for (int i = 0; i < 16; i++) { c2p[i] = (float)C[i]; if (!std::isfinite(c2p[i]) || fabsf(c2p[i]) > 1e6f) return true; }
+    memcpy(vtc, a, sizeof vtc); vtc[8] = 0.f; vtc[9] = 0.f;   // ViewToClipNoAA = ViewToClip without the jitter
+    { std::lock_guard<std::mutex> lk2(g_camMx);
+      memcpy(g_vtcNoAA, vtc, sizeof g_vtcNoAA); memcpy(g_c2p, c2p, sizeof g_c2p);
+      g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY;
+      g_camFrame = fr; }
+    if (g_lastJitFrame < fr) g_lastJitFrame = fr;
+    static int n = 0; if (n++ < 8) Log("camera(legacy layout): frame=%d %s jitter px=(%.4f,%.4f) m0=%.5f m5=%.5f near=%.3f viewsize=%.0fx%.0f c2p diag=%.5f %.5f %.5f %.5f", fr, dummy ? "DUMMY-identity-view" : "main-view", g_jitPX, g_jitPY, a[0], a[5], a[14], p[472], p[473], c2p[0], c2p[5], c2p[10], c2p[15]);
+    return true;
+}
 static void TrackCamera(UINT64 va) {
+    g_cbvCalls++;
     std::lock_guard<std::mutex> lk(g_bufMx);
-    auto it = g_bufs.upper_bound(va); if (it == g_bufs.begin()) return; --it;
-    UINT64 off = va - it->first; if (off + (UINT64)(std::max(g_cfg.mvOff + 16, 148)) * 4 > it->second.size) return;
+    auto it = g_bufs.upper_bound(va); if (it == g_bufs.begin()) { g_cbvMiss++; return; } --it;
+    UINT64 off = va - it->first; if (off >= it->second.size) { g_cbvMiss++; return; }
+    int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 3072);
     const float* p = (const float*)(it->second.map + off);
-    const float* a = p + g_cfg.projOff; const float* b = p + g_cfg.noAAOff;
-    auto isproj = [&](const float* m) { return m[0] > 0.2f && m[5] > 0.2f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f && m[4] == 0.f && m[6] == 0.f && m[7] == 0.f
-        && fabsf(m[11]) == 1.f && m[12] == 0.f && m[13] == 0.f && m[15] == 0.f && fabsf(m[5] / m[0] - (float)g_cfg.renderW / (float)g_cfg.renderH) < 0.02f; };
-    if (!isproj(a) || !isproj(b) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) return;
-    if (a[8] == 0.f && a[9] == 0.f) return;   // un-jittered view of a non-TAA pass: keep the last real one
-    const float* c = p + g_cfg.mvOff; bool ok = true; for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) ok = false;
-    if (!ok) return;
+    bool strict = availF >= std::max(g_cfg.mvOff + 16, 148) && g_cfg.projOff >= 0 && g_cfg.noAAOff >= 0 && g_cfg.mvOff >= 0;
+    const float* a = nullptr; const float* b = nullptr; const float* c = nullptr;
+    if (strict) { a = p + g_cfg.projOff; b = p + g_cfg.noAAOff; c = p + g_cfg.mvOff;
+        if (!IsProj(a, false) || !IsProj(b, false) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) strict = false; }
+    if (strict) { for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) strict = false; }
+    if (!strict) {
+        if (g_cfg.camAuto && TryLegacyLayout(p, availF)) return;
+        if (g_cfg.camAuto && !g_camLocked.load() && availF >= 64) {
+            // upload heaps are write-combined = very slow to read: only look at buffers that are bound many times per frame (the view buffer), max 4 per frame
+            static int vaFrame = -1, scans = 0; static std::unordered_map<UINT64, int> cnt; int fr0 = g_frame.load();
+            if (fr0 != vaFrame) { vaFrame = fr0; scans = 0; cnt.clear(); }
+            if (++cnt[va] == 3 && scans < 4) { scans++; static float tmp[3072]; int nf = std::min(availF, 3072); memcpy(tmp, p, (size_t)nf * 4); ScanViewBuffer(tmp, nf, off); }
+        }
+        return;
+    }
+    int fr = g_frame.load();
+    bool jittered = (a[8] != 0.f || a[9] != 0.f);
+    if (jittered) g_lastJitFrame = fr;
+    else if (fr - g_lastJitFrame < 90) return;   // un-jittered view of a non-TAA pass while TAA is active: keep the last real one (no TAA at all -> accepted after 90 frames)
     std::lock_guard<std::mutex> lk2(g_camMx);
     memcpy(g_vtcNoAA, b, sizeof g_vtcNoAA); memcpy(g_c2p, c, sizeof g_c2p);
-    g_jitPX = a[8] * 0.5f * (float)g_cfg.renderW * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)g_cfg.renderH * (float)g_cfg.jitSY;
-    g_camFrame = g_frame.load();
-    static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f", g_frame.load(), g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15]);
+    g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY;
+    g_camFrame = fr;
+    static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f%s", fr, g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15], jittered ? "" : " (NO TAA jitter)");
 }
 
 // ---- hooks on the native D3D12 vtables
@@ -640,6 +755,7 @@ static void UpdatePins() {
         if ((m.flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && score > bd) { bd = score; bestDep = m.res; }
         if (m.fmt == DXGI_FORMAT_R16G16_UNORM && score > bv) { bv = score; bestVel = m.res; } } }
     g_pinVel = bestVel; g_pinDepth = bestDep;
+    if (bestDep) { D3D12_RESOURCE_DESC dd = ResDesc(bestDep); if ((int)dd.Width != g_effW.load() || (int)dd.Height != g_effH.load()) { g_effW = (int)dd.Width; g_effH = (int)dd.Height; Log("render size from pinned depth buffer: %dx%d", g_effW.load(), g_effH.load()); } }
 }
 
 // ------------------------------------------------------------------ 4x4 helpers + constants
@@ -672,7 +788,7 @@ static bool BuildConstants(sl::Constants& c, bool reset) {
     if (!Inv4(vtc, inv1) || !Inv4(c2p, inv2)) return false;
     ToSl(vtc, c.cameraViewToClip); ToSl(inv1, c.clipToCameraView); ToSl(c2p, c.clipToPrevClip); ToSl(inv2, c.prevClipToClip);
     c.jitterOffset = sl::float2(j[0], j[1]);
-    c.mvecScale = sl::float2(1.0f / (float)g_cfg.renderW, 1.0f / (float)g_cfg.renderH);
+    c.mvecScale = sl::float2(1.0f / (float)EffW(), 1.0f / (float)EffH());
     c.cameraPinholeOffset = sl::float2(0.f, 0.f);
     c.cameraPos = sl::float3(0.f, 0.f, 0.f); c.cameraUp = sl::float3(0.f, 1.f, 0.f); c.cameraRight = sl::float3(1.f, 0.f, 0.f); c.cameraFwd = sl::float3(0.f, 0.f, 1.f);
     float nearP = vtc[14]; if (!(nearP > 0.f) || !std::isfinite(nearP)) nearP = 10.f;
@@ -770,7 +886,9 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     int fr = ++g_frame; int bbd = g_bbDraws.exchange(0);
     if (fr == 1 || (fr % 600) == 0) {
         DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; }
+        size_t nb_; { std::lock_guard<std::mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
         Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_camFrame.load(), bbd);
+        Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_projSeen.load(), g_scanRuns.load(), g_camLocked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
     }
     UpdatePins();
     if (!g_slInitOk || g_cfg.stage < 1) return ctx;
