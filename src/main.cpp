@@ -1,0 +1,1037 @@
+// SN_DLSSG - real NVIDIA DLSS Frame Generation (via Streamline / sl.dlss_g) injector, D3D12.
+// Proxy for winmm.dll. Written for Scarlet Nexus (UE4, D3D12) - separate from the DLAA/DLSS-SR project.
+//
+// What it does:
+//   1. Loads sl.interposer.dll (+ plugins next to it) and calls slInit BEFORE the game creates its D3D12 device.
+//   2. Inline-hooks D3D12CreateDevice / CreateDXGIFactory* and redirects them to the Streamline interposer,
+//      so Streamline sees the device/factory/swap chain (automatic hooking mode).
+//   3. Finds the UE4 depth + velocity buffers and the view uniform buffer (camera matrices) exactly like the DLAA project,
+//      converts velocity -> pixel motion vectors with a small compute shader and tags depth / MVs (and optionally a
+//      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
+//      DLSS-G options (mode on, numFramesToGenerate = mult-1).
+// NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <d3dcommon.h>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <map>
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+#include <cstdint>
+#include <algorithm>
+#include <cmath>
+#include <cfloat>
+
+#include "MinHook.h"
+#include <sl.h>
+#include <sl_consts.h>
+#include <sl_dlss_g.h>
+#include <sl_reflex.h>
+#include <sl_pcl.h>
+
+// ------------------------------------------------------------------ winmm forwarding (same as FG v5)
+#include "winmm_stubs.inc"
+extern "C" { void* g_fwd[WINMM_EXPORT_COUNT]; }
+static HMODULE g_realWinmm = nullptr;
+static void LoadRealWinmm() {
+    if (g_realWinmm) return;
+    wchar_t p[MAX_PATH]; GetSystemDirectoryW(p, MAX_PATH); wcscat(p, L"\\winmm.dll");
+    g_realWinmm = LoadLibraryW(p);
+    if (!g_realWinmm) return;
+    for (int i = 0; i < WINMM_EXPORT_COUNT; i++) g_fwd[i] = (void*)GetProcAddress(g_realWinmm, g_fwdNames[i]);
+}
+
+// ------------------------------------------------------------------ MSVC-ABI struct returns (mingw passes the hidden pointer in a different order)
+template <class T> static T VRet(void* obj, int idx) {
+    typedef T* (STDMETHODCALLTYPE* F)(void*, T*);
+    T out; memset(&out, 0, sizeof out);
+    ((F)(*(void***)obj)[idx])(obj, &out);
+    return out;
+}
+static D3D12_RESOURCE_DESC ResDesc(ID3D12Resource* r) { return VRet<D3D12_RESOURCE_DESC>(r, 10); }
+static D3D12_COMMAND_QUEUE_DESC QDesc(ID3D12CommandQueue* q) { return VRet<D3D12_COMMAND_QUEUE_DESC>(q, 18); }
+static D3D12_CPU_DESCRIPTOR_HANDLE CpuStart(ID3D12DescriptorHeap* h) { return VRet<D3D12_CPU_DESCRIPTOR_HANDLE>(h, 9); }
+static D3D12_GPU_DESCRIPTOR_HANDLE GpuStart(ID3D12DescriptorHeap* h) { return VRet<D3D12_GPU_DESCRIPTOR_HANDLE>(h, 10); }
+
+// ------------------------------------------------------------------ config / log
+struct Cfg {
+    int fg = 1;              // master switch
+    int mult = 2;            // output frames per game frame (2 = numFramesToGenerate 1). Clamped to what the GPU supports
+    int stage = 2;           // 0 = pass-through (no Streamline), 1 = Streamline init + support query only, 2 = frame generation, (hudless is separate)
+    int log = 1;
+    int hudless = 0;         // 1 = copy the back buffer right before the Nth draw into it and tag it as HUD-less
+    int hudlessDraw = 2;     // N for hudless=1 (draw calls that target the back buffer, counted per frame)
+    int renderW = 2000, renderH = 1124, tol = 100;  // internal render resolution of the game (same defaults as the DLAA project)
+    int mvOff = 492;         // float index of ClipToPrevClip in the UE4 view uniform buffer (same as DLAA 'mvoff')
+    int noAAOff = 132;       // float index of ViewToClipNoAA
+    int projOff = 116;       // float index of ViewToClip (jittered)
+    int jitSX = 1, jitSY = 1, mvSX = 1, mvSY = 1;
+    int warmup = 150;        // frames to wait before enabling
+    int camStale = 6;        // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view)
+    int farPlane = 1000000;
+    int reflexSleep = 1;     // 1 = call slReflexSleep every frame (needed for DLSS-G pacing)
+    int baseFpsLimit = 0;    // Reflex frame limiter for the BASE frame rate (needs reflexsleep=1)
+    int showConsole = 0;     // only works with the 'development' Streamline DLLs
+    int ngxLog = 0;
+    int shaderCache = 1;     // 1 = build shaders before the game starts and keep them in SN_DLSSG_shaders.snsc (no run-time compile hitch)
+    int splash = 1;          // 1 = show the progress window while the cache is being built (only when something has to be built)
+    std::wstring slDir;      // folder with sl.interposer.dll etc. (default: next to the game exe)
+} g_cfg;
+
+static std::wstring g_dir;
+static FILE* g_log = nullptr;
+static std::mutex g_logMx;
+static void Log(const char* fmt, ...) {
+    if (!g_log) return;
+    std::lock_guard<std::mutex> lk(g_logMx);
+    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); fprintf(g_log, "\n"); fflush(g_log); va_end(ap);
+}
+static void LogW(const wchar_t* w) {
+    if (!g_log) return; char b[1024]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, nullptr, nullptr); Log("%s", b);
+}
+static void LoadCfg() {
+    std::wstring p = g_dir + L"\\SN_DLSSG_cfg.txt";
+    FILE* f = _wfopen(p.c_str(), L"r");
+    if (!f) {
+        f = _wfopen(p.c_str(), L"w");
+        if (f) {
+            fprintf(f,
+                "# Scarlet Nexus - DLSS Frame Generation (Streamline) config\n"
+                "# fg        : 1 = on, 0 = off\n"
+                "# mult      : 2 = 2x (1 generated frame). 3/4 need an RTX 50 series card (clamped automatically)\n"
+                "# stage     : 0 = pass-through, 1 = only init Streamline + log feature support, 2 = full frame generation\n"
+                "# log       : 1 = write SN_DLSSG_log.txt + Streamline log files next to the exe\n"
+                "# hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)\n"
+                "# hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')\n"
+                "# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance\n"
+                "# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)\n"
+                "# warmup    : frames before frame generation is switched on\n"
+                "# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)\n"
+                "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
+                "# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)\n"
+                "# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)\n"
+                "fg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n");
+            fclose(f);
+        }
+    } else {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char k[64], v[400] = {};
+            if (line[0] == '#') continue;
+            if (sscanf(line, " %63[^=]=%399[^\r\n]", k, v) < 1) continue;
+            int iv = atoi(v);
+            if (!strcmp(k, "fg")) g_cfg.fg = iv; else if (!strcmp(k, "mult")) g_cfg.mult = iv; else if (!strcmp(k, "stage")) g_cfg.stage = iv;
+            else if (!strcmp(k, "log")) g_cfg.log = iv; else if (!strcmp(k, "hudless")) g_cfg.hudless = iv; else if (!strcmp(k, "hudlessdraw")) g_cfg.hudlessDraw = iv;
+            else if (!strcmp(k, "renderw")) g_cfg.renderW = iv; else if (!strcmp(k, "renderh")) g_cfg.renderH = iv; else if (!strcmp(k, "tol")) g_cfg.tol = iv;
+            else if (!strcmp(k, "mvoff")) g_cfg.mvOff = iv; else if (!strcmp(k, "noaaoff")) g_cfg.noAAOff = iv; else if (!strcmp(k, "projoff")) g_cfg.projOff = iv;
+            else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
+            else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv;
+            else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
+            else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
+            else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
+            else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
+        }
+        fclose(f);
+    }
+    if (g_cfg.mult < 2) g_cfg.mult = 2;
+    if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+    Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d mvoff=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.mvOff, g_cfg.warmup);
+}
+
+static LONG CALLBACK DiagVEH(PEXCEPTION_POINTERS ep) {
+    DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (c == 0xC0000005 || c == 0xC000001D || c == 0xC0000094 || c == 0xC00000FD || c == 0xC0000409) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 8) {
+            void* a = ep->ExceptionRecord->ExceptionAddress; HMODULE m = nullptr; char name[MAX_PATH] = "?";
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m);
+            if (m) GetModuleFileNameA(m, name, MAX_PATH);
+            Log("first-chance exception 0x%08X at %p (%s +0x%llX) tid=%u  [informational: the game/OS may handle this itself, e.g. while shutting down - NOT necessarily a crash]", (unsigned)c, a, name, (unsigned long long)((BYTE*)a - (BYTE*)m), (unsigned)GetCurrentThreadId());
+            void* st[24]; USHORT nf = CaptureStackBackTrace(0, 24, st, nullptr);
+            for (USHORT i = 0; i < nf; i++) {
+                HMODULE sm = nullptr; char sn[MAX_PATH] = "?";
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)st[i], &sm);
+                if (sm) GetModuleFileNameA(sm, sn, MAX_PATH);
+                const char* b = strrchr(sn, '\\');
+                Log("  #%02u %p %s+0x%llX", (unsigned)i, st[i], b ? b + 1 : sn, (unsigned long long)((BYTE*)st[i] - (BYTE*)sm));
+            }
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ------------------------------------------------------------------ vtable patch helpers
+static void* Patch(void** vt, int idx, void* hk) {
+    DWORD old; VirtualProtect(&vt[idx], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+    void* o = vt[idx]; vt[idx] = hk; VirtualProtect(&vt[idx], sizeof(void*), old, &old); return o;
+}
+// per-vtable original lookup (a proxy class and a native class may have different vtables)
+struct VHook { std::unordered_map<void**, void*> orig; std::mutex mx; };
+static bool HookVt(VHook& h, void** vt, int idx, void* hk) {
+    std::lock_guard<std::mutex> lk(h.mx);
+    if (h.orig.count(vt)) return false;
+    h.orig[vt] = Patch(vt, idx, hk); return true;
+}
+static void* OrigOf(VHook& h, void* obj) {
+    std::lock_guard<std::mutex> lk(h.mx);
+    auto it = h.orig.find(*(void***)obj); return it != h.orig.end() ? it->second : nullptr;
+}
+
+// ------------------------------------------------------------------ Streamline loading
+using F_slInit = sl::Result(*)(const sl::Preferences&, uint64_t);
+using F_slShutdown = sl::Result(*)();
+using F_slIsFeatureSupported = sl::Result(*)(sl::Feature, const sl::AdapterInfo&);
+using F_slGetFeatureFunction = sl::Result(*)(sl::Feature, const char*, void*&);
+using F_slGetNewFrameToken = sl::Result(*)(sl::FrameToken*&, const uint32_t*);
+using F_slSetConstants = sl::Result(*)(const sl::Constants&, const sl::FrameToken&, const sl::ViewportHandle&);
+using F_slSetTagForFrame = sl::Result(*)(const sl::FrameToken&, const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t, sl::CommandBuffer*);
+using F_slSetTag = sl::Result(*)(const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t, sl::CommandBuffer*);
+using F_slGetNativeInterface = sl::Result(*)(void*, void**);
+using F_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+using F_CreateDXGIFactory = HRESULT(WINAPI*)(REFIID, void**);
+using F_CreateDXGIFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
+
+static HMODULE g_sl = nullptr;
+static F_slInit p_slInit; static F_slShutdown p_slShutdown; static F_slIsFeatureSupported p_slIsFeatureSupported;
+static F_slGetFeatureFunction p_slGetFeatureFunction; static F_slGetNewFrameToken p_slGetNewFrameToken;
+static F_slSetConstants p_slSetConstants; static F_slSetTagForFrame p_slSetTagForFrame; static F_slSetTag p_slSetTag;
+static F_slGetNativeInterface p_slGetNativeInterface;
+static F_D3D12CreateDevice pSL_D3D12CreateDevice; static F_CreateDXGIFactory pSL_CreateDXGIFactory, pSL_CreateDXGIFactory1; static F_CreateDXGIFactory2 pSL_CreateDXGIFactory2;
+static PFun_slDLSSGSetOptions* p_DLSSGSetOptions; static PFun_slDLSSGGetState* p_DLSSGGetState;
+static PFun_slPCLSetMarker* p_PCLSetMarker; static PFun_slReflexSetOptions* p_ReflexSetOptions; static PFun_slReflexSleep* p_ReflexSleep;
+static bool g_slInitOk = false, g_slRuntimeOk = false, g_useFrameTags = false;
+
+static const char* SlStr(sl::Result r) {
+    switch (r) {
+    case sl::Result::eOk: return "eOk"; case sl::Result::eErrorIO: return "eErrorIO"; case sl::Result::eErrorDriverOutOfDate: return "eErrorDriverOutOfDate";
+    case sl::Result::eErrorOSOutOfDate: return "eErrorOSOutOfDate"; case sl::Result::eErrorOSDisabledHWS: return "eErrorOSDisabledHWS(enable Hardware-accelerated GPU scheduling!)";
+    case sl::Result::eErrorDeviceNotCreated: return "eErrorDeviceNotCreated"; case sl::Result::eErrorNoSupportedAdapterFound: return "eErrorNoSupportedAdapterFound";
+    case sl::Result::eErrorAdapterNotSupported: return "eErrorAdapterNotSupported"; case sl::Result::eErrorNoPlugins: return "eErrorNoPlugins";
+    case sl::Result::eErrorVulkanAPI: return "eErrorVulkanAPI"; case sl::Result::eErrorDXGIAPI: return "eErrorDXGIAPI"; case sl::Result::eErrorD3DAPI: return "eErrorD3DAPI";
+    case sl::Result::eErrorNRDAPI: return "eErrorNRDAPI"; case sl::Result::eErrorNVAPI: return "eErrorNVAPI"; case sl::Result::eErrorReflexAPI: return "eErrorReflexAPI";
+    case sl::Result::eErrorNGXFailed: return "eErrorNGXFailed"; case sl::Result::eErrorJSONParsing: return "eErrorJSONParsing";
+    case sl::Result::eErrorMissingProxy: return "eErrorMissingProxy"; case sl::Result::eErrorMissingResourceState: return "eErrorMissingResourceState";
+    case sl::Result::eErrorInvalidIntegration: return "eErrorInvalidIntegration"; case sl::Result::eErrorMissingInputParameter: return "eErrorMissingInputParameter";
+    case sl::Result::eErrorNotInitialized: return "eErrorNotInitialized"; case sl::Result::eErrorComputeFailed: return "eErrorComputeFailed";
+    case sl::Result::eErrorInitNotCalled: return "eErrorInitNotCalled"; case sl::Result::eErrorExceptionHandler: return "eErrorExceptionHandler";
+    case sl::Result::eErrorInvalidParameter: return "eErrorInvalidParameter"; case sl::Result::eErrorMissingConstants: return "eErrorMissingConstants";
+    case sl::Result::eErrorDuplicatedConstants: return "eErrorDuplicatedConstants"; case sl::Result::eErrorMissingOrInvalidAPI: return "eErrorMissingOrInvalidAPI";
+    case sl::Result::eErrorCommonConstantsMissing: return "eErrorCommonConstantsMissing"; case sl::Result::eErrorUnsupportedInterface: return "eErrorUnsupportedInterface";
+    case sl::Result::eErrorFeatureMissing: return "eErrorFeatureMissing"; case sl::Result::eErrorFeatureNotSupported: return "eErrorFeatureNotSupported";
+    case sl::Result::eErrorFeatureMissingHooks: return "eErrorFeatureMissingHooks"; case sl::Result::eErrorFeatureFailedToLoad: return "eErrorFeatureFailedToLoad";
+    case sl::Result::eErrorFeatureWrongPriority: return "eErrorFeatureWrongPriority"; case sl::Result::eErrorFeatureMissingDependency: return "eErrorFeatureMissingDependency";
+    case sl::Result::eErrorFeatureManagerInvalidState: return "eErrorFeatureManagerInvalidState"; case sl::Result::eErrorInvalidState: return "eErrorInvalidState";
+    case sl::Result::eWarnOutOfVRAM: return "eWarnOutOfVRAM";
+    default: return "(other, see sl_result.h)"; }
+}
+static void SlLogCb(sl::LogType t, const char* msg) { Log("[SL %d] %s", (int)t, msg ? msg : "(null)"); }
+
+static bool FileExists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+static bool InitStreamline() {
+    if (g_cfg.slDir.empty()) g_cfg.slDir = g_dir;
+    LogW((L"Streamline dir: " + g_cfg.slDir).c_str());
+    const wchar_t* need[] = { L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss_g.dll", L"sl.reflex.dll", L"sl.pcl.dll", L"nvngx_dlssg.dll" };
+    bool all = true;
+    for (auto n : need) { bool ok = FileExists(g_cfg.slDir + L"\\" + n); all &= ok; LogW((std::wstring(L"  ") + n + (ok ? L": found" : L": MISSING")).c_str()); }
+    if (!FileExists(g_cfg.slDir + L"\\sl.interposer.dll")) { Log("sl.interposer.dll not found -> frame generation disabled (game runs normally)"); return false; }
+    if (!all) Log("WARNING: some Streamline files are missing, DLSS-G will not load");
+    g_sl = LoadLibraryExW((g_cfg.slDir + L"\\sl.interposer.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!g_sl) { Log("LoadLibrary sl.interposer.dll failed err=%u", (unsigned)GetLastError()); return false; }
+    auto gp = [&](const char* n) { return (void*)GetProcAddress(g_sl, n); };
+    p_slInit = (F_slInit)gp("slInit"); p_slShutdown = (F_slShutdown)gp("slShutdown"); p_slIsFeatureSupported = (F_slIsFeatureSupported)gp("slIsFeatureSupported");
+    p_slGetFeatureFunction = (F_slGetFeatureFunction)gp("slGetFeatureFunction"); p_slGetNewFrameToken = (F_slGetNewFrameToken)gp("slGetNewFrameToken");
+    p_slSetConstants = (F_slSetConstants)gp("slSetConstants"); p_slSetTagForFrame = (F_slSetTagForFrame)gp("slSetTagForFrame"); p_slSetTag = (F_slSetTag)gp("slSetTag");
+    p_slGetNativeInterface = (F_slGetNativeInterface)gp("slGetNativeInterface");
+    pSL_D3D12CreateDevice = (F_D3D12CreateDevice)gp("D3D12CreateDevice"); pSL_CreateDXGIFactory = (F_CreateDXGIFactory)gp("CreateDXGIFactory");
+    pSL_CreateDXGIFactory1 = (F_CreateDXGIFactory)gp("CreateDXGIFactory1"); pSL_CreateDXGIFactory2 = (F_CreateDXGIFactory2)gp("CreateDXGIFactory2");
+    Log("SL exports: slInit=%p slGetFeatureFunction=%p slGetNewFrameToken=%p slSetConstants=%p slSetTagForFrame=%p slSetTag=%p native=%p | D3D12CreateDevice=%p Factory1=%p Factory2=%p",
+        (void*)p_slInit, (void*)p_slGetFeatureFunction, (void*)p_slGetNewFrameToken, (void*)p_slSetConstants, (void*)p_slSetTagForFrame, (void*)p_slSetTag, (void*)p_slGetNativeInterface,
+        (void*)pSL_D3D12CreateDevice, (void*)pSL_CreateDXGIFactory1, (void*)pSL_CreateDXGIFactory2);
+    if (!p_slInit || !p_slGetFeatureFunction || !p_slGetNewFrameToken || !p_slSetConstants || !(p_slSetTagForFrame || p_slSetTag) || !pSL_D3D12CreateDevice || !pSL_CreateDXGIFactory1) {
+        Log("interposer is missing required exports (wrong/old Streamline version?)"); return false; }
+    g_useFrameTags = (p_slSetTagForFrame != nullptr);
+
+    sl::Preferences pref{};
+    pref.showConsole = g_cfg.showConsole != 0;
+    pref.logLevel = g_cfg.log ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
+    static const wchar_t* paths[1]; paths[0] = g_cfg.slDir.c_str();
+    pref.pathsToPlugins = paths; pref.numPathsToPlugins = 1;
+    pref.pathToLogsAndData = g_cfg.log ? g_dir.c_str() : nullptr;
+    pref.logMessageCallback = &SlLogCb;
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | (g_useFrameTags ? sl::PreferenceFlags::eUseFrameBasedResourceTagging : (sl::PreferenceFlags)0);
+    static sl::Feature feats[] = { sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+    pref.featuresToLoad = feats; pref.numFeaturesToLoad = 3;
+    pref.engine = sl::EngineType::eUnreal; pref.engineVersion = "4.26";
+    pref.projectId = "5f0c8c2e-7a39-4b1e-9d6a-2c1b8e4f7d30";
+    pref.renderAPI = sl::RenderAPI::eD3D12;
+    sl::Result r = p_slInit(pref, sl::kSDKVersion);
+    Log("slInit -> %d %s (frame tags: %d)", (int)r, SlStr(r), (int)g_useFrameTags);
+    g_slInitOk = (r == sl::Result::eOk);
+    return g_slInitOk;
+}
+
+// ------------------------------------------------------------------ resource tracking (ported from the DLAA project)
+static bool IsInternal(UINT w, UINT h) { return abs((int)w - g_cfg.renderW) <= g_cfg.tol && abs((int)h - g_cfg.renderH) <= g_cfg.tol; }
+struct ResMeta { ID3D12Resource* res = nullptr; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE; int useClear = 0, useSetRT = 0, useCopySrc = 0, useCopyDst = 0, useSRV = 0; bool held = false; bool cand = false; };
+static std::unordered_map<void*, ResMeta> g_res;
+static std::unordered_map<SIZE_T, void*> g_rtvToRes, g_dsvToRes;
+static std::mutex g_resMx;
+static UINT g_rtvInc = 0, g_dsvInc = 0;
+static ID3D12Device* g_device = nullptr;
+static ID3D12CommandQueue* g_queue = nullptr;          // the game's direct queue (the one the swap chain was created with)
+static std::atomic<int> g_frame{0};
+static ID3D12Resource* g_pinVel = nullptr; static ID3D12Resource* g_pinDepth = nullptr;
+
+static void RegisterRes(ID3D12Resource* res) {
+    if (!res) return;
+    D3D12_RESOURCE_DESC d = ResDesc(res);
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    bool depth = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || d.Format == DXGI_FORMAT_R16G16_UNORM);
+    std::lock_guard<std::mutex> lk(g_resMx);
+    if (!cand && !g_res.count((void*)res)) return;
+    auto& m = g_res[(void*)res];
+    m.res = res; m.w = (UINT)d.Width; m.h = d.Height; m.fmt = d.Format; m.flags = d.Flags; m.cand = cand;
+    if (cand && !m.held) { res->AddRef(); m.held = true; }   // keep alive: we keep raw pointers across frames
+}
+static void NoteUse(void* p, int kind) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_resMx);
+    auto it = g_res.find(p); if (it == g_res.end()) return;
+    if (kind == 0) it->second.useClear++; else if (kind == 1) it->second.useSetRT++; else if (kind == 2) it->second.useCopySrc++; else if (kind == 3) it->second.useCopyDst++; else it->second.useSRV++;
+}
+static void* LookupRTV(D3D12_CPU_DESCRIPTOR_HANDLE h) { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_rtvToRes.find(h.ptr); return it != g_rtvToRes.end() ? it->second : nullptr; }
+
+// ---- barrier state tracking (last StateAfter for candidate resources)
+using PFN_ResBarrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+static PFN_ResBarrier oResBarrier = nullptr;
+struct SubSt { UINT st[2] = { 0, 0 }; bool known[2] = { false, false }; };
+static std::unordered_map<void*, SubSt> g_state;
+static void STDMETHODCALLTYPE hkResBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    oResBarrier(cl, n, b);
+    std::lock_guard<std::mutex> lk(g_resMx);
+    for (UINT i = 0; i < n; i++) {
+        if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+        void* r = b[i].Transition.pResource; UINT sub = b[i].Transition.Subresource;
+        if (sub != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && sub > 1) continue;
+        auto it = g_res.find(r); if (it == g_res.end() || !it->second.cand) continue;
+        auto& ss = g_state[r]; UINT st = (UINT)b[i].Transition.StateAfter;
+        if (sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) { ss.st[0] = ss.st[1] = st; ss.known[0] = ss.known[1] = true; }
+        else { ss.st[sub] = st; ss.known[sub] = true; }
+    }
+}
+static bool GetSubState(void* r, UINT sub, UINT* st) { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_state.find(r); if (it == g_state.end() || !it->second.known[sub]) return false; *st = it->second.st[sub]; return true; }
+
+// ---- camera / jitter from the UE4 view uniform buffer (upload heap buffers are mapped once and kept)
+struct BufInfo { UINT64 size; ID3D12Resource* res; BYTE* map; };
+static std::map<UINT64, BufInfo> g_bufs; static std::mutex g_bufMx;
+static float g_vtcNoAA[16] = {}, g_c2p[16] = {}; static float g_jitPX = 0.f, g_jitPY = 0.f;
+static std::atomic<int> g_camFrame{-1}; static std::mutex g_camMx;
+static void RegisterUploadBuf(ID3D12Resource* r) {
+    if (!r) return;
+    D3D12_RESOURCE_DESC d = ResDesc(r); if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width < 65536) return;
+    D3D12_HEAP_PROPERTIES hp; D3D12_HEAP_FLAGS hf; if (FAILED(r->GetHeapProperties(&hp, &hf)) || hp.Type != D3D12_HEAP_TYPE_UPLOAD) return;
+    std::lock_guard<std::mutex> lk(g_bufMx);
+    if (g_bufs.size() >= 4096) return;
+    void* ptr = nullptr; if (FAILED(r->Map(0, nullptr, &ptr)) || !ptr) return;
+    r->AddRef();
+    g_bufs[r->GetGPUVirtualAddress()] = { d.Width, r, (BYTE*)ptr };
+}
+static void TrackCamera(UINT64 va) {
+    std::lock_guard<std::mutex> lk(g_bufMx);
+    auto it = g_bufs.upper_bound(va); if (it == g_bufs.begin()) return; --it;
+    UINT64 off = va - it->first; if (off + (UINT64)(std::max(g_cfg.mvOff + 16, 148)) * 4 > it->second.size) return;
+    const float* p = (const float*)(it->second.map + off);
+    const float* a = p + g_cfg.projOff; const float* b = p + g_cfg.noAAOff;
+    auto isproj = [&](const float* m) { return m[0] > 0.2f && m[5] > 0.2f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f && m[4] == 0.f && m[6] == 0.f && m[7] == 0.f
+        && fabsf(m[11]) == 1.f && m[12] == 0.f && m[13] == 0.f && m[15] == 0.f && fabsf(m[5] / m[0] - (float)g_cfg.renderW / (float)g_cfg.renderH) < 0.02f; };
+    if (!isproj(a) || !isproj(b) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) return;
+    if (a[8] == 0.f && a[9] == 0.f) return;   // un-jittered view of a non-TAA pass: keep the last real one
+    const float* c = p + g_cfg.mvOff; bool ok = true; for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) ok = false;
+    if (!ok) return;
+    std::lock_guard<std::mutex> lk2(g_camMx);
+    memcpy(g_vtcNoAA, b, sizeof g_vtcNoAA); memcpy(g_c2p, c, sizeof g_c2p);
+    g_jitPX = a[8] * 0.5f * (float)g_cfg.renderW * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)g_cfg.renderH * (float)g_cfg.jitSY;
+    g_camFrame = g_frame.load();
+    static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f", g_frame.load(), g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15]);
+}
+
+// ---- hooks on the native D3D12 vtables
+using PFN_CreateRTV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_CreateDSV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_CreateSRV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_CopyDescSimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+using PFN_CreateCommitted = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+using PFN_CreatePlaced = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+using PFN_OMSetRT = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+using PFN_ClearRTV = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT*, UINT, const D3D12_RECT*);
+using PFN_ClearDSV = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+using PFN_CopyTex = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+using PFN_SetRootCbv = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+using PFN_DrawInst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using PFN_DrawIdxInst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+using PFN_Exec = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+static PFN_CreateRTV oCreateRTV; static PFN_CreateDSV oCreateDSV; static PFN_CreateSRV oCreateSRV; static PFN_CopyDescSimple oCopyDescSimple;
+static PFN_CreateCommitted oCreateCommitted; static PFN_CreatePlaced oCreatePlaced; static PFN_OMSetRT oOMSetRT; static PFN_ClearRTV oClearRTV; static PFN_ClearDSV oClearDSV;
+static PFN_CopyTex oCopyTex; static PFN_SetRootCbv oSetGCbv, oSetCCbv; static PFN_DrawInst oDrawInst; static PFN_DrawIdxInst oDrawIdxInst; static PFN_Exec oExec;
+
+// hudless capture
+struct RtTrack { ID3D12GraphicsCommandList* cl = nullptr; void* rt0 = nullptr; };
+static thread_local RtTrack t_rt;
+static std::atomic<int> g_bbDraws{0}, g_hudStamp{-1};
+static std::unordered_map<void*, bool> g_bbCache;
+static UINT g_dispW = 0, g_dispH = 0;
+static ID3D12Resource* g_hudless = nullptr; static D3D12_RESOURCE_STATES g_hudCur = D3D12_RESOURCE_STATE_COPY_DEST; static UINT g_hudW = 0, g_hudH = 0; static DXGI_FORMAT g_hudFmt = DXGI_FORMAT_UNKNOWN;
+static std::mutex g_hudMx;
+
+static void STDMETHODCALLTYPE hkCreateRTV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    if (!g_device) g_device = dev;
+    RegisterRes(res);
+    if (res) { std::lock_guard<std::mutex> lk(g_resMx); g_rtvToRes[dest.ptr] = (void*)res; }
+    oCreateRTV(dev, res, desc, dest);
+}
+static void STDMETHODCALLTYPE hkCreateDSV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    if (!g_device) g_device = dev;
+    RegisterRes(res);
+    if (res) { std::lock_guard<std::mutex> lk(g_resMx); g_dsvToRes[dest.ptr] = (void*)res; }
+    oCreateDSV(dev, res, desc, dest);
+}
+static void STDMETHODCALLTYPE hkCreateSRV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    if (res) {
+        D3D12_RESOURCE_DESC d = ResDesc(res);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && IsInternal((UINT)d.Width, d.Height)) { RegisterRes(res); NoteUse((void*)res, 4); }
+    }
+    oCreateSRV(dev, res, desc, dest);
+}
+static void STDMETHODCALLTYPE hkCopyDescSimple(ID3D12Device* dev, UINT num, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    oCopyDescSimple(dev, num, dest, src, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && g_rtvInc) {
+        std::lock_guard<std::mutex> lk(g_resMx);
+        for (UINT i = 0; i < num; i++) { auto it = g_rtvToRes.find(src.ptr + i * g_rtvInc); if (it != g_rtvToRes.end()) g_rtvToRes[dest.ptr + i * g_rtvInc] = it->second; }
+    }
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && g_dsvInc) {
+        std::lock_guard<std::mutex> lk(g_resMx);
+        for (UINT i = 0; i < num; i++) { auto it = g_dsvToRes.find(src.ptr + i * g_dsvInc); if (it != g_dsvToRes.end()) g_dsvToRes[dest.ptr + i * g_dsvInc] = it->second; }
+    }
+}
+static HRESULT STDMETHODCALLTYPE hkCreateCommitted(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** ppv) {
+    HRESULT hr = oCreateCommitted(d, hp, hf, rd, st, cv, riid, ppv);
+    if (SUCCEEDED(hr) && ppv && *ppv && hp && hp->Type == D3D12_HEAP_TYPE_UPLOAD && rd && rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        ID3D12Resource* r = nullptr; if (SUCCEEDED(((IUnknown*)*ppv)->QueryInterface(__uuidof(ID3D12Resource), (void**)&r)) && r) { RegisterUploadBuf(r); r->Release(); } }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hkCreatePlaced(ID3D12Device* d, ID3D12Heap* h, UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** ppv) {
+    HRESULT hr = oCreatePlaced(d, h, off, rd, st, cv, riid, ppv);
+    if (SUCCEEDED(hr) && ppv && *ppv && rd && rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        ID3D12Resource* r = nullptr; if (SUCCEEDED(((IUnknown*)*ppv)->QueryInterface(__uuidof(ID3D12Resource), (void**)&r)) && r) { RegisterUploadBuf(r); r->Release(); } }
+    return hr;
+}
+static void STDMETHODCALLTYPE hkSetGCbv(ID3D12GraphicsCommandList* cl, UINT i, D3D12_GPU_VIRTUAL_ADDRESS va) { TrackCamera(va); oSetGCbv(cl, i, va); }
+static void STDMETHODCALLTYPE hkSetCCbv(ID3D12GraphicsCommandList* cl, UINT i, D3D12_GPU_VIRTUAL_ADDRESS va) { TrackCamera(va); oSetCCbv(cl, i, va); }
+
+static void STDMETHODCALLTYPE hkOMSetRT(ID3D12GraphicsCommandList* cl, UINT num, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
+    oOMSetRT(cl, num, rts, single, dsv);
+    t_rt.cl = cl; t_rt.rt0 = nullptr;
+    if (rts) for (UINT i = 0; i < num && i < 8; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = single ? rts[0] : rts[i]; if (single && i > 0) h.ptr += i * g_rtvInc;
+        void* r = LookupRTV(h); if (i == 0) t_rt.rt0 = r; NoteUse(r, 1);
+    }
+    if (dsv) { void* r = nullptr; { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv->ptr); if (it != g_dsvToRes.end()) r = it->second; } NoteUse(r, 1); }
+}
+static void STDMETHODCALLTYPE hkClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT* c, UINT nr, const D3D12_RECT* r) { oClearRTV(cl, rtv, c, nr, r); NoteUse(LookupRTV(rtv), 0); }
+static void STDMETHODCALLTYPE hkClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT nr, const D3D12_RECT* r) {
+    oClearDSV(cl, dsv, f, d, s, nr, r);
+    void* rr = nullptr; { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv.ptr); if (it != g_dsvToRes.end()) rr = it->second; } NoteUse(rr, 0);
+}
+static void STDMETHODCALLTYPE hkCopyTex(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    if (src && src->pResource) { RegisterRes(src->pResource); NoteUse((void*)src->pResource, 2); }
+    if (dst && dst->pResource) { RegisterRes(dst->pResource); NoteUse((void*)dst->pResource, 3); }
+    oCopyTex(cl, dst, x, y, z, src, box);
+}
+
+// ---- HUD-less capture: copy of the back buffer right before the Nth draw that targets it
+static bool IsBackbufferRes(void* r) {
+    if (!r || !g_dispW) return false;
+    { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_bbCache.find(r); if (it != g_bbCache.end()) return it->second; }
+    D3D12_RESOURCE_DESC d = ResDesc((ID3D12Resource*)r);
+    bool bb = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_dispW && d.Height == g_dispH && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && d.MipLevels == 1 && d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1;
+    std::lock_guard<std::mutex> lk(g_resMx); g_bbCache[r] = bb; return bb;
+}
+static void TransitionOne(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+    D3D12_RESOURCE_BARRIER x = {}; x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource = r; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    x.Transition.StateBefore = a; x.Transition.StateAfter = b; oResBarrier(cl, 1, &x);
+}
+static void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb) {
+    std::lock_guard<std::mutex> lk(g_hudMx);
+    D3D12_RESOURCE_DESC d = ResDesc(bb);
+    if (!g_hudless || g_hudW != d.Width || g_hudH != d.Height || g_hudFmt != d.Format) {
+        if (g_hudless) { g_hudless->Release(); g_hudless = nullptr; }
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = d.Width; rd.Height = d.Height; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = d.Format; rd.SampleDesc.Count = 1;
+        HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), (void**)&g_hudless);
+        Log("hudless texture %llux%u fmt=%d -> hr=0x%08X", (unsigned long long)d.Width, d.Height, (int)d.Format, (unsigned)hr);
+        if (FAILED(hr)) { g_hudless = nullptr; return; }
+        g_hudW = (UINT)d.Width; g_hudH = d.Height; g_hudFmt = d.Format; g_hudCur = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if (g_hudCur != D3D12_RESOURCE_STATE_COPY_DEST) TransitionOne(cl, g_hudless, g_hudCur, D3D12_RESOURCE_STATE_COPY_DEST);
+    TransitionOne(cl, bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cl->CopyResource(g_hudless, bb);
+    TransitionOne(cl, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    TransitionOne(cl, g_hudless, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    g_hudCur = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+}
+static void NoteDraw(ID3D12GraphicsCommandList* cl, const char* kind, UINT count) {
+    if (t_rt.cl != cl || !IsBackbufferRes(t_rt.rt0)) return;
+    int n = ++g_bbDraws;
+    static std::atomic<int> logged{0};
+    if (logged.load() < 160 && g_frame.load() > 200 && g_frame.load() < 215) { logged++; Log("bbdraw frame=%d #%d %s count=%u", g_frame.load(), n, kind, count); }
+    if (g_cfg.hudless && n == g_cfg.hudlessDraw && g_hudStamp.load() != g_frame.load() && g_device) { CaptureHudless(cl, (ID3D12Resource*)t_rt.rt0); g_hudStamp = g_frame.load(); }
+}
+static void STDMETHODCALLTYPE hkDrawInst(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) { NoteDraw(cl, "DrawInstanced", a); oDrawInst(cl, a, b, c, d); }
+static void STDMETHODCALLTYPE hkDrawIdxInst(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) { NoteDraw(cl, "DrawIndexedInstanced", a); oDrawIdxInst(cl, a, b, c, d, e); }
+
+static void STDMETHODCALLTYPE hkExec(ID3D12CommandQueue* q, UINT num, ID3D12CommandList* const* lists) {
+    static int nq = 0;
+    if (nq < 8) { D3D12_COMMAND_QUEUE_DESC qd = QDesc(q); Log("ExecuteCommandLists queue=%p type=%d (game queue=%p)", (void*)q, (int)qd.Type, (void*)g_queue); nq++; }
+    oExec(q, num, lists);
+}
+
+// ------------------------------------------------------------------ deferred release of private command lists
+struct DeferredCl { ID3D12GraphicsCommandList* cl; ID3D12CommandAllocator* al; int frame; };
+static std::vector<DeferredCl> g_deferred; static std::mutex g_deferredMx;
+static void DeferRelease(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* al) {
+    std::lock_guard<std::mutex> lk(g_deferredMx); int now = g_frame.load();
+    for (size_t i = 0; i < g_deferred.size();) { if (now - g_deferred[i].frame >= 8) { g_deferred[i].cl->Release(); g_deferred[i].al->Release(); g_deferred.erase(g_deferred.begin() + i); } else i++; }
+    g_deferred.push_back({ cl, al, now });
+}
+
+// ------------------------------------------------------------------ MV compute pass: UE4 velocity (R16G16_UNORM, 0 = static) + depth + ClipToPrevClip -> pixel MVs (R16G16_FLOAT) + depth copy (R32_FLOAT)
+static const char* kMvHlsl =
+"cbuffer C : register(b0) { row_major float4x4 M; uint2 dim; float2 sgn; };\n"
+"Texture2D<float2> V : register(t0);\n"
+"Texture2D<float>  D : register(t1);\n"
+"RWTexture2D<float2> O : register(u0);\n"
+"RWTexture2D<float>  OD : register(u1);\n"
+"[numthreads(8,8,1)]\n"
+"void main(uint3 t : SV_DispatchThreadID)\n"
+"{\n"
+"    if (t.x >= dim.x || t.y >= dim.y) return;\n"
+"    float2 v = V.Load(int3(t.xy, 0));\n"
+"    float z = D.Load(int3(t.xy, 0));\n"
+"    float2 back;\n"
+"    if (v.x > 0.0) {\n"
+"        back = (v - 32767.0/65535.0) / (0.499*0.5);\n"
+"    } else {\n"
+"        float2 sp = float2((t.x + 0.5)/dim.x*2.0 - 1.0, 1.0 - (t.y + 0.5)/dim.y*2.0);\n"
+"        float4 pc = mul(float4(sp, z, 1.0), M);\n"
+"        back = sp - pc.xy / pc.w;\n"
+"    }\n"
+"    O[t.xy] = float2(-back.x * 0.5 * dim.x * sgn.x, back.y * 0.5 * dim.y * sgn.y);\n"
+"    OD[t.xy] = z;\n"
+"}\n";
+static ID3D12RootSignature* g_mvRS = nullptr; static ID3D12PipelineState* g_mvPSO = nullptr; static ID3D12DescriptorHeap* g_mvHeap = nullptr;
+static ID3D12Resource* g_mvOut = nullptr; static ID3D12Resource* g_depthOut = nullptr; static UINT g_mvInc = 0; static bool g_mvFailed = false; static int g_mvSlot = 0; static bool g_mvFirst = true;
+static UINT g_mvW = 0, g_mvH = 0;
+static const int MV_SETS = 16;
+static const D3D12_RESOURCE_STATES kOutState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+#include "shadercache.inc"   // SNSC shader cache, pre-game warm-up + progress window, EnsureMvPipeline()
+
+static bool InitMvPass(UINT W, UINT H) {
+    if (g_mvPSO && g_mvOut && g_mvW == W && g_mvH == H) return true;
+    if (g_mvFailed || !g_device) return false;
+    g_mvFailed = true;
+    if (!EnsureMvPipeline(g_device)) return false;   // shaders come from the pre-built cache (compiled at run time only if there is none)
+    HRESULT hr = S_OK;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 4 * MV_SETS; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (!g_mvHeap && FAILED(g_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void**)&g_mvHeap))) { Log("MV: heap failed"); return false; }
+    g_mvInc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = W; rd.Height = H; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), (void**)&g_mvOut);
+    if (FAILED(hr)) { Log("MV: mv texture 0x%08X", (unsigned)hr); return false; }
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), (void**)&g_depthOut);
+    if (FAILED(hr)) { Log("MV: depth texture 0x%08X", (unsigned)hr); return false; }
+    g_mvW = W; g_mvH = H; g_mvFirst = true; g_mvFailed = false; Log("MV pass ready (%ux%u, MV R16G16_FLOAT + depth R32_FLOAT)", W, H); return true;
+}
+static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    default: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; }
+}
+// Builds a private command list, runs the MV pass on the game's queue. Returns true if g_mvOut/g_depthOut were refreshed.
+static bool RunMvPass(UINT W, UINT H, ID3D12Resource* vel, ID3D12Resource* depth) {
+    if (!g_device || !g_queue || !vel || !depth) return false;
+    if (!InitMvPass(W, H)) return false;
+    ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr;
+    if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&al))) return false;
+    if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl))) { al->Release(); return false; }
+    // input transitions (tracked states of the game's resources) -> compute-readable, restored afterwards
+    D3D12_RESOURCE_BARRIER pre[8], post[8]; UINT nb = 0;
+    struct In { ID3D12Resource* r; D3D12_RESOURCE_STATES want; const char* n; UINT planes; } ins[2] = {
+        { vel, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "velocity", 1 },
+        { depth, (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), "depth", 2 } };
+    auto add = [&](ID3D12Resource* res, UINT sub, UINT from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = res; b.Transition.Subresource = sub;
+        b.Transition.StateBefore = (D3D12_RESOURCE_STATES)from; b.Transition.StateAfter = to; pre[nb] = b;
+        b.Transition.StateBefore = to; b.Transition.StateAfter = (D3D12_RESOURCE_STATES)from; post[nb] = b; nb++; };
+    static int s_log = 0;
+    for (auto& in : ins) {
+        UINT st[2] = { 0, 0 }; bool k[2] = { false, false };
+        for (UINT p = 0; p < in.planes; p++) k[p] = GetSubState(in.r, p, &st[p]);
+        if (s_log < 3) Log("barrier: %s tracked state plane0=%s0x%X plane1=%s0x%X", in.n, k[0] ? "" : "?", st[0], k[1] ? "" : "?", st[1]);
+        if (in.planes == 1) {
+            if (!k[0]) continue;
+            if ((st[0] & in.want) == (UINT)in.want) continue;
+            add(in.r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, st[0], in.want);
+        } else {
+            if (!k[0] && !k[1]) continue;
+            if (k[0] && k[1] && st[0] == st[1]) { if ((st[0] & in.want) != (UINT)in.want) add(in.r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, st[0], in.want); }
+            else for (UINT p = 0; p < 2; p++) if (k[p] && (st[p] & in.want) != (UINT)in.want) add(in.r, p, st[p], in.want);
+        }
+    }
+    if (nb) oResBarrier(cl, nb, pre);
+    if (!g_mvFirst) { D3D12_RESOURCE_BARRIER u[2] = {}; for (int i = 0; i < 2; i++) { u[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; u[i].Transition.pResource = i ? g_depthOut : g_mvOut; u[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; u[i].Transition.StateBefore = kOutState; u[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; } oResBarrier(cl, 2, u); }
+    g_mvFirst = false;
+    int slot = (g_mvSlot++) % MV_SETS; UINT64 base = (UINT64)slot * 4 * g_mvInc;
+    D3D12_CPU_DESCRIPTOR_HANDLE c = CpuStart(g_mvHeap); c.ptr += (SIZE_T)base;
+    D3D12_GPU_DESCRIPTOR_HANDLE g = GpuStart(g_mvHeap); g.ptr += base;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
+    sv.Format = DXGI_FORMAT_R16G16_UNORM; g_device->CreateShaderResourceView(vel, &sv, c);
+    c.ptr += g_mvInc; sv.Format = DepthSrvFormat(ResDesc(depth).Format); g_device->CreateShaderResourceView(depth, &sv, c);
+    c.ptr += g_mvInc; D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; uv.Format = DXGI_FORMAT_R16G16_FLOAT; g_device->CreateUnorderedAccessView(g_mvOut, nullptr, &uv, c);
+    c.ptr += g_mvInc; uv.Format = DXGI_FORMAT_R32_FLOAT; g_device->CreateUnorderedAccessView(g_depthOut, nullptr, &uv, c);
+    struct { float m[16]; UINT w, h; float sx, sy; } k; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(k.m, g_c2p, sizeof k.m); }
+    k.w = W; k.h = H; k.sx = (float)g_cfg.mvSX; k.sy = (float)g_cfg.mvSY;
+    ID3D12DescriptorHeap* hh[1] = { g_mvHeap }; cl->SetDescriptorHeaps(1, hh);
+    cl->SetComputeRootSignature(g_mvRS); cl->SetPipelineState(g_mvPSO);
+    cl->SetComputeRoot32BitConstants(0, 20, &k, 0); cl->SetComputeRootDescriptorTable(1, g);
+    cl->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+    D3D12_RESOURCE_BARRIER o[2] = {}; for (int i = 0; i < 2; i++) { o[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; o[i].Transition.pResource = i ? g_depthOut : g_mvOut; o[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; o[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; o[i].Transition.StateAfter = kOutState; }
+    oResBarrier(cl, 2, o);
+    if (nb) oResBarrier(cl, nb, post);
+    cl->Close();
+    ID3D12CommandList* lists[1] = { cl }; oExec(g_queue, 1, lists);
+    DeferRelease(cl, al);
+    if (s_log++ < 3) Log("MV pass submitted: frame=%d slot=%d %ux%u transitions=%u c2p diag=%.5f %.5f %.5f %.5f", g_frame.load(), slot, W, H, nb, k.m[0], k.m[5], k.m[10], k.m[15]);
+    return true;
+}
+
+static void UpdatePins() {
+    ID3D12Resource* bestVel = nullptr, * bestDep = nullptr; int bv = -1, bd = -1;
+    { std::lock_guard<std::mutex> lk(g_resMx);
+      for (auto& kv : g_res) { auto& m = kv.second; if (!m.cand || !IsInternal(m.w, m.h)) continue;
+        int score = m.useClear + m.useSetRT * 2 + m.useCopySrc + m.useCopyDst + m.useSRV;
+        if ((m.flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && score > bd) { bd = score; bestDep = m.res; }
+        if (m.fmt == DXGI_FORMAT_R16G16_UNORM && score > bv) { bv = score; bestVel = m.res; } } }
+    g_pinVel = bestVel; g_pinDepth = bestDep;
+}
+
+// ------------------------------------------------------------------ 4x4 helpers + constants
+static bool Inv4(const float* m, float* out) {
+    double a[16], inv[16]; for (int i = 0; i < 16; i++) a[i] = m[i];
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+    double det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if (fabs(det) < 1e-30) return false;
+    det = 1.0 / det; for (int i = 0; i < 16; i++) out[i] = (float)(inv[i] * det); return true;
+}
+static void ToSl(const float* m, sl::float4x4& o) { for (int r = 0; r < 4; r++) o.row[r] = sl::float4(m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]); }
+static bool BuildConstants(sl::Constants& c, bool reset) {
+    float vtc[16], c2p[16], j[2]; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(vtc, g_vtcNoAA, sizeof vtc); memcpy(c2p, g_c2p, sizeof c2p); j[0] = g_jitPX; j[1] = g_jitPY; }
+    float inv1[16], inv2[16];
+    if (!Inv4(vtc, inv1) || !Inv4(c2p, inv2)) return false;
+    ToSl(vtc, c.cameraViewToClip); ToSl(inv1, c.clipToCameraView); ToSl(c2p, c.clipToPrevClip); ToSl(inv2, c.prevClipToClip);
+    c.jitterOffset = sl::float2(j[0], j[1]);
+    c.mvecScale = sl::float2(1.0f / (float)g_cfg.renderW, 1.0f / (float)g_cfg.renderH);
+    c.cameraPinholeOffset = sl::float2(0.f, 0.f);
+    c.cameraPos = sl::float3(0.f, 0.f, 0.f); c.cameraUp = sl::float3(0.f, 1.f, 0.f); c.cameraRight = sl::float3(1.f, 0.f, 0.f); c.cameraFwd = sl::float3(0.f, 0.f, 1.f);
+    float nearP = vtc[14]; if (!(nearP > 0.f) || !std::isfinite(nearP)) nearP = 10.f;
+    c.cameraNear = nearP; c.cameraFar = (float)g_cfg.farPlane;
+    c.cameraFOV = 2.0f * atanf(1.0f / vtc[5]); c.cameraAspectRatio = vtc[5] / vtc[0];
+    c.depthInverted = sl::Boolean::eTrue; c.cameraMotionIncluded = sl::Boolean::eTrue; c.motionVectors3D = sl::Boolean::eFalse;
+    c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse; c.orthographicProjection = sl::Boolean::eFalse; c.motionVectorsDilated = sl::Boolean::eFalse; c.motionVectorsJittered = sl::Boolean::eFalse;
+    return true;
+}
+
+// ------------------------------------------------------------------ per-frame logic (runs inside the Present hook)
+struct FrameCtx { sl::FrameToken* tok = nullptr; };
+static std::atomic<bool> g_deviceLost{false};
+static int g_lastOnFrame = -1; static bool g_wasOn = false; static int g_stateLog = 0; static bool g_loggedSupport = false;
+static UINT g_scW = 0, g_scH = 0;
+
+static void LogSupport() {
+    if (g_loggedSupport || !p_slIsFeatureSupported) return; g_loggedSupport = true;
+    HMODULE mdx = GetModuleHandleW(L"dxgi.dll"); if (!mdx) return;
+    auto pCF = (F_CreateDXGIFactory)GetProcAddress(mdx, "CreateDXGIFactory1"); if (!pCF) return;
+    // note: this goes through our hook -> Streamline's proxy factory, which is fine for EnumAdapters/GetDesc
+    IDXGIFactory1* f = nullptr; if (FAILED(pCF(__uuidof(IDXGIFactory1), (void**)&f)) || !f) return;
+    IDXGIAdapter* ad = nullptr;
+    for (UINT i = 0; f->EnumAdapters(i, &ad) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC d = {}; ad->GetDesc(&d);
+        sl::AdapterInfo ai{}; ai.deviceLUID = (uint8_t*)&d.AdapterLuid; ai.deviceLUIDSizeInBytes = sizeof(LUID);
+        sl::Result r = p_slIsFeatureSupported(sl::kFeatureDLSS_G, ai);
+        char nm[128]; WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, nm, sizeof nm, nullptr, nullptr);
+        Log("DLSS-G supported on adapter %u '%s' -> %d %s", i, nm, (int)r, SlStr(r));
+        ad->Release();
+    }
+    f->Release();
+}
+// Streamline docs: slGetFeatureFunction needs the device to be set first. In the log the interposer never got it
+// (UE4 creates + destroys probe devices), so we hand it the live (proxy) device from the swap chain explicitly, once.
+static bool g_slDevSet = false; static int g_slDevTries = 0;
+static void EnsureSlDevice(IDXGISwapChain* sc) {
+    if (g_slDevSet || g_slDevTries >= 5 || !g_sl || !sc) return; g_slDevTries++;
+    typedef sl::Result(*F_slSetD3DDevice)(void*);
+    auto fn = (F_slSetD3DDevice)GetProcAddress(g_sl, "slSetD3DDevice");
+    if (!fn) { Log("slSetD3DDevice export missing"); g_slDevTries = 99; return; }
+    ID3D12Device* dev = nullptr;
+    if (FAILED(sc->GetDevice(__uuidof(ID3D12Device), (void**)&dev)) || !dev) { Log("swapchain->GetDevice failed"); return; }
+    sl::Result r = fn((void*)dev);
+    Log("slSetD3DDevice(%p) -> %d %s", (void*)dev, (int)r, SlStr(r));
+    dev->Release();
+    if (r == sl::Result::eOk) g_slDevSet = true;
+}
+// Plugins (incl. DLSS-G) only start once Streamline knows the device, and DLSS-G must see CreateSwapChain to take over the swap chain.
+// So hand the device to Streamline from the queue that is passed to CreateSwapChain, BEFORE the swap chain is created.
+static void EnsureSlDeviceFromQueue(IUnknown* queueUnk) {
+    if (g_slDevSet || !g_sl || !queueUnk) return;
+    typedef sl::Result(*F_slSetD3DDevice)(void*);
+    auto fn = (F_slSetD3DDevice)GetProcAddress(g_sl, "slSetD3DDevice");
+    if (!fn) { Log("slSetD3DDevice export missing"); return; }
+    ID3D12CommandQueue* cq = nullptr;
+    if (FAILED(queueUnk->QueryInterface(__uuidof(ID3D12CommandQueue), (void**)&cq)) || !cq) { Log("EnsureSlDeviceFromQueue: not a D3D12 queue"); return; }
+    ID3D12Device* dev = nullptr;
+    if (SUCCEEDED(cq->GetDevice(__uuidof(ID3D12Device), (void**)&dev)) && dev) {
+        void* nat = nullptr; ID3D12Device* use = dev;
+        if (p_slGetNativeInterface && p_slGetNativeInterface((void*)dev, &nat) == sl::Result::eOk && nat) use = (ID3D12Device*)nat;
+        sl::Result r = fn((void*)use);
+        Log("slSetD3DDevice(%p) BEFORE CreateSwapChain -> %d %s", (void*)use, (int)r, SlStr(r));
+        if (r == sl::Result::eOk) g_slDevSet = true;
+        dev->Release();
+    }
+    cq->Release();
+}
+static bool InitSlRuntime() {
+    if (g_slRuntimeOk) return true;
+    static int tries = 0; if (tries++ > 5) return false;
+    auto get = [&](sl::Feature f, const char* n, void*& fn) { sl::Result r = p_slGetFeatureFunction(f, n, fn); if (r != sl::Result::eOk) Log("slGetFeatureFunction(%s) -> %d %s", n, (int)r, SlStr(r)); return r == sl::Result::eOk; };
+    bool ok = true;
+    ok &= get(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)p_DLSSGSetOptions);
+    get(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)p_DLSSGGetState);
+    ok &= get(sl::kFeaturePCL, "slPCLSetMarker", (void*&)p_PCLSetMarker);
+    ok &= get(sl::kFeatureReflex, "slReflexSetOptions", (void*&)p_ReflexSetOptions);
+    get(sl::kFeatureReflex, "slReflexSleep", (void*&)p_ReflexSleep);
+    LogSupport();
+    if (!ok) { Log("Streamline runtime init incomplete (try %d)", tries); return false; }
+    sl::ReflexOptions ro{}; ro.mode = sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
+    if (g_cfg.baseFpsLimit > 0) ro.frameLimitUs = (uint32_t)(1000000 / g_cfg.baseFpsLimit);
+    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(LowLatency) -> %d %s", (int)r, SlStr(r));
+    g_slRuntimeOk = true; return true;
+}
+static void Marker(sl::PCLMarker m, const FrameCtx& c) {
+    if (!(p_PCLSetMarker && c.tok)) return;
+    sl::Result r = p_PCLSetMarker(m, *c.tok);
+    static int bad = 0; if (r != sl::Result::eOk && bad++ < 10) Log("slPCLSetMarker(%d) -> %d %s", (int)m, (int)r, SlStr(r));
+}
+
+static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
+    FrameCtx ctx;
+    int cur = g_frame.load(); bool hudOk = g_hudStamp.load() == cur && cur > 0;
+    int fr = ++g_frame; int bbd = g_bbDraws.exchange(0);
+    if (fr == 1 || (fr % 600) == 0) {
+        DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; }
+        Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_camFrame.load(), bbd);
+    }
+    UpdatePins();
+    if (!g_slInitOk || g_cfg.stage < 1) return ctx;
+    if (!g_slRuntimeOk) { EnsureSlDevice(sc); if (!(g_device && g_slDevSet && InitSlRuntime())) return ctx; }
+    if (p_slGetNewFrameToken(ctx.tok, nullptr) != sl::Result::eOk || !ctx.tok) { ctx.tok = nullptr; return ctx; }
+    if (g_cfg.reflexSleep && p_ReflexSleep) p_ReflexSleep(*ctx.tok);
+    Marker(sl::PCLMarker::eSimulationStart, ctx); Marker(sl::PCLMarker::eSimulationEnd, ctx);
+    Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
+    sl::ViewportHandle vp(0u);
+    // DLSS-G requires IDXGISwapChain3::GetCurrentBackBufferIndex to be called through the SL swap chain EVERY frame
+    // (UE4 tracks the back buffer index itself and never calls it -> status 0x10 / eFailGetCurrentBackBufferIndexNotCalled).
+    { IDXGISwapChain3* s3 = nullptr;
+      if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&s3)) && s3) { (void)s3->GetCurrentBackBufferIndex(); s3->Release(); }
+      else { static int w = 0; if (w++ < 3) Log("swap chain has no IDXGISwapChain3 - cannot call GetCurrentBackBufferIndex"); } }
+
+    bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load();
+    int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
+    bool inputs = false; sl::Constants consts{};
+    if (wantOn && camOk && g_pinVel && g_pinDepth && g_queue) {
+        D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth);
+        if (vd.Width == dd.Width && vd.Height == dd.Height) {
+            if (RunMvPass((UINT)vd.Width, vd.Height, g_pinVel, g_pinDepth)) {
+                bool reset = !g_wasOn || (fr - g_lastOnFrame) > 1;
+                if (BuildConstants(consts, reset)) inputs = true;
+            }
+        }
+    }
+    static int s_why = 0;
+    if (wantOn && !inputs && (s_why++ % 300) == 0) Log("FG not ready: camOk=%d(age %d) vel=%p depth=%p queue=%p mv=%p", (int)camOk, camAge, (void*)g_pinVel, (void*)g_pinDepth, (void*)g_queue, (void*)g_mvOut);
+
+    { static int prev = -1; int now = inputs ? 1 : 0;
+      if (now != prev) { Log("FG %s at frame=%d (wantOn=%d camOk=%d age=%d vel=%d depth=%d queue=%d)", now ? "ON" : "OFF", fr, (int)wantOn, (int)camOk, camAge, g_pinVel != nullptr, g_pinDepth != nullptr, g_queue != nullptr); prev = now; } }
+    sl::DLSSGOptions opt{};
+    if (inputs) {
+        sl::Extent ext{ 0, 0, (uint32_t)g_cfg.renderW, (uint32_t)g_cfg.renderH };
+        D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel); ext.width = (uint32_t)vd.Width; ext.height = vd.Height;
+        sl::Resource rDepth(sl::ResourceType::eTex2d, g_depthOut, (uint32_t)kOutState);
+        sl::Resource rMv(sl::ResourceType::eTex2d, g_mvOut, (uint32_t)kOutState);
+        sl::Resource rHud(sl::ResourceType::eTex2d, g_hudless, (uint32_t)D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        sl::ResourceTag tags[3] = {
+            sl::ResourceTag(&rDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &ext),
+            sl::ResourceTag(&rMv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &ext),
+            sl::ResourceTag(&rHud, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, nullptr) };
+        uint32_t nt = 2; if (g_cfg.hudless && hudOk && g_hudless) nt = 3;
+        sl::Result r1 = g_useFrameTags ? p_slSetTagForFrame(*ctx.tok, vp, tags, nt, nullptr) : p_slSetTag(vp, tags, nt, nullptr);
+        sl::Result r2 = p_slSetConstants(consts, *ctx.tok, vp);
+        static int s_r = 0; if (s_r < 4 || r1 != sl::Result::eOk || r2 != sl::Result::eOk) { if (s_r < 40) Log("frame=%d tags(%u)=%d %s constants=%d %s hud=%d", fr, nt, (int)r1, SlStr(r1), (int)r2, SlStr(r2), (int)(nt == 3)); s_r++; }
+        opt.mode = sl::DLSSGMode::eOn; opt.numFramesToGenerate = (uint32_t)(g_cfg.mult - 1);
+        opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        { DXGI_SWAP_CHAIN_DESC sd = {}; if (SUCCEEDED(sc->GetDesc(&sd))) { opt.numBackBuffers = sd.BufferCount; opt.colorWidth = sd.BufferDesc.Width; opt.colorHeight = sd.BufferDesc.Height; opt.colorBufferFormat = (uint32_t)sd.BufferDesc.Format; } }
+        opt.mvecDepthWidth = ext.width; opt.mvecDepthHeight = ext.height; opt.mvecBufferFormat = (uint32_t)DXGI_FORMAT_R16G16_FLOAT; opt.depthBufferFormat = (uint32_t)DXGI_FORMAT_R32_FLOAT;
+        g_wasOn = true; g_lastOnFrame = fr;
+    } else { opt.mode = sl::DLSSGMode::eOff; opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff; g_wasOn = false; }
+    // clamp the multiplier to what the GPU supports
+    static uint32_t s_maxGen = 0;
+    if (s_maxGen && opt.numFramesToGenerate > s_maxGen) opt.numFramesToGenerate = s_maxGen;
+    sl::Result ro = p_DLSSGSetOptions(vp, opt);
+    static int s_o = 0; if (ro != sl::Result::eOk && s_o++ < 20) Log("slDLSSGSetOptions(mode=%d gen=%u) -> %d %s", (int)opt.mode, opt.numFramesToGenerate, (int)ro, SlStr(ro));
+    if (p_DLSSGGetState && (g_stateLog < 6 || (fr % 120) == 0) && fr > g_cfg.warmup) {
+        sl::DLSSGState st{}; sl::Result rs = p_DLSSGGetState(vp, st, nullptr);
+        if (rs == sl::Result::eOk) { s_maxGen = st.numFramesToGenerateMax; Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
+        else Log("slDLSSGGetState -> %d %s", (int)rs, SlStr(rs));
+        g_stateLog++;
+    }
+    // Best-effort proof that frames are really being generated: compare the game's Present() rate with the swap chain's own
+    // present counter (generated frames are presented by Streamline on the same swap chain). ratio ~2.0 => frame generation works.
+    {
+        static LARGE_INTEGER s_f = {}, s_t0 = {}; static int s_fr0 = 0; static UINT s_pc0 = 0; static bool s_have = false;
+        if (!s_f.QuadPart) QueryPerformanceFrequency(&s_f);
+        if (fr > g_cfg.warmup && (fr % 300) == 0) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            DXGI_FRAME_STATISTICS fs = {}; HRESULT hs = sc->GetFrameStatistics(&fs);
+            if (s_have && SUCCEEDED(hs)) {
+                double dt = (double)(now.QuadPart - s_t0.QuadPart) / (double)s_f.QuadPart; int dFr = fr - s_fr0; UINT dPc = fs.PresentCount - s_pc0;
+                Log("RATE: game present %.1f/s | swapchain PresentCount %.1f/s | ratio %.2f (about 2.0 = frame generation active, 1.0 = not generating)", dFr / dt, dPc / dt, dFr ? (double)dPc / dFr : 0.0);
+            } else if (FAILED(hs)) Log("RATE: GetFrameStatistics failed 0x%08X", (unsigned)hs);
+            s_t0 = now; s_fr0 = fr; s_pc0 = SUCCEEDED(hs) ? fs.PresentCount : 0; s_have = SUCCEEDED(hs);
+        }
+    }
+    Marker(sl::PCLMarker::ePresentStart, ctx);
+    return ctx;
+}
+static void OnPresentEnd(const FrameCtx& ctx) { Marker(sl::PCLMarker::ePresentEnd, ctx); }
+
+static void CheckDeviceRemoved() {
+    if (g_deviceLost.load() || !g_device) return;
+    HRESULT hr = g_device->GetDeviceRemovedReason();
+    if (FAILED(hr)) { g_deviceLost = true; Log("DEVICE REMOVED reason=0x%08X (frame=%d)", (unsigned)hr, g_frame.load()); }
+}
+
+static VHook g_hPresent, g_hPresent1, g_hCSC, g_hCSCH;
+static thread_local int t_depth = 0;
+static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* sc, UINT s, UINT f) {
+    auto o = (HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT))OrigOf(g_hPresent, sc);
+    if (!o) return E_FAIL;
+    bool outer = (t_depth++ == 0); FrameCtx ctx;
+    if (outer) { CheckDeviceRemoved(); try { ctx = OnPresentBegin(sc); } catch (...) { Log("exception in OnPresentBegin"); } }
+    HRESULT r = o(sc, s, f);
+    if (outer) { try { OnPresentEnd(ctx); } catch (...) {} }
+    t_depth--; return r;
+}
+static HRESULT STDMETHODCALLTYPE hkPresent1(IDXGISwapChain1* sc, UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p) {
+    auto o = (HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*))OrigOf(g_hPresent1, sc);
+    if (!o) return E_FAIL;
+    bool outer = (t_depth++ == 0); FrameCtx ctx;
+    if (outer) { CheckDeviceRemoved(); try { ctx = OnPresentBegin(sc); } catch (...) { Log("exception in OnPresentBegin"); } }
+    HRESULT r = o(sc, s, f, p);
+    if (outer) { try { OnPresentEnd(ctx); } catch (...) {} }
+    t_depth--; return r;
+}
+
+// ------------------------------------------------------------------ swap chain / factory / device hooks
+static ID3D12CommandQueue* NativeQueueOf(IUnknown* q) {
+    if (!q) return nullptr;
+    ID3D12CommandQueue* cq = nullptr; if (FAILED(q->QueryInterface(__uuidof(ID3D12CommandQueue), (void**)&cq)) || !cq) return nullptr;
+    void* nat = nullptr;
+    if (p_slGetNativeInterface && p_slGetNativeInterface((void*)cq, &nat) == sl::Result::eOk && nat) { cq->Release(); return (ID3D12CommandQueue*)nat; }
+    return cq;   // already native (reference intentionally kept)
+}
+static void OnSwapChainCreated(IUnknown* queueUnk, IDXGISwapChain* sc) {
+    if (!sc) return;
+    ID3D12CommandQueue* nq = NativeQueueOf(queueUnk);
+    if (nq) { D3D12_COMMAND_QUEUE_DESC qd = QDesc(nq); Log("swap chain created: queue proxy/native=%p native=%p type=%d", (void*)queueUnk, (void*)nq, (int)qd.Type); if (qd.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) g_queue = nq; }
+    else Log("swap chain created with a non-D3D12 queue (D3D11?) - frame generation will not work");
+    DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; Log("swap chain %ux%u fmt=%d buffers=%u effect=%d", g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (int)d.SwapEffect); }
+    void** vt = *(void***)sc; bool a = HookVt(g_hPresent, vt, 8, (void*)hkPresent);
+    IDXGISwapChain1* s1 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&s1)) && s1) { HookVt(g_hPresent1, *(void***)s1, 22, (void*)hkPresent1); s1->Release(); }
+    Log("Present hooked (new vtable=%d)", (int)a);
+}
+static HRESULT STDMETHODCALLTYPE hkCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out) {
+    auto o = (HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**))OrigOf(g_hCSC, f);
+    if (!o) return E_FAIL;
+    EnsureSlDeviceFromQueue(dev);
+    HRESULT hr = o(f, dev, d, out);
+    if (SUCCEEDED(hr) && out && *out) OnSwapChainCreated(dev, *out);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hw, const DXGI_SWAP_CHAIN_DESC1* d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fd, IDXGIOutput* out, IDXGISwapChain1** sc) {
+    auto o = (HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**))OrigOf(g_hCSCH, f);
+    if (!o) return E_FAIL;
+    EnsureSlDeviceFromQueue(dev);
+    HRESULT hr = o(f, dev, hw, d, fd, out, sc);
+    if (SUCCEEDED(hr) && sc && *sc) OnSwapChainCreated(dev, (IDXGISwapChain*)*sc);
+    return hr;
+}
+static void PatchFactory(IUnknown* fac) {
+    if (!fac) return;
+    IDXGIFactory* f1 = nullptr;
+    if (SUCCEEDED(fac->QueryInterface(__uuidof(IDXGIFactory), (void**)&f1)) && f1) { if (HookVt(g_hCSC, *(void***)f1, 10, (void*)hkCreateSwapChain)) Log("factory CreateSwapChain hooked"); f1->Release(); }
+    IDXGIFactory2* f2 = nullptr;
+    if (SUCCEEDED(fac->QueryInterface(__uuidof(IDXGIFactory2), (void**)&f2)) && f2) { if (HookVt(g_hCSCH, *(void***)f2, 15, (void*)hkCreateSwapChainForHwnd)) Log("factory CreateSwapChainForHwnd hooked"); f2->Release(); }
+}
+
+static thread_local bool t_inSL = false;
+// Streamline must be initialised BEFORE the game creates its D3D12 device. Doing slInit on a background thread raced with the game
+// (the device was created first -> no SL proxy device/queue -> no frame generation). Now the hooks are installed immediately and
+// Streamline is initialised lazily, synchronously, inside the first hooked D3D12/DXGI call (outside the loader lock).
+static std::once_flag g_slOnce;
+static bool EnsureSL() {
+    if (t_inSL) return g_slInitOk;   // re-entrant call coming from Streamline itself
+    std::call_once(g_slOnce, [] {
+        t_inSL = true;
+        bool ok = false; try { ok = InitStreamline(); } catch (...) { Log("exception in InitStreamline"); }
+        t_inSL = false;
+        if (!ok) Log("Streamline init failed -> game runs unmodified (hooks pass through)");
+    });
+    return g_slInitOk;
+}
+// true = call the original function (our own warm-up thread, or Streamline calling back into us). Otherwise the game waits here until the shader cache is ready.
+static bool PassThrough() { if (t_prewarm) return true; WaitPrewarm(); return t_inSL || !EnsureSL(); }
+static bool g_devHooked = false; static std::mutex g_devHookMx;
+
+static void InstallNativeHooks(ID3D12Device* nat) {
+    std::lock_guard<std::mutex> lk(g_devHookMx);
+    if (g_devHooked) return;
+    void** vtDev = *(void***)nat;
+    g_rtvInc = nat->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV); g_dsvInc = nat->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    // dummy queue + command list on the native device to read their (shared) vtables
+    ID3D12CommandQueue* q = nullptr; ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(nat->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&q)) || FAILED(nat->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&al)) ||
+        FAILED(nat->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl))) { Log("InstallNativeHooks: dummy objects failed"); return; }
+    void** vtQ = *(void***)q; void** vtCL = *(void***)cl; cl->Close();
+    oCreateCBVStub:;
+    oCreateSRV = (PFN_CreateSRV)Patch(vtDev, 18, (void*)hkCreateSRV);
+    oCreateRTV = (PFN_CreateRTV)Patch(vtDev, 20, (void*)hkCreateRTV);
+    oCreateDSV = (PFN_CreateDSV)Patch(vtDev, 21, (void*)hkCreateDSV);
+    oCopyDescSimple = (PFN_CopyDescSimple)Patch(vtDev, 24, (void*)hkCopyDescSimple);
+    oCreateCommitted = (PFN_CreateCommitted)Patch(vtDev, 27, (void*)hkCreateCommitted);
+    oCreatePlaced = (PFN_CreatePlaced)Patch(vtDev, 29, (void*)hkCreatePlaced);
+    oExec = (PFN_Exec)Patch(vtQ, 10, (void*)hkExec);
+    oCopyTex = (PFN_CopyTex)Patch(vtCL, 16, (void*)hkCopyTex);
+    oResBarrier = (PFN_ResBarrier)Patch(vtCL, 26, (void*)hkResBarrier);
+    oOMSetRT = (PFN_OMSetRT)Patch(vtCL, 46, (void*)hkOMSetRT);
+    oClearDSV = (PFN_ClearDSV)Patch(vtCL, 47, (void*)hkClearDSV);
+    oClearRTV = (PFN_ClearRTV)Patch(vtCL, 48, (void*)hkClearRTV);
+    oSetCCbv = (PFN_SetRootCbv)Patch(vtCL, 37, (void*)hkSetCCbv);
+    oSetGCbv = (PFN_SetRootCbv)Patch(vtCL, 38, (void*)hkSetGCbv);
+    if (g_cfg.hudless) { oDrawInst = (PFN_DrawInst)Patch(vtCL, 12, (void*)hkDrawInst); oDrawIdxInst = (PFN_DrawIdxInst)Patch(vtCL, 13, (void*)hkDrawIdxInst); }
+    cl->Release(); al->Release(); q->Release();
+    g_devHooked = true; Log("native D3D12 hooks installed (device vtable=%p queue vtable=%p cl vtable=%p)", (void*)vtDev, (void*)vtQ, (void*)vtCL);
+}
+static void OnDeviceCreated(IUnknown* dev) {
+    if (!dev) return;
+    ID3D12Device* d = nullptr; if (FAILED(dev->QueryInterface(__uuidof(ID3D12Device), (void**)&d)) || !d) return;
+    void* nat = nullptr; ID3D12Device* use = d;
+    if (p_slGetNativeInterface && p_slGetNativeInterface((void*)d, &nat) == sl::Result::eOk && nat) use = (ID3D12Device*)nat;
+    Log("D3D12 device created: returned=%p native=%p", (void*)d, (void*)use);
+    InstallNativeHooks(use);
+    d->Release();
+}
+static HRESULT WINAPI hkD3D12CreateDevice(IUnknown* ad, D3D_FEATURE_LEVEL fl, REFIID riid, void** ppDev) {
+    if (PassThrough()) return oD3D12CreateDevice(ad, fl, riid, ppDev);
+    t_inSL = true; HRESULT hr = pSL_D3D12CreateDevice(ad, fl, riid, ppDev); t_inSL = false;
+    Log("D3D12CreateDevice -> 0x%08X (ppDev=%p)", (unsigned)hr, (void*)ppDev);
+    if (SUCCEEDED(hr) && ppDev && *ppDev) OnDeviceCreated((IUnknown*)*ppDev);
+    return hr;
+}
+static HRESULT WINAPI hkCreateDXGIFactory(REFIID riid, void** pp) {
+    if (PassThrough()) return oCreateDXGIFactory(riid, pp);
+    t_inSL = true; HRESULT hr = pSL_CreateDXGIFactory(riid, pp); t_inSL = false;
+    if (SUCCEEDED(hr) && pp && *pp) PatchFactory((IUnknown*)*pp); return hr;
+}
+static HRESULT WINAPI hkCreateDXGIFactory1(REFIID riid, void** pp) {
+    if (PassThrough()) return oCreateDXGIFactory1(riid, pp);
+    t_inSL = true; HRESULT hr = pSL_CreateDXGIFactory1(riid, pp); t_inSL = false;
+    if (SUCCEEDED(hr) && pp && *pp) PatchFactory((IUnknown*)*pp); return hr;
+}
+static HRESULT WINAPI hkCreateDXGIFactory2(UINT fl, REFIID riid, void** pp) {
+    if (PassThrough() || !pSL_CreateDXGIFactory2) return oCreateDXGIFactory2(fl, riid, pp);
+    t_inSL = true; HRESULT hr = pSL_CreateDXGIFactory2(fl, riid, pp); t_inSL = false;
+    if (SUCCEEDED(hr) && pp && *pp) PatchFactory((IUnknown*)*pp); return hr;
+}
+
+static DWORD WINAPI InitThread(LPVOID) {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    g_dir = exe; g_dir = g_dir.substr(0, g_dir.find_last_of(L'\\'));
+    LoadCfg();
+    if (g_cfg.log) AddVectoredExceptionHandler(1, DiagVEH);
+    if (g_cfg.stage < 1 || !g_cfg.fg) { Log("stage=%d fg=%d -> pass-through, nothing hooked", g_cfg.stage, g_cfg.fg); return 0; }
+    // make sure the system D3D12/DXGI are loaded before we hook their exports (the game loads the same modules later)
+    HMODULE m12 = LoadLibraryW(L"d3d12.dll"), mdx = LoadLibraryW(L"dxgi.dll");
+    if (!m12 || !mdx) { Log("d3d12/dxgi load failed"); return 0; }
+    // Streamline itself is initialised lazily from the first hooked call (see EnsureSL)
+    if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return 0; }
+    void* tDev = (void*)GetProcAddress(m12, "D3D12CreateDevice"); void* tF = (void*)GetProcAddress(mdx, "CreateDXGIFactory");
+    void* tF1 = (void*)GetProcAddress(mdx, "CreateDXGIFactory1"); void* tF2 = (void*)GetProcAddress(mdx, "CreateDXGIFactory2");
+    int ok = 0;
+    if (tDev) ok += MH_CreateHook(tDev, (void*)hkD3D12CreateDevice, (void**)&oD3D12CreateDevice) == MH_OK;
+    if (tF) ok += MH_CreateHook(tF, (void*)hkCreateDXGIFactory, (void**)&oCreateDXGIFactory) == MH_OK;
+    if (tF1) ok += MH_CreateHook(tF1, (void*)hkCreateDXGIFactory1, (void**)&oCreateDXGIFactory1) == MH_OK;
+    if (tF2) ok += MH_CreateHook(tF2, (void*)hkCreateDXGIFactory2, (void**)&oCreateDXGIFactory2) == MH_OK;
+    PrewarmInit();   // game's D3D12/DXGI creation calls will wait for the shader warm-up from the moment the hooks are live
+    MH_STATUS es = MH_EnableHook(MH_ALL_HOOKS);
+    Log("MinHook: %d hooks created, enable -> %d (D3D12CreateDevice=%p CreateDXGIFactory=%p/1=%p/2=%p)", ok, (int)es, tDev, tF, tF1, tF2);
+    PrewarmStart();
+    // if the game already created its device before we got here, we cannot recover (log it so we know)
+    return 0;
+}
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); LoadRealWinmm(); CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr); }
+    return TRUE;
+}
