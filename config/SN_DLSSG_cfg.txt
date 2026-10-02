@@ -6,28 +6,37 @@
 # hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)
 # hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')
 # renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance
-# camauto   : 1 = (default) automatically find the camera matrices in the UE4 view buffer when projoff/noaaoff/mvoff do not match this game (log: cam-scan LOCKED ...)
-# projoff/noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 in Scarlet Nexus)
+# camauto   : 1 = automatically find the camera matrices in the UE4 view buffer when the offsets below do not fit this game (look for 'cam-scan: LOCKED' in the log)
+# projoff / noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 for Scarlet Nexus)
 # mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)
 # warmup    : frames before frame generation is switched on
 # reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)
-# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)
-# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)
+# fgminfps : >0 = pause frame generation while the BASE fps is below this value (busy scenes), resume at value+8 (0 = never)
+# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental)
+# log       : 1 = normal log, 2 = + verbose Streamline log (debug only, slow)
+# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads
+# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)
 # sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)
 fg=1
 mult=2
 stage=2
-log=0
+log=1
 hudless=0
 hudlessdraw=2
 renderw=2000
 renderh=1124
 tol=100
 mvoff=492
+projoff=116
+noaaoff=132
+camauto=1
 warmup=150
 reflexsleep=1
 baseFpsLimit=0
 showconsole=0
-shadercache=1
-splash=1
 sldir=
+fgminfps=35
+reflexplace=0
+fgdelay=30
+bufmaxmb=192
+psoretry=1
