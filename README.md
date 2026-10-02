@@ -27,13 +27,55 @@ It includes automatic detection of different UE4 view-buffer layouts to improve 
 | Scarlet Nexus   | UE4    | DX12  | Working    | Primary test case                          |
 | Code Vein       | UE4    | DX12  | Working    | Older UE4 view-buffer layout supported     |
 
-## Installation (basic)
+## Installation
 
-1. Build the project (see below) or use a release binary when available.
-2. Place `winmm.dll` next to the game executable.
-3. Place the required Streamline / DLSS-G files (obtained from official NVIDIA sources) next to the executable or in a folder specified in the config.
-4. Place a config file (example provided in `config/`) next to the executable.
-5. Launch the game.
+### 1. Files you need
+
+| File | Where to get it | Notes |
+| ---- | --------------- | ----- |
+| `winmm.dll` | This project (Releases page, or build it yourself) | The injector itself |
+| `sl.interposer.dll` | NVIDIA Streamline SDK | Required |
+| `sl.common.dll` | NVIDIA Streamline SDK | Required |
+| `sl.dlss_g.dll` | NVIDIA Streamline SDK | Frame Generation plugin |
+| `sl.reflex.dll` | NVIDIA Streamline SDK | Required by DLSS-G |
+| `sl.pcl.dll` | NVIDIA Streamline SDK | Required by DLSS-G |
+| `nvngx_dlssg.dll` | NVIDIA Streamline SDK | DLSS-G model |
+| config file | `config/` folder in this repo | Copy and edit if needed |
+
+Get the Streamline files from NVIDIA's official repository
+(https://github.com/NVIDIAGameWorks/Streamline). Use the **production**
+(not development) DLLs from the SDK's `bin/x64` folder. Use the same SDK
+version for all files. The versions I tested with: **[fill in, e.g. 2.x.x]**.
+
+These files are NOT included in this repository or in the releases.
+
+### 2. Folder layout
+
+Put everything in the same folder as the game's executable
+(the `.exe` inside `...\Binaries\Win64\` for Unreal Engine games):
+
+    Binaries\Win64\
+    ├── ScarletNexus-Win64-Shipping.exe     (the game's own exe)
+    ├── winmm.dll
+    ├── sl.interposer.dll
+    ├── sl.common.dll
+    ├── sl.dlss_g.dll
+    ├── sl.reflex.dll
+    ├── sl.pcl.dll
+    ├── nvngx_dlssg.dll
+    └── SN_DLSSG_cfg.txt
+
+### 3. Run
+
+1. Launch the game in **DirectX 12 mode**.
+2. [How to enable FG: hotkey / config option / automatic. Fill in.]
+3. To uninstall, delete the files you added.
+
+### Troubleshooting
+
+- Game crashes at startup: check that all Streamline DLLs come from the
+  same SDK version, and that the game is running in DX12.
+- Please attach the log when opening an issue.
 
 > Detailed usage instructions, Streamline file requirements, and config options will be expanded as more testing is completed.
 
