@@ -105,8 +105,12 @@ No NVIDIA proprietary binaries are redistributed.
 Streamline headers and MinHook are fetched at build time.
 See THIRD_PARTY_NOTICES.md for details.
 
-Development
-This project was developed with assistance from Claude Sonnet 5.5.
+## Development
+
+This project was written entirely by an AI model (Claude Sonnet 5.5, by
+Anthropic). I directed the work, tested it on real games, and verified
+the results myself. I did not write the code by hand.
+
 Disclaimer
 This project is not affiliated with, endorsed by, or connected to NVIDIA Corporation.
 
