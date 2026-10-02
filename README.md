@@ -68,8 +68,7 @@ Put everything in the same folder as the game's executable
 ### 3. Run
 
 1. Launch the game in **DirectX 12 mode**.
-2. [How to enable FG: hotkey / config option / automatic. Fill in.]
-3. To uninstall, delete the files you added.
+2. To uninstall, delete the files you added.
 
 ### Troubleshooting
 
