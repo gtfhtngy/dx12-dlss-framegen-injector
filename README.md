@@ -81,12 +81,15 @@ Put everything in the same folder as the game's executable
 
 ## Building
 
-```bash
+```
 # On Linux (requires git + mingw-w64)
 sudo apt install g++-mingw-w64-x86-64-posix git
 cd src
 sh build.sh
-This produces winmm.dll.
+```
+
+This produces `winmm.dll`. Dependencies (MinHook + Streamline headers)
+are fetched automatically at build time.
 
 Dependencies (MinHook + Streamline headers) are fetched automatically at build time.
 Known Limitations
