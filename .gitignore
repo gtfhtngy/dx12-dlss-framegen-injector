@@ -1,0 +1,7 @@
+*.dll
+*.exe
+*.o
+obj/
+deps/
+*.snsc
+*_log.txt
