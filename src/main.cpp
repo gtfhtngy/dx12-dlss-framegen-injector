@@ -18,6 +18,8 @@
 #include <d3dcommon.h>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
+#include <tuple>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -75,12 +77,17 @@ struct Cfg {
     int projOff = 116;       // float index of ViewToClip (jittered)
     int jitSX = 1, jitSY = 1, mvSX = 1, mvSY = 1;
     int warmup = 150;        // frames to wait before enabling
-    int camStale = 6;        // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view)
+    int psoRetry = 1;        // v17: 1 = if the GAME's CreateGraphicsPipelineState fails with E_INVALIDARG, log the full desc and retry once without CachedPSO
+    int camStale = 30;       // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view). v16: 6 -> 30 (short hitches no longer toggle FG)
     int farPlane = 1000000;
     int camAuto = 1;         // 1 = if the view buffer is not found at projoff/noaaoff/mvoff, scan the buffer and lock onto the real offsets (other UE4 games)
     int reflexSleep = 1;     // 1 = call slReflexSleep every frame (needed for DLSS-G pacing)
     int baseFpsLimit = 0;    // Reflex frame limiter for the BASE frame rate (needs reflexsleep=1)
     int showConsole = 0;     // only works with the 'development' Streamline DLLs
+    int fgMinFps = 0;        // >0: switch frame generation OFF while the BASE fps stays below this value (busy scenes), back ON when it recovers
+    int fgDelay = 30;        // frames the camera must be valid IN A ROW before frame generation is (re)enabled (stops on/off flapping during loading/fades)
+    int bufMaxMB = 192;      // upper bound for upload buffers kept alive by the camera tracker (texture-streaming staging buffers are huge during loads)
+    int reflexPlace = 0;     // 1 = call slReflexSleep + SimulationStart at the START of the game frame (end of the previous Present) instead of inside Present
     int ngxLog = 0;
     int shaderCache = 1;     // 1 = build shaders before the game starts and keep them in SN_DLSSG_shaders.snsc (no run-time compile hitch)
     int splash = 1;          // 1 = show the progress window while the cache is being built (only when something has to be built)
@@ -90,10 +97,15 @@ struct Cfg {
 static std::wstring g_dir;
 static FILE* g_log = nullptr;
 static std::mutex g_logMx;
+static size_t g_logBytes = 0; static DWORD g_lastFlush = 0;
+static void LogFlush() { if (!g_log) return; std::lock_guard<std::mutex> lk(g_logMx); fflush(g_log); }
 static void Log(const char* fmt, ...) {
     if (!g_log) return;
     std::lock_guard<std::mutex> lk(g_logMx);
-    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); fprintf(g_log, "\n"); fflush(g_log); va_end(ap);
+    if (g_logBytes > (24u << 20)) return;                 // never let the log grow without bound in long sessions
+    va_list ap; va_start(ap, fmt); int n = vfprintf(g_log, fmt, ap); va_end(ap); fputc('\n', g_log);
+    if (n > 0) g_logBytes += (size_t)n + 1;
+    DWORD now = GetTickCount(); if (now - g_lastFlush > 1000) { fflush(g_log); g_lastFlush = now; }   // flushing every line stalls the render thread
 }
 static void LogW(const wchar_t* w) {
     if (!g_log) return; char b[1024]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, nullptr, nullptr); Log("%s", b);
@@ -119,7 +131,7 @@ static void LoadCfg() {
                 "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
                 "# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)\n"
                 "# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)\n"
-                "fg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n");
+                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n");
             fclose(f);
         }
     } else {
@@ -134,9 +146,11 @@ static void LoadCfg() {
             else if (!strcmp(k, "renderw")) g_cfg.renderW = iv; else if (!strcmp(k, "renderh")) g_cfg.renderH = iv; else if (!strcmp(k, "tol")) g_cfg.tol = iv;
             else if (!strcmp(k, "mvoff")) g_cfg.mvOff = iv; else if (!strcmp(k, "noaaoff")) g_cfg.noAAOff = iv; else if (!strcmp(k, "projoff")) g_cfg.projOff = iv;
             else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
-            else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv; else if (!strcmp(k, "camauto")) g_cfg.camAuto = iv;
+            else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "psoretry")) g_cfg.psoRetry = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv; else if (!strcmp(k, "camauto")) g_cfg.camAuto = iv;
             else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
             else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
+            else if (!strcmp(k, "fgminfps")) g_cfg.fgMinFps = iv; else if (!strcmp(k, "reflexplace")) g_cfg.reflexPlace = iv;
+            else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
             else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
         }
@@ -165,6 +179,7 @@ static LONG CALLBACK DiagVEH(PEXCEPTION_POINTERS ep) {
                 const char* b = strrchr(sn, '\\');
                 Log("  #%02u %p %s+0x%llX", (unsigned)i, st[i], b ? b + 1 : sn, (unsigned long long)((BYTE*)st[i] - (BYTE*)sm));
             }
+            LogFlush();
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -264,7 +279,7 @@ static bool InitStreamline() {
 
     sl::Preferences pref{};
     pref.showConsole = g_cfg.showConsole != 0;
-    pref.logLevel = g_cfg.log ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
+    pref.logLevel = (g_cfg.log >= 2) ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;   // verbose SL logging = thousands of lines/second -> stutter + huge files
     static const wchar_t* paths[1]; paths[0] = g_cfg.slDir.c_str();
     pref.pathsToPlugins = paths; pref.numPathsToPlugins = 1;
     pref.pathToLogsAndData = g_cfg.log ? g_dir.c_str() : nullptr;
@@ -283,10 +298,10 @@ static bool InitStreamline() {
 
 // ------------------------------------------------------------------ resource tracking (ported from the DLAA project)
 static bool IsInternal(UINT w, UINT h) { return abs((int)w - g_cfg.renderW) <= g_cfg.tol && abs((int)h - g_cfg.renderH) <= g_cfg.tol; }
-struct ResMeta { ID3D12Resource* res = nullptr; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE; int useClear = 0, useSetRT = 0, useCopySrc = 0, useCopyDst = 0, useSRV = 0; bool held = false; bool cand = false; };
+struct ResMeta { ID3D12Resource* res = nullptr; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE; std::atomic<int> useClear{0}, useSetRT{0}, useCopySrc{0}, useCopyDst{0}, useSRV{0}; int score = 0; bool held = false; bool cand = false; };
 static std::unordered_map<void*, ResMeta> g_res;
 static std::unordered_map<SIZE_T, void*> g_rtvToRes, g_dsvToRes;
-static std::mutex g_resMx;
+static std::shared_mutex g_resMx; static std::mutex g_stateMx;
 static UINT g_rtvInc = 0, g_dsvInc = 0;
 static ID3D12Device* g_device = nullptr;
 static ID3D12CommandQueue* g_queue = nullptr;          // the game's direct queue (the one the swap chain was created with)
@@ -295,6 +310,7 @@ static std::atomic<int> g_effW{0}, g_effH{0};   // real size of the pinned depth
 static inline int EffW() { int v = g_effW.load(); return v ? v : g_cfg.renderW; }
 static inline int EffH() { int v = g_effH.load(); return v ? v : g_cfg.renderH; }
 static ID3D12Resource* g_pinVel = nullptr; static ID3D12Resource* g_pinDepth = nullptr;
+static std::atomic<bool> g_forceReset{false};   // next DLSS-G frame is sent with reset=true (pins changed, hitch, MV buffers re-created)
 
 static void RegisterRes(ID3D12Resource* res) {
     if (!res) return;
@@ -302,19 +318,19 @@ static void RegisterRes(ID3D12Resource* res) {
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
     bool depth = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
     bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || d.Format == DXGI_FORMAT_R16G16_UNORM);
-    std::lock_guard<std::mutex> lk(g_resMx);
-    if (!cand && !g_res.count((void*)res)) return;
+    if (!cand) { std::shared_lock<std::shared_mutex> sl(g_resMx); if (!g_res.count((void*)res)) return; }   // loading creates thousands of RTV/DSV/SRVs: no exclusive lock for those
+    std::lock_guard<std::shared_mutex> lk(g_resMx);
     auto& m = g_res[(void*)res];
     m.res = res; m.w = (UINT)d.Width; m.h = d.Height; m.fmt = d.Format; m.flags = d.Flags; m.cand = cand;
     if (cand && !m.held) { res->AddRef(); m.held = true; }   // keep alive: we keep raw pointers across frames
 }
-static void NoteUse(void* p, int kind) {
+static void NoteUse(void* p, int kind) {   // hot path (every render-target bind / clear / copy on every worker thread): shared lock + atomic counters
     if (!p) return;
-    std::lock_guard<std::mutex> lk(g_resMx);
+    std::shared_lock<std::shared_mutex> lk(g_resMx);
     auto it = g_res.find(p); if (it == g_res.end()) return;
     if (kind == 0) it->second.useClear++; else if (kind == 1) it->second.useSetRT++; else if (kind == 2) it->second.useCopySrc++; else if (kind == 3) it->second.useCopyDst++; else it->second.useSRV++;
 }
-static void* LookupRTV(D3D12_CPU_DESCRIPTOR_HANDLE h) { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_rtvToRes.find(h.ptr); return it != g_rtvToRes.end() ? it->second : nullptr; }
+static void* LookupRTV(D3D12_CPU_DESCRIPTOR_HANDLE h) { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_rtvToRes.find(h.ptr); return it != g_rtvToRes.end() ? it->second : nullptr; }
 
 // ---- barrier state tracking (last StateAfter for candidate resources)
 using PFN_ResBarrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
@@ -323,36 +339,55 @@ struct SubSt { UINT st[2] = { 0, 0 }; bool known[2] = { false, false }; };
 static std::unordered_map<void*, SubSt> g_state;
 static void STDMETHODCALLTYPE hkResBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     oResBarrier(cl, n, b);
-    std::lock_guard<std::mutex> lk(g_resMx);
+    std::shared_lock<std::shared_mutex> lk(g_resMx);     // thousands of barriers per frame on many threads: shared lock, exclusive only for the (rare) candidate
     for (UINT i = 0; i < n; i++) {
         if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
         void* r = b[i].Transition.pResource; UINT sub = b[i].Transition.Subresource;
         if (sub != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && sub > 1) continue;
         auto it = g_res.find(r); if (it == g_res.end() || !it->second.cand) continue;
+        std::lock_guard<std::mutex> sl(g_stateMx);
         auto& ss = g_state[r]; UINT st = (UINT)b[i].Transition.StateAfter;
         if (sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) { ss.st[0] = ss.st[1] = st; ss.known[0] = ss.known[1] = true; }
         else { ss.st[sub] = st; ss.known[sub] = true; }
     }
 }
-static bool GetSubState(void* r, UINT sub, UINT* st) { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_state.find(r); if (it == g_state.end() || !it->second.known[sub]) return false; *st = it->second.st[sub]; return true; }
+static bool GetSubState(void* r, UINT sub, UINT* st) { std::lock_guard<std::mutex> lk(g_stateMx); auto it = g_state.find(r); if (it == g_state.end() || !it->second.known[sub]) return false; *st = it->second.st[sub]; return true; }
 
 // ---- camera / jitter from the UE4 view uniform buffer (upload heap buffers are mapped once and kept)
-struct BufInfo { UINT64 size; ID3D12Resource* res; BYTE* map; };
-static std::map<UINT64, BufInfo> g_bufs; static std::mutex g_bufMx;
+struct BufInfo { UINT64 size = 0; ID3D12Resource* res = nullptr; BYTE* map = nullptr; std::atomic<int> lastUse{0}; };
+static std::map<UINT64, BufInfo> g_bufs; static std::shared_mutex g_bufMx;
 static float g_vtcNoAA[16] = {}, g_c2p[16] = {}; static float g_jitPX = 0.f, g_jitPY = 0.f;
 static std::atomic<int> g_camFrame{-1}; static std::mutex g_camMx;
+// The registry keeps one reference to every upload buffer (>=64 KB) so the mapped pointer stays valid.
+// v13 never let go of them: after a long session the 4096-entry cap was full of buffers the game had destroyed long ago,
+// NEW constant-buffer pages were no longer registered -> the view buffer was "not found" -> frame generation flapped on/off (stutter + ghosting).
+// Now: a buffer whose only remaining reference is ours is dead for the game -> unmap + release it.   (caller holds g_bufMx exclusively)
+static UINT64 g_bufBytes = 0; static DWORD g_lastPrune = 0; static int g_regSincePrune = 0; static long g_prunedTotal = 0;
+static void PruneBuffersLocked() {
+    for (auto it = g_bufs.begin(); it != g_bufs.end();) {
+        ID3D12Resource* r = it->second.res; r->AddRef(); ULONG c = r->Release();
+        if (c <= 1) { g_bufBytes -= std::min<UINT64>(g_bufBytes, it->second.size); r->Unmap(0, nullptr); r->Release(); it = g_bufs.erase(it); g_prunedTotal++; } else ++it;
+    }
+    g_lastPrune = GetTickCount(); g_regSincePrune = 0;
+}
 static void RegisterUploadBuf(ID3D12Resource* r) {
     if (!r) return;
     D3D12_RESOURCE_DESC d = ResDesc(r); if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width < 65536) return;
+    if (d.Width > (UINT64)g_cfg.bufMaxMB * (1ull << 20) / 4) return;          // a camera/constant-buffer page is never this big; these are texture-streaming / mesh staging buffers
     D3D12_HEAP_PROPERTIES hp; D3D12_HEAP_FLAGS hf; if (FAILED(r->GetHeapProperties(&hp, &hf)) || hp.Type != D3D12_HEAP_TYPE_UPLOAD) return;
-    std::lock_guard<std::mutex> lk(g_bufMx);
-    if (g_bufs.size() >= 4096) return;
+    std::unique_lock<std::shared_mutex> lk(g_bufMx);
+    // while the game streams/loads it creates and destroys lots of big upload buffers. Every one we hold keeps its memory alive -> prune by TIME and BYTES, not by frame count
+    // (frames are rare during loading screens, so the v14 "every 120 frames" prune could let hundreds of MB of dead staging memory pile up)
+    DWORD now = GetTickCount();
+    if (g_bufBytes > (UINT64)g_cfg.bufMaxMB * (1ull << 20) || (++g_regSincePrune >= 64 && now - g_lastPrune > 250) || g_bufs.size() >= 6000) PruneBuffersLocked();
+    if (g_bufBytes > (UINT64)g_cfg.bufMaxMB * (1ull << 20) || g_bufs.size() >= 12000) return;
     void* ptr = nullptr; if (FAILED(r->Map(0, nullptr, &ptr)) || !ptr) return;
     r->AddRef();
-    g_bufs[r->GetGPUVirtualAddress()] = { d.Width, r, (BYTE*)ptr };
+    auto& e = g_bufs[r->GetGPUVirtualAddress()];
+    e.size = d.Width; e.res = r; e.map = (BYTE*)ptr; e.lastUse.store(g_frame.load()); g_bufBytes += d.Width;
 }
 static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0}, g_projSeen{0}, g_scanRuns{0}; static std::atomic<int> g_camLocked{0};
-static int g_lastJitFrame = -1000;
+static std::atomic<int> g_lastJitFrame{-1000};
 static bool IsProj(const float* m, bool loose) {
     float ref = (float)EffW() / (float)EffH(); float asp = m[5] / m[0];
     bool aspOk = loose ? (asp > 1.2f && asp < 2.6f) : fabsf(asp - ref) < 0.03f;
@@ -375,7 +410,7 @@ static void DumpViewBuf(const float* p, int avail, UINT64 off, const char* why) 
 }
 static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     static int s_frame = -1, s_budget = 0; int fr = g_frame.load();
-    if (fr != s_frame) { s_frame = fr; s_budget = 600; } if (s_budget-- <= 0) return;
+    if (fr != s_frame) { s_frame = fr; s_budget = 24; }   // v16: was 600 full-buffer scans per frame if (s_budget-- <= 0) return;
     g_scanRuns++;
     int ji = -1, nj = -1;
     for (int i = 0; i + 16 <= avail && ji < 0; i += 4) {
@@ -418,7 +453,7 @@ static bool Inv4d(const double* m, double* out) {
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][4 + c];
     return true;
 }
-static int g_lastRealViewFrame = -100000;
+static std::atomic<int> g_lastRealViewFrame{-100000};
 static bool TryLegacyLayout(const float* p, int availF) {
     if (availF < 480) return false;
     const float* a = p + 96;
@@ -448,37 +483,86 @@ static bool TryLegacyLayout(const float* p, int availF) {
     static int n = 0; if (n++ < 8) Log("camera(legacy layout): frame=%d %s jitter px=(%.4f,%.4f) m0=%.5f m5=%.5f near=%.3f viewsize=%.0fx%.0f c2p diag=%.5f %.5f %.5f %.5f", fr, dummy ? "DUMMY-identity-view" : "main-view", g_jitPX, g_jitPY, a[0], a[5], a[14], p[472], p[473], c2p[0], c2p[5], c2p[10], c2p[15]);
     return true;
 }
-static void TrackCamera(UINT64 va) {
-    g_cbvCalls++;
-    std::lock_guard<std::mutex> lk(g_bufMx);
-    auto it = g_bufs.upper_bound(va); if (it == g_bufs.begin()) { g_cbvMiss++; return; } --it;
-    UINT64 off = va - it->first; if (off >= it->second.size) { g_cbvMiss++; return; }
-    int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 3072);
-    const float* p = (const float*)(it->second.map + off);
+// Parses one view-buffer candidate (a COPY in normal memory). true = recognised as a camera view buffer.
+static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
     bool strict = availF >= std::max(g_cfg.mvOff + 16, 148) && g_cfg.projOff >= 0 && g_cfg.noAAOff >= 0 && g_cfg.mvOff >= 0;
     const float* a = nullptr; const float* b = nullptr; const float* c = nullptr;
     if (strict) { a = p + g_cfg.projOff; b = p + g_cfg.noAAOff; c = p + g_cfg.mvOff;
         if (!IsProj(a, false) || !IsProj(b, false) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) strict = false; }
     if (strict) { for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) strict = false; }
     if (!strict) {
-        if (g_cfg.camAuto && TryLegacyLayout(p, availF)) return;
-        if (g_cfg.camAuto && !g_camLocked.load() && availF >= 64) {
-            // upload heaps are write-combined = very slow to read: only look at buffers that are bound many times per frame (the view buffer), max 4 per frame
-            static int vaFrame = -1, scans = 0; static std::unordered_map<UINT64, int> cnt; int fr0 = g_frame.load();
-            if (fr0 != vaFrame) { vaFrame = fr0; scans = 0; cnt.clear(); }
-            if (++cnt[va] == 3 && scans < 4) { scans++; static float tmp[3072]; int nf = std::min(availF, 3072); memcpy(tmp, p, (size_t)nf * 4); ScanViewBuffer(tmp, nf, off); }
-        }
-        return;
+        if (g_cfg.camAuto && TryLegacyLayout(p, availF)) return true;
+        if (g_cfg.camAuto && !g_camLocked.load() && availF >= 64) ScanViewBuffer(p, availF, off);
+        return false;
     }
     int fr = g_frame.load();
     bool jittered = (a[8] != 0.f || a[9] != 0.f);
     if (jittered) g_lastJitFrame = fr;
-    else if (fr - g_lastJitFrame < 90) return;   // un-jittered view of a non-TAA pass while TAA is active: keep the last real one (no TAA at all -> accepted after 90 frames)
+    else if (fr - g_lastJitFrame < 90) return true;   // un-jittered view of a non-TAA pass while TAA is active: keep the last real one (no TAA at all -> accepted after 90 frames)
     std::lock_guard<std::mutex> lk2(g_camMx);
     memcpy(g_vtcNoAA, b, sizeof g_vtcNoAA); memcpy(g_c2p, c, sizeof g_c2p);
     g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY;
     g_camFrame = fr;
     static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f%s", fr, g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15], jittered ? "" : " (NO TAA jitter)");
+    return true;
+}
+
+// TrackCamera runs on EVERY SetGraphicsRootConstantBufferView / SetComputeRootConstantBufferView of the game, on every worker thread
+// (thousands per frame in a busy scene). v13 took a global mutex, did a std::map lookup and read the (write-combined = very slow to read)
+// upload memory on each of those calls. Now the common case is a few thread-local compares and an early return:
+//   - addresses already recognised as view buffers are re-read at most 3x per thread per frame (only the first ~2.5 KB)
+//   - unknown addresses are examined only when bound >=2x in a frame on one thread, max 24 probes per frame, and a rejected address is skipped for 30 frames
+struct TcEntry { UINT64 va = 0; int frame = -1; int cnt = 0; };
+struct TcTls { TcEntry e[256]; int readFrame = -1, readCnt = 0; };
+static thread_local TcTls t_tls;
+static std::atomic<UINT64> g_knownVA[16]; static std::atomic<unsigned> g_knownPos{0};
+static std::atomic<UINT64> g_negVA[256]; static std::atomic<int> g_negFrame[256];
+static std::atomic<int> g_probeFrame{-1}, g_probeCnt{0};
+static inline unsigned HashVA(UINT64 va) { return (unsigned)(((va >> 8) * 0x9E3779B97F4A7C15ull) >> 56); }
+static bool IsKnownVA(UINT64 va) { for (int i = 0; i < 16; i++) if (g_knownVA[i].load(std::memory_order_relaxed) == va) return true; return false; }
+static void AddKnownVA(UINT64 va) { if (!IsKnownVA(va)) g_knownVA[g_knownPos.fetch_add(1) & 15].store(va); }
+static void DropKnownVA(UINT64 va) { for (int i = 0; i < 16; i++) { UINT64 e = va; g_knownVA[i].compare_exchange_strong(e, 0); } }
+static __attribute__((noinline)) void ProbeView(UINT64 va, bool known, int fr) {
+    float tmp[3072]; int nf = 0; UINT64 off = 0;
+    {   // copy the head of the buffer once into normal memory (never parse straight from the write-combined mapping)
+        std::shared_lock<std::shared_mutex> lk(g_bufMx);
+        auto it = g_bufs.upper_bound(va); if (it == g_bufs.begin()) { g_cbvMiss++; return; } --it;
+        off = va - it->first; if (off >= it->second.size) { g_cbvMiss++; return; }
+        int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 3072);
+        nf = known ? std::min(availF, 640) : availF;
+        if (nf < 64) return;
+        memcpy(tmp, it->second.map + off, (size_t)nf * 4);
+        it->second.lastUse.store(fr, std::memory_order_relaxed);
+    }
+    bool ok = ParseViewBuffer(tmp, nf, off);
+    if (ok) { if (!known) AddKnownVA(va); }
+    else if (known) DropKnownVA(va);
+    else { unsigned h = HashVA(va); g_negVA[h].store(va); g_negFrame[h].store(fr); }
+}
+static std::atomic<long> g_probeN{0}, g_probeNs{0}, g_cbvPerFrame{0};
+static inline long long NowNs() { static LARGE_INTEGER f = {}; if (!f.QuadPart) QueryPerformanceFrequency(&f); LARGE_INTEGER n; QueryPerformanceCounter(&n); return (long long)((double)n.QuadPart * 1e9 / (double)f.QuadPart); }
+static void TrackCamera(UINT64 va) {
+    g_cbvCalls++;
+    int fr = g_frame.load(std::memory_order_relaxed);
+    TcTls& t = t_tls;
+    bool known = IsKnownVA(va);
+    if (known) {
+        if (t.readFrame != fr) { t.readFrame = fr; t.readCnt = 0; }
+        if (t.readCnt >= 3) return;
+        t.readCnt++;
+    } else {
+        unsigned h = HashVA(va);
+        TcEntry& e = t.e[h];
+        if (e.va != va || e.frame != fr) { e.va = va; e.frame = fr; e.cnt = 0; }
+        if (++e.cnt != 2) return;                       // only buffers bound >= 2x in one frame on this thread (the view buffer is bound by every pass)
+        // v16: while a BUSY 3D scene is rendering but no camera was found for >2 frames, search harder (more probes per frame, short negative cache:
+        // the allocator re-uses addresses, so an address rejected earlier may hold the view buffer now). Menus/loading (few CBV calls) are not boosted.
+        bool lost = (fr - g_camFrame.load(std::memory_order_relaxed)) > 2 && g_cbvPerFrame.load(std::memory_order_relaxed) > 1000;
+        if (g_negVA[h].load(std::memory_order_relaxed) == va && fr - g_negFrame[h].load(std::memory_order_relaxed) < (lost ? 2 : 30)) return;
+        if (g_probeFrame.load(std::memory_order_relaxed) != fr) { g_probeFrame.store(fr); g_probeCnt.store(0); }
+        if (g_probeCnt.fetch_add(1) >= (lost ? 96 : 24)) return;
+    }
+    long long t0 = NowNs(); ProbeView(va, known, fr); g_probeNs += NowNs() - t0; g_probeN++;
 }
 
 // ---- hooks on the native D3D12 vtables
@@ -512,13 +596,13 @@ static std::mutex g_hudMx;
 static void STDMETHODCALLTYPE hkCreateRTV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     if (!g_device) g_device = dev;
     RegisterRes(res);
-    if (res) { std::lock_guard<std::mutex> lk(g_resMx); g_rtvToRes[dest.ptr] = (void*)res; }
+    if (res) { std::lock_guard<std::shared_mutex> lk(g_resMx); g_rtvToRes[dest.ptr] = (void*)res; }
     oCreateRTV(dev, res, desc, dest);
 }
 static void STDMETHODCALLTYPE hkCreateDSV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     if (!g_device) g_device = dev;
     RegisterRes(res);
-    if (res) { std::lock_guard<std::mutex> lk(g_resMx); g_dsvToRes[dest.ptr] = (void*)res; }
+    if (res) { std::lock_guard<std::shared_mutex> lk(g_resMx); g_dsvToRes[dest.ptr] = (void*)res; }
     oCreateDSV(dev, res, desc, dest);
 }
 static void STDMETHODCALLTYPE hkCreateSRV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
@@ -531,11 +615,11 @@ static void STDMETHODCALLTYPE hkCreateSRV(ID3D12Device* dev, ID3D12Resource* res
 static void STDMETHODCALLTYPE hkCopyDescSimple(ID3D12Device* dev, UINT num, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     oCopyDescSimple(dev, num, dest, src, type);
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && g_rtvInc) {
-        std::lock_guard<std::mutex> lk(g_resMx);
+        std::lock_guard<std::shared_mutex> lk(g_resMx);
         for (UINT i = 0; i < num; i++) { auto it = g_rtvToRes.find(src.ptr + i * g_rtvInc); if (it != g_rtvToRes.end()) g_rtvToRes[dest.ptr + i * g_rtvInc] = it->second; }
     }
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && g_dsvInc) {
-        std::lock_guard<std::mutex> lk(g_resMx);
+        std::lock_guard<std::shared_mutex> lk(g_resMx);
         for (UINT i = 0; i < num; i++) { auto it = g_dsvToRes.find(src.ptr + i * g_dsvInc); if (it != g_dsvToRes.end()) g_dsvToRes[dest.ptr + i * g_dsvInc] = it->second; }
     }
 }
@@ -561,12 +645,12 @@ static void STDMETHODCALLTYPE hkOMSetRT(ID3D12GraphicsCommandList* cl, UINT num,
         D3D12_CPU_DESCRIPTOR_HANDLE h = single ? rts[0] : rts[i]; if (single && i > 0) h.ptr += i * g_rtvInc;
         void* r = LookupRTV(h); if (i == 0) t_rt.rt0 = r; NoteUse(r, 1);
     }
-    if (dsv) { void* r = nullptr; { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv->ptr); if (it != g_dsvToRes.end()) r = it->second; } NoteUse(r, 1); }
+    if (dsv) { void* r = nullptr; { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv->ptr); if (it != g_dsvToRes.end()) r = it->second; } NoteUse(r, 1); }
 }
 static void STDMETHODCALLTYPE hkClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT* c, UINT nr, const D3D12_RECT* r) { oClearRTV(cl, rtv, c, nr, r); NoteUse(LookupRTV(rtv), 0); }
 static void STDMETHODCALLTYPE hkClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT nr, const D3D12_RECT* r) {
     oClearDSV(cl, dsv, f, d, s, nr, r);
-    void* rr = nullptr; { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv.ptr); if (it != g_dsvToRes.end()) rr = it->second; } NoteUse(rr, 0);
+    void* rr = nullptr; { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv.ptr); if (it != g_dsvToRes.end()) rr = it->second; } NoteUse(rr, 0);
 }
 static void STDMETHODCALLTYPE hkCopyTex(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
     if (src && src->pResource) { RegisterRes(src->pResource); NoteUse((void*)src->pResource, 2); }
@@ -577,10 +661,10 @@ static void STDMETHODCALLTYPE hkCopyTex(ID3D12GraphicsCommandList* cl, const D3D
 // ---- HUD-less capture: copy of the back buffer right before the Nth draw that targets it
 static bool IsBackbufferRes(void* r) {
     if (!r || !g_dispW) return false;
-    { std::lock_guard<std::mutex> lk(g_resMx); auto it = g_bbCache.find(r); if (it != g_bbCache.end()) return it->second; }
+    { std::lock_guard<std::shared_mutex> lk(g_resMx); auto it = g_bbCache.find(r); if (it != g_bbCache.end()) return it->second; }
     D3D12_RESOURCE_DESC d = ResDesc((ID3D12Resource*)r);
     bool bb = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_dispW && d.Height == g_dispH && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && d.MipLevels == 1 && d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1;
-    std::lock_guard<std::mutex> lk(g_resMx); g_bbCache[r] = bb; return bb;
+    std::lock_guard<std::shared_mutex> lk(g_resMx); g_bbCache[r] = bb; return bb;
 }
 static void TransitionOne(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
     D3D12_RESOURCE_BARRIER x = {}; x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource = r; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -655,17 +739,33 @@ static const char* kMvHlsl =
 "    OD[t.xy] = z;\n"
 "}\n";
 static ID3D12RootSignature* g_mvRS = nullptr; static ID3D12PipelineState* g_mvPSO = nullptr; static ID3D12DescriptorHeap* g_mvHeap = nullptr;
-static ID3D12Resource* g_mvOut = nullptr; static ID3D12Resource* g_depthOut = nullptr; static UINT g_mvInc = 0; static bool g_mvFailed = false; static int g_mvSlot = 0; static bool g_mvFirst = true;
+static ID3D12Resource* g_mvOut = nullptr; static ID3D12Resource* g_depthOut = nullptr; static UINT g_mvInc = 0; static bool g_mvFailed = false; static int g_mvSlot = 0;
+// the MV / depth outputs are rotated over MV_BUFSETS sets: with frame generation the GPU may still be reading frame N's inputs while frame N+1 already writes its own
+// (that is exactly what happens in GPU-bound busy scenes) -> one shared set = corrupted inputs = ghosting
+static const int MV_BUFSETS = 3;
+static ID3D12Resource* g_mvOutA[MV_BUFSETS] = {}; static ID3D12Resource* g_depthOutA[MV_BUFSETS] = {}; static bool g_setFirst[MV_BUFSETS] = {}; static int g_setPos = 0;
+// ring of pre-created command allocators/lists + fence (v13 created and destroyed an allocator + list EVERY frame)
+static const int MV_RING = 8;
+static ID3D12CommandAllocator* g_ringAl[MV_RING] = {}; static ID3D12GraphicsCommandList* g_ringCl[MV_RING] = {}; static UINT64 g_ringVal[MV_RING] = {};
+static ID3D12Fence* g_ringFence = nullptr; static UINT64 g_fenceNext = 0; static int g_ringPos = 0;
+static std::vector<std::pair<ID3D12Resource*, int>> g_deferredRes; static std::mutex g_deferredResMx;
+static void DeferResRelease(ID3D12Resource* r) { if (!r) return; std::lock_guard<std::mutex> lk(g_deferredResMx); g_deferredRes.push_back({ r, g_frame.load() }); }
+static void FlushDeferredRes() {
+    std::lock_guard<std::mutex> lk(g_deferredResMx); int now = g_frame.load();
+    for (size_t i = 0; i < g_deferredRes.size();) { if (now - g_deferredRes[i].second >= 24) { g_deferredRes[i].first->Release(); g_deferredRes.erase(g_deferredRes.begin() + i); } else i++; }
+}
 static UINT g_mvW = 0, g_mvH = 0;
 static const int MV_SETS = 16;
 static const D3D12_RESOURCE_STATES kOutState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
 #include "shadercache.inc"   // SNSC shader cache, pre-game warm-up + progress window, EnsureMvPipeline()
 
+static std::mutex g_mvInitMx; static std::atomic<bool> g_mvPreIniting{false};
 static bool InitMvPass(UINT W, UINT H) {
-    if (g_mvPSO && g_mvOut && g_mvW == W && g_mvH == H) return true;
+    std::lock_guard<std::mutex> imk(g_mvInitMx);
+    if (g_mvPSO && g_mvOutA[0] && g_mvW == W && g_mvH == H) return true;
     if (g_mvFailed || !g_device) return false;
-    g_mvFailed = true;
+    g_mvFailed = true; DWORD tInit = GetTickCount();
     if (!EnsureMvPipeline(g_device)) return false;   // shaders come from the pre-built cache (compiled at run time only if there is none)
     HRESULT hr = S_OK;
     D3D12_DESCRIPTOR_HEAP_DESC hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 4 * MV_SETS; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
@@ -673,13 +773,20 @@ static bool InitMvPass(UINT W, UINT H) {
     g_mvInc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = W; rd.Height = H; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
-    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), (void**)&g_mvOut);
-    if (FAILED(hr)) { Log("MV: mv texture 0x%08X", (unsigned)hr); return false; }
-    rd.Format = DXGI_FORMAT_R32_FLOAT;
-    hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), (void**)&g_depthOut);
-    if (FAILED(hr)) { Log("MV: depth texture 0x%08X", (unsigned)hr); return false; }
-    g_mvW = W; g_mvH = H; g_mvFirst = true; g_mvFailed = false; Log("MV pass ready (%ux%u, MV R16G16_FLOAT + depth R32_FLOAT)", W, H); return true;
+    ID3D12Resource* nm[MV_BUFSETS] = {}; ID3D12Resource* nd[MV_BUFSETS] = {};
+    for (int i = 0; i < MV_BUFSETS; i++) {
+        rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), (void**)&nm[i]);
+        if (FAILED(hr)) { Log("MV: mv texture 0x%08X", (unsigned)hr); break; }
+        rd.Format = DXGI_FORMAT_R32_FLOAT;
+        hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), (void**)&nd[i]);
+        if (FAILED(hr)) { Log("MV: depth texture 0x%08X", (unsigned)hr); break; }
+    }
+    if (FAILED(hr)) { for (int i = 0; i < MV_BUFSETS; i++) { if (nm[i]) nm[i]->Release(); if (nd[i]) nd[i]->Release(); } return false; }
+    // resolution change: the old buffers may still be in use by the GPU -> released a few frames later (v13 leaked them)
+    for (int i = 0; i < MV_BUFSETS; i++) { DeferResRelease(g_mvOutA[i]); DeferResRelease(g_depthOutA[i]); g_mvOutA[i] = nm[i]; g_depthOutA[i] = nd[i]; g_setFirst[i] = true; }
+    g_mvOut = g_mvOutA[0]; g_depthOut = g_depthOutA[0];
+    g_mvW = W; g_mvH = H; g_mvFailed = false; g_forceReset = true; Log("MV pass ready (%ux%u, MV R16G16_FLOAT + depth R32_FLOAT, %d buffer sets) in %u ms", W, H, MV_BUFSETS, (unsigned)(GetTickCount() - tInit)); return true;
 }
 static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
     switch (f) {
@@ -693,9 +800,23 @@ static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
 static bool RunMvPass(UINT W, UINT H, ID3D12Resource* vel, ID3D12Resource* depth) {
     if (!g_device || !g_queue || !vel || !depth) return false;
     if (!InitMvPass(W, H)) return false;
-    ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr;
-    if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&al))) return false;
-    if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl))) { al->Release(); return false; }
+    ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr; int ringSlot = -1;
+    if (!g_ringFence) g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_ringFence);
+    if (g_ringFence) {
+        int s = g_ringPos % MV_RING;
+        if (!g_ringAl[s]) {
+            ID3D12CommandAllocator* a2 = nullptr; ID3D12GraphicsCommandList* c2 = nullptr;
+            if (SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&a2)) &&
+                SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a2, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&c2))) { c2->Close(); g_ringAl[s] = a2; g_ringCl[s] = c2; g_ringVal[s] = 0; }
+            else { if (c2) c2->Release(); if (a2) a2->Release(); }
+        }
+        if (g_ringAl[s] && g_ringFence->GetCompletedValue() >= g_ringVal[s] && SUCCEEDED(g_ringAl[s]->Reset()) && SUCCEEDED(g_ringCl[s]->Reset(g_ringAl[s], nullptr))) { al = g_ringAl[s]; cl = g_ringCl[s]; ringSlot = s; g_ringPos++; }
+    }
+    if (!cl) {   // ring slot still busy on the GPU (or ring creation failed): fall back to a one-off list
+        if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&al))) return false;
+        if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl))) { al->Release(); return false; }
+    }
+    int set = (g_setPos++) % MV_BUFSETS; g_mvOut = g_mvOutA[set]; g_depthOut = g_depthOutA[set]; bool firstUse = g_setFirst[set]; g_setFirst[set] = false;
     // input transitions (tracked states of the game's resources) -> compute-readable, restored afterwards
     D3D12_RESOURCE_BARRIER pre[8], post[8]; UINT nb = 0;
     struct In { ID3D12Resource* r; D3D12_RESOURCE_STATES want; const char* n; UINT planes; } ins[2] = {
@@ -721,8 +842,7 @@ static bool RunMvPass(UINT W, UINT H, ID3D12Resource* vel, ID3D12Resource* depth
         }
     }
     if (nb) oResBarrier(cl, nb, pre);
-    if (!g_mvFirst) { D3D12_RESOURCE_BARRIER u[2] = {}; for (int i = 0; i < 2; i++) { u[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; u[i].Transition.pResource = i ? g_depthOut : g_mvOut; u[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; u[i].Transition.StateBefore = kOutState; u[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; } oResBarrier(cl, 2, u); }
-    g_mvFirst = false;
+    if (!firstUse) { D3D12_RESOURCE_BARRIER u[2] = {}; for (int i = 0; i < 2; i++) { u[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; u[i].Transition.pResource = i ? g_depthOut : g_mvOut; u[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; u[i].Transition.StateBefore = kOutState; u[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; } oResBarrier(cl, 2, u); }
     int slot = (g_mvSlot++) % MV_SETS; UINT64 base = (UINT64)slot * 4 * g_mvInc;
     D3D12_CPU_DESCRIPTOR_HANDLE c = CpuStart(g_mvHeap); c.ptr += (SIZE_T)base;
     D3D12_GPU_DESCRIPTOR_HANDLE g = GpuStart(g_mvHeap); g.ptr += base;
@@ -742,20 +862,52 @@ static bool RunMvPass(UINT W, UINT H, ID3D12Resource* vel, ID3D12Resource* depth
     if (nb) oResBarrier(cl, nb, post);
     cl->Close();
     ID3D12CommandList* lists[1] = { cl }; oExec(g_queue, 1, lists);
-    DeferRelease(cl, al);
+    if (ringSlot >= 0) { g_ringVal[ringSlot] = ++g_fenceNext; g_queue->Signal(g_ringFence, g_ringVal[ringSlot]); } else DeferRelease(cl, al);
     if (s_log++ < 3) Log("MV pass submitted: frame=%d slot=%d %ux%u transitions=%u c2p diag=%.5f %.5f %.5f %.5f", g_frame.load(), slot, W, H, nb, k.m[0], k.m[5], k.m[10], k.m[15]);
     return true;
 }
 
+// Drops candidate resources the game has already destroyed (only our own reference is left). v13 kept them forever (VRAM leak) and,
+// because the use-counters only ever grew, an old dead depth/velocity buffer could stay "the best" forever after a level load / settings change -> stale MVs = ghosting.
+static void PruneRes() {
+    std::unique_lock<std::shared_mutex> lk(g_resMx);
+    for (auto it = g_res.begin(); it != g_res.end();) {
+        auto& m = it->second;
+        if (m.held && m.res) {
+            m.res->AddRef(); ULONG c = m.res->Release();
+            if (c <= 1) {
+                void* key = it->first;
+                if (g_pinVel == m.res) g_pinVel = nullptr;
+                if (g_pinDepth == m.res) g_pinDepth = nullptr;
+                for (auto r = g_rtvToRes.begin(); r != g_rtvToRes.end();) { if (r->second == key) r = g_rtvToRes.erase(r); else ++r; }
+                for (auto r = g_dsvToRes.begin(); r != g_dsvToRes.end();) { if (r->second == key) r = g_dsvToRes.erase(r); else ++r; }
+                { std::lock_guard<std::mutex> sl(g_stateMx); g_state.erase(key); }
+                m.res->Release();
+                it = g_res.erase(it); continue;
+            }
+        }
+        ++it;
+    }
+}
 static void UpdatePins() {
-    ID3D12Resource* bestVel = nullptr, * bestDep = nullptr; int bv = -1, bd = -1;
-    { std::lock_guard<std::mutex> lk(g_resMx);
+    int fr = g_frame.load();
+    if ((fr % 30) == 0) PruneRes();
+    if (g_pinVel && g_pinDepth && (fr % 8) != 0) return;      // pins are stable: re-evaluate every 8 frames only
+    ID3D12Resource* bestVel = nullptr, * bestDep = nullptr; int bv = -1, bd = -1, curV = -1, curD = -1;
+    { std::unique_lock<std::shared_mutex> lk(g_resMx);
       for (auto& kv : g_res) { auto& m = kv.second; if (!m.cand || !IsInternal(m.w, m.h)) continue;
-        int score = m.useClear + m.useSetRT * 2 + m.useCopySrc + m.useCopyDst + m.useSRV;
-        if ((m.flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && score > bd) { bd = score; bestDep = m.res; }
-        if (m.fmt == DXGI_FORMAT_R16G16_UNORM && score > bv) { bv = score; bestVel = m.res; } } }
-    g_pinVel = bestVel; g_pinDepth = bestDep;
-    if (bestDep) { D3D12_RESOURCE_DESC dd = ResDesc(bestDep); if ((int)dd.Width != g_effW.load() || (int)dd.Height != g_effH.load()) { g_effW = (int)dd.Width; g_effH = (int)dd.Height; Log("render size from pinned depth buffer: %dx%d", g_effW.load(), g_effH.load()); } }
+        int window = m.useClear.exchange(0) + m.useSetRT.exchange(0) * 2 + m.useCopySrc.exchange(0) + m.useCopyDst.exchange(0) + m.useSRV.exchange(0);
+        m.score = (m.score * 3) / 4 + window;                  // recent activity counts, old activity fades (v13: counters only ever grew)
+        if (m.res == g_pinDepth) curD = m.score;
+        if (m.res == g_pinVel) curV = m.score;
+        if ((m.flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && m.score > bd) { bd = m.score; bestDep = m.res; }
+        if (m.fmt == DXGI_FORMAT_R16G16_UNORM && m.score > bv) { bv = m.score; bestVel = m.res; } } }
+    // hysteresis: keep the current pin unless another resource is clearly (1.5x) busier
+    ID3D12Resource* nv = (g_pinVel && curV >= 0 && curV * 3 >= bv * 2) ? g_pinVel : bestVel;
+    ID3D12Resource* nd = (g_pinDepth && curD >= 0 && curD * 3 >= bd * 2) ? g_pinDepth : bestDep;
+    if (nv != g_pinVel || nd != g_pinDepth) { if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (frame generation is reset)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd); g_forceReset = true; }
+    g_pinVel = nv; g_pinDepth = nd;
+    if (nd) { D3D12_RESOURCE_DESC dd = ResDesc(nd); if ((int)dd.Width != g_effW.load() || (int)dd.Height != g_effH.load()) { g_effW = (int)dd.Width; g_effH = (int)dd.Height; Log("render size from pinned depth buffer: %dx%d", g_effW.load(), g_effH.load()); } }
 }
 
 // ------------------------------------------------------------------ 4x4 helpers + constants
@@ -801,6 +953,7 @@ static bool BuildConstants(sl::Constants& c, bool reset) {
 
 // ------------------------------------------------------------------ per-frame logic (runs inside the Present hook)
 struct FrameCtx { sl::FrameToken* tok = nullptr; };
+static sl::FrameToken* g_nextTok = nullptr;   // reflexplace=1: token that was already used for slReflexSleep/SimulationStart at the end of the previous Present
 static std::atomic<bool> g_deviceLost{false};
 static int g_lastOnFrame = -1; static bool g_wasOn = false; static int g_stateLog = 0; static bool g_loggedSupport = false;
 static UINT g_scW = 0, g_scH = 0;
@@ -880,23 +1033,54 @@ static void Marker(sl::PCLMarker m, const FrameCtx& c) {
     static int bad = 0; if (r != sl::Result::eOk && bad++ < 10) Log("slPCLSetMarker(%d) -> %d %s", (int)m, (int)r, SlStr(r));
 }
 
+static LARGE_INTEGER g_qf = {};
+static inline double NowMs() { if (!g_qf.QuadPart) QueryPerformanceFrequency(&g_qf); LARGE_INTEGER n; QueryPerformanceCounter(&n); return (double)n.QuadPart * 1000.0 / (double)g_qf.QuadPart; }
+struct PreInitArg { UINT w, h; };
+static DWORD WINAPI MvPreInitThread(LPVOID p) { PreInitArg a = *(PreInitArg*)p; delete (PreInitArg*)p; t_prewarm = true; try { InitMvPass(a.w, a.h); } catch (...) {} t_prewarm = false; g_mvPreIniting = false; return 0; }
+static double g_obStart = 0, g_obMs = 0, g_tSleep = 0, g_tPins = 0, g_tMv = 0, g_tPrune = 0;   // time spent in OnPresentBegin (= our own per-frame overhead) of the last frame
 static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
+    g_obStart = NowMs(); g_obMs = 0; g_tSleep = g_tPins = g_tMv = g_tPrune = 0;
+    { static long s_lastCbv = 0; long c = g_cbvCalls.load(); g_cbvPerFrame = c - s_lastCbv; s_lastCbv = c; }
     FrameCtx ctx;
     int cur = g_frame.load(); bool hudOk = g_hudStamp.load() == cur && cur > 0;
     int fr = ++g_frame; int bbd = g_bbDraws.exchange(0);
+    // frame time (base fps) + maintenance
+    static LARGE_INTEGER s_qf = {}, s_last = {}; static double s_ema = 16.7;
+    if (!s_qf.QuadPart) QueryPerformanceFrequency(&s_qf);
+    { LARGE_INTEGER n; QueryPerformanceCounter(&n); double dtMs = s_last.QuadPart ? (double)(n.QuadPart - s_last.QuadPart) * 1000.0 / (double)s_qf.QuadPart : 0.0; s_last = n;
+      if (dtMs > 0.0 && dtMs < 1000.0) s_ema += (dtMs - s_ema) * 0.05;
+      if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
+    FlushDeferredRes();
+    if ((fr % 120) == 0) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(); } g_tPrune = NowMs() - tp0; }
     if (fr == 1 || (fr % 600) == 0) {
         DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; }
-        size_t nb_; { std::lock_guard<std::mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
+        size_t nb_; { std::shared_lock<std::shared_mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
         Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_camFrame.load(), bbd);
+        static long s_pn = 0, s_pns = 0; long pn = g_probeN.load(), pns = g_probeNs.load();
+        Log("cam-diag: probes +%ld (%.2f ms total, %.1f us each) cbv/frame=%ld", pn - s_pn, (pns - s_pns) / 1e6, pn > s_pn ? (pns - s_pns) / 1e3 / (double)(pn - s_pn) : 0.0, g_cbvPerFrame.load()); s_pn = pn; s_pns = pns;
         Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_projSeen.load(), g_scanRuns.load(), g_camLocked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
     }
-    UpdatePins();
+    { double tp0 = NowMs(); UpdatePins(); g_tPins = NowMs() - tp0; }
+    // Build the MV pipeline + buffers as soon as the pins are known (long before warm-up ends), on a worker thread: the first frame with frame generation
+    // then does not have to create a PSO, 6 textures, a descriptor heap and the command-list ring on the render thread.
+    if (g_cfg.stage >= 2 && g_cfg.fg && g_pinVel && g_pinDepth && g_device && !g_mvPreIniting.load()) {
+        D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth);
+        if (vd.Width == dd.Width && vd.Height == dd.Height && !(g_mvPSO && g_mvOutA[0] && g_mvW == (UINT)vd.Width && g_mvH == vd.Height) && !g_mvFailed) {
+            g_mvPreIniting = true; auto* a = new PreInitArg{ (UINT)vd.Width, vd.Height };
+            HANDLE th = CreateThread(nullptr, 0, MvPreInitThread, a, 0, nullptr); if (th) CloseHandle(th); else { delete a; g_mvPreIniting = false; }
+        }
+    }
     if (!g_slInitOk || g_cfg.stage < 1) return ctx;
     if (!g_slRuntimeOk) { EnsureSlDevice(sc); if (!(g_device && g_slDevSet && InitSlRuntime())) return ctx; }
-    if (p_slGetNewFrameToken(ctx.tok, nullptr) != sl::Result::eOk || !ctx.tok) { ctx.tok = nullptr; return ctx; }
-    if (g_cfg.reflexSleep && p_ReflexSleep) p_ReflexSleep(*ctx.tok);
-    Marker(sl::PCLMarker::eSimulationStart, ctx); Marker(sl::PCLMarker::eSimulationEnd, ctx);
-    Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
+    if (g_cfg.reflexPlace && g_nextTok) {
+        ctx.tok = g_nextTok; g_nextTok = nullptr;   // sleep + SimulationStart were issued at the end of the previous Present = the real start of this game frame
+        Marker(sl::PCLMarker::eSimulationEnd, ctx); Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
+    } else {
+        if (p_slGetNewFrameToken(ctx.tok, nullptr) != sl::Result::eOk || !ctx.tok) { ctx.tok = nullptr; return ctx; }
+        if (g_cfg.reflexSleep && p_ReflexSleep) { double ts0 = NowMs(); p_ReflexSleep(*ctx.tok); g_tSleep = NowMs() - ts0; }
+        Marker(sl::PCLMarker::eSimulationStart, ctx); Marker(sl::PCLMarker::eSimulationEnd, ctx);
+        Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
+    }
     sl::ViewportHandle vp(0u);
     // DLSS-G requires IDXGISwapChain3::GetCurrentBackBufferIndex to be called through the SL swap chain EVERY frame
     // (UE4 tracks the back buffer index itself and never calls it -> status 0x10 / eFailGetCurrentBackBufferIndexNotCalled).
@@ -904,14 +1088,24 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
       if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&s3)) && s3) { (void)s3->GetCurrentBackBufferIndex(); s3->Release(); }
       else { static int w = 0; if (w++ < 3) Log("swap chain has no IDXGISwapChain3 - cannot call GetCurrentBackBufferIndex"); } }
 
-    bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load();
+    // busy-scene protection: frame generation on top of a very low base fps looks bad (ghosting) and costs GPU time itself -> pause it until the base fps recovers
+    static bool s_susp = false; static int s_lowN = 0, s_highN = 0;
+    if (g_cfg.fgMinFps > 0 && fr > g_cfg.warmup) {
+        double fps = 1000.0 / std::max(s_ema, 1.0);
+        if (!s_susp) { if (fps < (double)g_cfg.fgMinFps) { if (++s_lowN >= 45) { s_susp = true; s_highN = 0; Log("FG paused: base fps %.1f < %d (frame %d)", fps, g_cfg.fgMinFps, fr); } } else s_lowN = 0; }
+        else { if (fps >= (double)(g_cfg.fgMinFps + 8)) { if (++s_highN >= 120) { s_susp = false; s_lowN = 0; g_forceReset = true; Log("FG resumed: base fps %.1f (frame %d)", fps, fr); } } else s_highN = 0; }
+    }
+    bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp;
     int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
+    static int s_camStreak = 0; if (camOk) s_camStreak++; else s_camStreak = 0;
+    bool delayOk = g_wasOn || s_camStreak >= g_cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
     bool inputs = false; sl::Constants consts{};
-    if (wantOn && camOk && g_pinVel && g_pinDepth && g_queue) {
+    if (wantOn && camOk && delayOk && g_pinVel && g_pinDepth && g_queue && !g_mvPreIniting.load()) {
         D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth);
         if (vd.Width == dd.Width && vd.Height == dd.Height) {
-            if (RunMvPass((UINT)vd.Width, vd.Height, g_pinVel, g_pinDepth)) {
-                bool reset = !g_wasOn || (fr - g_lastOnFrame) > 1;
+            double tm0 = NowMs(); bool mvok = RunMvPass((UINT)vd.Width, vd.Height, g_pinVel, g_pinDepth); g_tMv = NowMs() - tm0;
+            if (mvok) {
+                bool reset = g_forceReset.exchange(false) || !g_wasOn || (fr - g_lastOnFrame) > 1;
                 if (BuildConstants(consts, reset)) inputs = true;
             }
         }
@@ -947,9 +1141,12 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     if (s_maxGen && opt.numFramesToGenerate > s_maxGen) opt.numFramesToGenerate = s_maxGen;
     sl::Result ro = p_DLSSGSetOptions(vp, opt);
     static int s_o = 0; if (ro != sl::Result::eOk && s_o++ < 20) Log("slDLSSGSetOptions(mode=%d gen=%u) -> %d %s", (int)opt.mode, opt.numFramesToGenerate, (int)ro, SlStr(ro));
-    if (p_DLSSGGetState && (g_stateLog < 6 || (fr % 120) == 0) && fr > g_cfg.warmup) {
+    if (p_DLSSGGetState && (g_stateLog < 6 || (fr % 30) == 0) && fr > g_cfg.warmup) {
         sl::DLSSGState st{}; sl::Result rs = p_DLSSGGetState(vp, st, nullptr);
-        if (rs == sl::Result::eOk) { s_maxGen = st.numFramesToGenerateMax; Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
+        static unsigned s_lastStatus = 0xFFFFFFFFu; bool chg = rs == sl::Result::eOk && (unsigned)st.status != s_lastStatus; if (rs == sl::Result::eOk) s_lastStatus = (unsigned)st.status;
+        if (rs == sl::Result::eOk) s_maxGen = st.numFramesToGenerateMax;
+        if (rs == sl::Result::eOk && !(g_stateLog < 6 || chg || (fr % 600) == 0)) { /* nothing new */ }
+        else if (rs == sl::Result::eOk) { s_maxGen = st.numFramesToGenerateMax; Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
         else Log("slDLSSGGetState -> %d %s", (int)rs, SlStr(rs));
         g_stateLog++;
     }
@@ -969,9 +1166,20 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
         }
     }
     Marker(sl::PCLMarker::ePresentStart, ctx);
+    g_obMs = NowMs() - g_obStart;
     return ctx;
 }
-static void OnPresentEnd(const FrameCtx& ctx) { Marker(sl::PCLMarker::ePresentEnd, ctx); }
+static void OnPresentEnd(const FrameCtx& ctx) {
+    Marker(sl::PCLMarker::ePresentEnd, ctx);
+    if (g_cfg.reflexPlace && ctx.tok && p_slGetNewFrameToken) {   // the next game frame starts here: sleep BEFORE simulating, not before presenting
+        sl::FrameToken* t = nullptr;
+        if (p_slGetNewFrameToken(t, nullptr) == sl::Result::eOk && t) {
+            if (g_cfg.reflexSleep && p_ReflexSleep) p_ReflexSleep(*t);
+            FrameCtx nc; nc.tok = t; Marker(sl::PCLMarker::eSimulationStart, nc);
+            g_nextTok = t;
+        }
+    }
+}
 
 static void CheckDeviceRemoved() {
     if (g_deviceLost.load() || !g_device) return;
@@ -979,6 +1187,7 @@ static void CheckDeviceRemoved() {
     if (FAILED(hr)) { g_deviceLost = true; Log("DEVICE REMOVED reason=0x%08X (frame=%d)", (unsigned)hr, g_frame.load()); }
 }
 
+static size_t bufCount() { std::shared_lock<std::shared_mutex> lk(g_bufMx); return g_bufs.size(); }
 static VHook g_hPresent, g_hPresent1, g_hCSC, g_hCSCH;
 static thread_local int t_depth = 0;
 static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* sc, UINT s, UINT f) {
@@ -986,7 +1195,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* sc, UINT s, UINT f) {
     if (!o) return E_FAIL;
     bool outer = (t_depth++ == 0); FrameCtx ctx;
     if (outer) { CheckDeviceRemoved(); try { ctx = OnPresentBegin(sc); } catch (...) { Log("exception in OnPresentBegin"); } }
+    double tp = NowMs();
     HRESULT r = o(sc, s, f);
+    if (outer) { double dp = NowMs() - tp; if ((dp > 120.0 || (g_obMs - g_tSleep) > 8.0) && g_frame.load() > 60) { static int ns = 0; if (ns++ < 60) Log("slow frame %d: our work before Present %.1f ms [ReflexSleep %.1f (intentional wait) | UpdatePins %.1f | MV pass %.1f | buffer prune %.1f] | inside Present (DLSS-G/driver/GPU wait) %.1f ms | upload bufs held=%zu (%llu MB, pruned %ld) cbv/frame=%ld", g_frame.load(), g_obMs, g_tSleep, g_tPins, g_tMv, g_tPrune, dp, bufCount(), (unsigned long long)(g_bufBytes >> 20), g_prunedTotal, g_cbvPerFrame.load()); } }
     if (outer) { try { OnPresentEnd(ctx); } catch (...) {} }
     t_depth--; return r;
 }
@@ -1060,6 +1271,53 @@ static bool EnsureSL() {
 }
 // true = call the original function (our own warm-up thread, or Streamline calling back into us). Otherwise the game waits here until the shader cache is ready.
 static bool PassThrough() { if (t_prewarm) return true; WaitPrewarm(); return t_inSL || !EnsureSL(); }
+// ---- v17: PSO creation diagnostics + one retry (game crash: UE4 D3D12RHI "CreatePipelineState failed with E_INVALIDARG")
+// A PSO that succeeds is never touched. Only when the GAME's call returns E_INVALIDARG: (1) log the desc + device state,
+// (2) if the desc carries a CachedPSO blob, retry once without it (a stale/corrupt blob is a known cause of E_INVALIDARG).
+using PFN_CreateGPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+using PFN_CreateCPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+static PFN_CreateGPSO oCreateGPSO; static PFN_CreateCPSO oCreateCPSO;
+static std::atomic<int> g_psoFail{0}, g_psoRescued{0};
+static void LogGPsoFail(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, int n) {
+    HRESULT rem = dev ? dev->GetDeviceRemovedReason() : E_POINTER;
+    Log("PSO FAIL #%d (graphics, E_INVALIDARG) tid=%lu | deviceRemoved=0x%08X | rootSig=%p VS=%zu PS=%zu GS=%zu HS=%zu DS=%zu cached=%zu | inputElems=%u rtCount=%u rtv=[%d %d %d %d %d %d %d %d] dsv=%d | samples=%u/%u mask=0x%X topo=%d cut=%d flags=0x%X | blend: alpha2cov=%d indep=%d rt0(en=%d logic=%d wm=0x%X) | raster: fill=%d cull=%d depthClip=%d msaa=%d forced=%u | ds: z=%d s=%d func=%d",
+        n, (unsigned long)GetCurrentThreadId(), (unsigned)rem, (void*)d->pRootSignature, d->VS.BytecodeLength, d->PS.BytecodeLength, d->GS.BytecodeLength, d->HS.BytecodeLength, d->DS.BytecodeLength, d->CachedPSO.CachedBlobSizeInBytes,
+        d->InputLayout.NumElements, d->NumRenderTargets, (int)d->RTVFormats[0], (int)d->RTVFormats[1], (int)d->RTVFormats[2], (int)d->RTVFormats[3], (int)d->RTVFormats[4], (int)d->RTVFormats[5], (int)d->RTVFormats[6], (int)d->RTVFormats[7], (int)d->DSVFormat,
+        d->SampleDesc.Count, d->SampleDesc.Quality, (unsigned)d->SampleMask, (int)d->PrimitiveTopologyType, (int)d->IBStripCutValue, (unsigned)d->Flags,
+        (int)d->BlendState.AlphaToCoverageEnable, (int)d->BlendState.IndependentBlendEnable, (int)d->BlendState.RenderTarget[0].BlendEnable, (int)d->BlendState.RenderTarget[0].LogicOpEnable, (unsigned)d->BlendState.RenderTarget[0].RenderTargetWriteMask,
+        (int)d->RasterizerState.FillMode, (int)d->RasterizerState.CullMode, (int)d->RasterizerState.DepthClipEnable, (int)d->RasterizerState.MultisampleEnable, (unsigned)d->RasterizerState.ForcedSampleCount,
+        (int)d->DepthStencilState.DepthEnable, (int)d->DepthStencilState.StencilEnable, (int)d->DepthStencilState.DepthFunc);
+    if (g_log) fflush(g_log);                              // the game is about to die: do not lose these lines
+}
+static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
+    HRESULT hr = oCreateGPSO(dev, desc, riid, ppv);
+    if (hr != E_INVALIDARG || !desc || !g_cfg.psoRetry) return hr;
+    int n = ++g_psoFail;
+    if (n <= 16) LogGPsoFail(dev, desc, n);
+    if (desc->CachedPSO.CachedBlobSizeInBytes) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
+        HRESULT hr2 = oCreateGPSO(dev, &cp, riid, ppv);
+        if (n <= 16) Log("PSO FAIL #%d: retry without CachedPSO -> hr=0x%08X", n, (unsigned)hr2);
+        if (SUCCEEDED(hr2)) { g_psoRescued++; Log("PSO rescued (total rescued=%d of %d failures)", g_psoRescued.load(), n); if (g_log) fflush(g_log); return hr2; }
+    }
+    if (g_log) fflush(g_log);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
+    HRESULT hr = oCreateCPSO(dev, desc, riid, ppv);
+    if (hr != E_INVALIDARG || !desc || !g_cfg.psoRetry) return hr;
+    int n = ++g_psoFail;
+    if (n <= 16) { Log("PSO FAIL #%d (compute, E_INVALIDARG) tid=%lu | deviceRemoved=0x%08X | rootSig=%p CS=%zu cached=%zu", n, (unsigned long)GetCurrentThreadId(), (unsigned)dev->GetDeviceRemovedReason(), (void*)desc->pRootSignature, desc->CS.BytecodeLength, desc->CachedPSO.CachedBlobSizeInBytes); }
+    if (desc->CachedPSO.CachedBlobSizeInBytes) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
+        HRESULT hr2 = oCreateCPSO(dev, &cp, riid, ppv);
+        if (n <= 16) Log("PSO FAIL #%d: retry without CachedPSO -> hr=0x%08X", n, (unsigned)hr2);
+        if (SUCCEEDED(hr2)) { g_psoRescued++; return hr2; }
+    }
+    if (g_log) fflush(g_log);
+    return hr;
+}
+
 static bool g_devHooked = false; static std::mutex g_devHookMx;
 
 static void InstallNativeHooks(ID3D12Device* nat) {
@@ -1074,6 +1332,7 @@ static void InstallNativeHooks(ID3D12Device* nat) {
         FAILED(nat->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl))) { Log("InstallNativeHooks: dummy objects failed"); return; }
     void** vtQ = *(void***)q; void** vtCL = *(void***)cl; cl->Close();
     oCreateCBVStub:;
+    if (g_cfg.psoRetry) { oCreateGPSO = (PFN_CreateGPSO)Patch(vtDev, 10, (void*)hkCreateGPSO); oCreateCPSO = (PFN_CreateCPSO)Patch(vtDev, 11, (void*)hkCreateCPSO); }
     oCreateSRV = (PFN_CreateSRV)Patch(vtDev, 18, (void*)hkCreateSRV);
     oCreateRTV = (PFN_CreateRTV)Patch(vtDev, 20, (void*)hkCreateRTV);
     oCreateDSV = (PFN_CreateDSV)Patch(vtDev, 21, (void*)hkCreateDSV);
