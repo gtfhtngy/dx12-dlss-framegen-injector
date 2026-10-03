@@ -26,7 +26,7 @@ It includes automatic detection of different UE4 view-buffer layouts to improve 
 |-----------------|--------|-------|------------|--------------------------------------------|
 | Scarlet Nexus   | UE4    | DX12  | Working    | Primary test case                          |
 | Code Vein       | UE4    | DX12  | Working    | Older UE4 view-buffer layout supported (DX12 Makes the game crashes after the end cutscene)    |
-| Code Vein       | UE5    | DX12  | Working    | UE5 Test (Flickering screen loading and menu) (**it only works good on TSR pls do NOT run it on any other ANTI-ALIASING**)    |
+| Captain Tsubasa: World Fighters      | UE5    | DX12  | Working    | UE5 Test (Flickering screen loading and menu) (**it only works good on TSR pls do NOT run it on any other ANTI-ALIASING**)    |
 
 ## Installation
 
