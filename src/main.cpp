@@ -175,7 +175,7 @@ static void LoadCfg() {
     if (g_cfg.c2pIdx < 0) g_cfg.c2pIdx = 0; if (g_cfg.c2pIdx > 3) g_cfg.c2pIdx = 3;
     if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
-    Log("SN_DLSSG v23 (UE4 + UE5, no FG on/off toggling on camera cuts, plausible-c2p guard + auto candidate switch, cheaper prune/probes) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+    Log("SN_DLSSG v25 (cut guard = single-frame onset only + cooldown, no 900-frame blind spots, depth/vel pin debounce, reset rate limiter, tick log) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
     Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d%s mvoff=%d c2pidx=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.renderW <= 0 ? " (AUTO)" : "", g_cfg.mvOff, g_cfg.c2pIdx, g_cfg.warmup);
 }
@@ -340,7 +340,7 @@ static inline int EffW() { int vv = g_viewW.load(); if (vv && g_cfg.viewRect) re
 static inline int EffH() { int vv = g_viewH.load(); if (vv && g_cfg.viewRect) return vv; int v = g_effH.load(); if (v) return v; if (g_cfg.renderH > 0) return g_cfg.renderH; UINT a = g_autoH.load(); return a ? (int)a : 1080; }
 static ID3D12Resource* g_pinVel = nullptr; static ID3D12Resource* g_pinDepth = nullptr;
 static ID3D12Resource* g_dummyVel = nullptr; static UINT g_dummyW = 0, g_dummyH = 0;   // v19: all-zero R16G16_UNORM 'no velocity anywhere' texture (owned by us, never in g_res)
-static std::atomic<bool> g_forceReset{false};   // next DLSS-G frame is sent with reset=true (pins changed, hitch, MV buffers re-created)
+static std::atomic<bool> g_forceReset{false}; static std::atomic<bool> g_forceResetHard{false};   // v25: hard = always honoured (hitch); soft = rate-limited (one per 10 frames)   // next DLSS-G frame is sent with reset=true (pins changed, hitch, MV buffers re-created)
 
 static inline bool IsVelFmt(DXGI_FORMAT f) { return f == DXGI_FORMAT_R16G16_UNORM || f == DXGI_FORMAT_R16G16_TYPELESS || (g_cfg.velFmt && (int)f == g_cfg.velFmt); }   // v18: some UE5 RHI paths create the velocity target typeless (we always view it as R16G16_UNORM)
 // v19: census of render-target / UAV textures at the internal resolution that are NOT depth and NOT accepted as velocity: tells us what format the game's velocity target really has
@@ -590,23 +590,27 @@ static void C2pMonitor(const float* p, int availF, int fr) {
 // projection (FOV). Reaction: reset the DLSS-G history and run a few frames WITHOUT frame generation (clean real frames), then resume.
 static std::atomic<int> g_cutHold{0};
 static float g_prevM0 = 0.f, g_prevM5 = 0.f; static int g_prevCamFrame = -1;
-static int g_cutWinStart = 0, g_cutWinCount = 0, g_cutSuppressUntil = 0, g_cutTotal = 0;
+static int g_cutLastFrame = -1000, g_cutTotal = 0, g_cutIgnored = 0; static double g_prevDev = 0.0;   // v25: no more "fires too often -> suspended for 900 frames"
+static std::atomic<int> g_rstDropped{0}, g_rstPins{0}, g_rstCut{0};
 static void CamCutCheck(const float* b, const float* c, int fr) {   // called with g_camMx held, once per frame at most
     if (!g_cfg.cutDetect || fr == g_prevCamFrame) return;
     bool cut = false; const char* why = ""; double val = 0.0;
-    double dev = C2pDev(c);
-    if (!(dev < (double)g_cfg.cutThresh100 / 100.0)) { cut = true; why = "ClipToPrevClip far from identity"; val = dev; }   // also catches NaN; v23: threshold 0.25 -> 1.20 (a fast camera turn gives 0.3..0.65)
-    else if (g_prevCamFrame >= 0 && g_prevM0 > 0.f && g_prevM5 > 0.f && fr - g_prevCamFrame <= 3) {
+    double dev = C2pDev(c); const double th = (double)g_cfg.cutThresh100 / 100.0;
+    // v25: a real camera CUT is a single-frame ONSET (deviation jumps from small to huge). Sustained large deviation over many frames (lock-on swings, dodges, boss camera: the
+    // v23 log shows 6 consecutive frames at 1.5..2.3) is fast camera motion, not a cut: no reset for those (implausible matrices are already replaced by identity in the MV pass).
+    // The v23 logic counted them as 'cuts', hit its limit (8 per 120 frames) and then switched the guard OFF for 900 frames - 47 times in one session.
+    bool high = !(dev < th); bool prevHigh = !(g_prevDev < th * 0.5) && g_prevCamFrame >= 0 && fr - g_prevCamFrame <= 3;
+    if (high && !prevHigh) { cut = true; why = "ClipToPrevClip far from identity"; val = dev; }
+    else if (!high && g_prevCamFrame >= 0 && g_prevM0 > 0.f && g_prevM5 > 0.f && fr - g_prevCamFrame <= 3) {
         double d0 = fabs((double)b[0] - g_prevM0) / g_prevM0, d5 = fabs((double)b[5] - g_prevM5) / g_prevM5;
         if (d0 > g_cfg.cutFov / 100.0 || d5 > g_cfg.cutFov / 100.0) { cut = true; why = "projection (FOV) jump"; val = std::max(d0, d5); }
     }
-    g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr;
-    if (!cut || fr < g_cutSuppressUntil) return;
-    if (fr - g_cutWinStart > 120) { g_cutWinStart = fr; g_cutWinCount = 0; }
-    if (++g_cutWinCount > 8) {   // the 'cut' keeps firing = this game changes its projection every frame (e.g. two alternating views): stop guarding, never leave FG off permanently
-        g_cutSuppressUntil = fr + 900; g_cutWinCount = 0; Log("camera-cut guard: fires too often (%s) -> suspended for 900 frames", why); return; }
-    int cur = g_cutHold.load(); if (cur < 2) g_cutHold = 2;   // v23: only the DLSS-G reset flag is raised for these frames; frame generation itself is NOT switched off (every on/off switch = SetMaximumFrameLatency 1<->2 + RSYNC flush = 100+ ms hitch in sl.log)
-    g_forceReset = true; g_cutTotal++;
+    g_prevDev = dev; g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr;
+    if (!cut) return;
+    if (fr - g_cutLastFrame < 24) { g_cutIgnored++; return; }   // v25: at most one guard reset per 24 frames
+    g_cutLastFrame = fr;
+    int cur = g_cutHold.load(); if (cur < 2) g_cutHold = 2;   // only the DLSS-G reset flag is raised; frame generation itself is NOT switched off (every on/off switch = 100+ ms hitch)
+    g_forceReset = true; g_cutTotal++; g_rstCut++;
     if (g_cutTotal <= 60) Log("camera cut at frame %d: %s (%.4f) -> DLSS-G history reset (FG stays on)", fr, why, val);
 }
 // Parses one view-buffer candidate (a COPY in normal memory). true = recognised as a camera view buffer.
@@ -1117,6 +1121,11 @@ static void UpdatePins() {
     // hysteresis: keep the current pin unless another resource is clearly (1.5x) busier
     ID3D12Resource* nv = (g_pinVel && curV >= 0 && curV * 3 >= bv * 2) ? g_pinVel : bestVel;
     ID3D12Resource* nd = (g_pinDepth && curD >= 0 && curD * 3 >= bd * 2) ? g_pinDepth : bestDep;
+    // v25: debounce. Two equally busy 1440x812 depth buffers made the pin flip A->B->A->B every 32..48 frames (log frames 12760-13264), each flip = DLSS-G reset.
+    // A candidate must win 6 evaluations in a row (~48 frames) before the pin moves - unless the current pin is gone (released) = immediate switch.
+    { static ID3D12Resource* pD = nullptr, * pV = nullptr; static int nD = 0, nV = 0;
+      if (g_pinDepth && curD >= 0 && nd != g_pinDepth) { if (nd == pD) nD++; else { pD = nd; nD = 1; } if (nD < 6) nd = g_pinDepth; else { pD = nullptr; nD = 0; } } else { pD = nullptr; nD = 0; }
+      if (g_pinVel && curV >= 0 && nv != g_pinVel) { if (nv == pV) nV++; else { pV = nv; nV = 1; } if (nV < 6) nv = g_pinVel; else { pV = nullptr; nV = 0; } } else { pV = nullptr; nV = 0; } }
     static int s_velSince = -1; static bool s_velCensus = false;
     // v19: a velocity buffer that cannot be paired with the depth buffer (size) counts as 'not found'
     if (nv && nd) { D3D12_RESOURCE_DESC a0 = ResDesc(nv), b0 = ResDesc(nd);
@@ -1139,7 +1148,7 @@ static void UpdatePins() {
         if (alt) nv = alt; } }
     if (nv != g_pinVel || nd != g_pinDepth) { static int s_pl = 0; if (s_pl++ < 60) { D3D12_RESOURCE_DESC vv = nv ? ResDesc(nv) : D3D12_RESOURCE_DESC{}, dd2 = nd ? ResDesc(nd) : D3D12_RESOURCE_DESC{};
         Log("pins (frame %d): velocity %p %llux%u fmt=%d | depth %p %llux%u fmt=%d", fr, (void*)nv, (unsigned long long)vv.Width, vv.Height, (int)vv.Format, (void*)nd, (unsigned long long)dd2.Width, dd2.Height, (int)dd2.Format); }
-      if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (frame generation is reset)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd); g_forceReset = true; }
+      if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (frame generation is reset)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd); g_forceReset = true; g_rstPins++; }
     g_pinVel = nv; g_pinDepth = nd;
     if (nd) { D3D12_RESOURCE_DESC dd = ResDesc(nd); if ((int)dd.Width != g_effW.load() || (int)dd.Height != g_effH.load()) { g_effW = (int)dd.Width; g_effH = (int)dd.Height; Log("render size from pinned depth buffer: %dx%d", g_effW.load(), g_effH.load()); } }
 }
@@ -1273,6 +1282,7 @@ struct PreInitArg { UINT w, h; };
 static DWORD WINAPI MvPreInitThread(LPVOID p) { PreInitArg a = *(PreInitArg*)p; delete (PreInitArg*)p; t_prewarm = true; try { InitMvPass(a.w, a.h); } catch (...) {} t_prewarm = false; g_mvPreIniting = false; return 0; }
 static double g_obStart = 0, g_obMs = 0, g_tSleep = 0, g_tPins = 0, g_tMv = 0, g_tPrune = 0;   // time spent in OnPresentBegin (= our own per-frame overhead) of the last frame
 static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
+    const double pObMs = g_obMs, pSleep = g_tSleep, pPins = g_tPins, pMv = g_tMv, pPrune = g_tPrune;   // v25: our own timings of the PREVIOUS frame (for the tick log)
     g_obStart = NowMs(); g_obMs = 0; g_tSleep = g_tPins = g_tMv = g_tPrune = 0;
     { static long s_lastCbv = 0; long c = g_cbvCalls.load(); g_cbvPerFrame = c - s_lastCbv; s_lastCbv = c; }
     FrameCtx ctx;
@@ -1282,8 +1292,11 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     static LARGE_INTEGER s_qf = {}, s_last = {}; static double s_ema = 16.7;
     if (!s_qf.QuadPart) QueryPerformanceFrequency(&s_qf);
     { LARGE_INTEGER n; QueryPerformanceCounter(&n); double dtMs = s_last.QuadPart ? (double)(n.QuadPart - s_last.QuadPart) * 1000.0 / (double)s_qf.QuadPart : 0.0; s_last = n;
+      // v25: tick log - every frame that took clearly longer than the running average (a visible "tick"), with what WE spent in the previous frame, so the next log shows the cause
+      if (dtMs > 0.0 && dtMs <= 250.0 && fr > g_cfg.warmup && dtMs > std::max(s_ema * 2.0, s_ema + 12.0)) { static int nt = 0; if (nt++ < 200)
+          Log("tick: frame %d took %.1f ms (avg %.1f) | ours(prev frame): total %.1f [sleep %.1f pins %.1f mv %.1f prune %.1f] | cbv/frame=%ld | FG %s | resets so far: cut=%d pins=%d dropped=%d", fr, dtMs, s_ema, pObMs, pSleep, pPins, pMv, pPrune, g_cbvPerFrame.load(), g_wasOn ? "on" : "off", g_rstCut.load(), g_rstPins.load(), g_rstDropped.load()); }
       if (dtMs > 0.0 && dtMs < 1000.0) s_ema += (dtMs - s_ema) * 0.05;
-      if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
+      if (dtMs > 250.0) { g_forceReset = true; g_forceResetHard = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
     FlushDeferredRes();
     UpdateViewRect(fr);   // v20
     if ((fr % 20) == 0) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(24); } g_tPrune = NowMs() - tp0; }   // v23: small slices (was: everything every 120 frames)
@@ -1293,6 +1306,7 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
         DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; if (g_dispW) { g_autoW = g_dispW; g_autoH = g_dispH; } }
         size_t nb_; { std::shared_lock<std::shared_mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
         Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_camFrame.load(), bbd);
+        Log("resets: cut-guard=%d (ignored %d) pins=%d dropped-by-limiter=%d", g_rstCut.load(), g_cutIgnored, g_rstPins.load(), g_rstDropped.load());
         static long s_pn = 0, s_pns = 0; long pn = g_probeN.load(), pns = g_probeNs.load();
         Log("cam-diag: probes +%ld (%.2f ms total, %.1f us each) cbv/frame=%ld", pn - s_pn, (pns - s_pns) / 1e6, pn > s_pn ? (pns - s_pns) / 1e3 / (double)(pn - s_pn) : 0.0, g_cbvPerFrame.load()); s_pn = pn; s_pns = pns;
         Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_projSeen.load(), g_scanRuns.load(), g_camLocked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
@@ -1344,7 +1358,10 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
             double tm0 = NowMs(); UINT bw = (UINT)vd.Width, bh = vd.Height, vw = bw, vh = bh; { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (UINT)gw <= bw && (UINT)gh <= bh) { vw = (UINT)gw; vh = (UINT)gh; } }
             bool mvok = RunMvPass(bw, bh, vw, vh, g_pinVel, g_pinDepth); g_tMv = NowMs() - tm0;
             if (mvok) {
-                bool reset = g_forceReset.exchange(false) || cutNow || !g_wasOn || (fr - g_lastOnFrame) > 1;   // v23: camera cut -> reset flag instead of FG off
+                bool softReq = g_forceReset.exchange(false) || cutNow; bool hard = g_forceResetHard.exchange(false) || !g_wasOn || (fr - g_lastOnFrame) > 1;
+                static int s_lastRst = -1000; bool reset = hard;
+                if (!hard && softReq) { if (fr - s_lastRst >= 10) reset = true; else g_rstDropped++; }   // v25: no reset storms (pins / cuts / c2p switches in quick succession)
+                if (reset) s_lastRst = fr;   // v23: camera cut -> reset flag instead of FG off
                 if (BuildConstants(consts, reset)) inputs = true;
             }
         }
