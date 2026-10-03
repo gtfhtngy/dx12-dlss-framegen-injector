@@ -4,8 +4,8 @@ A DLL-based injector that enables **NVIDIA DLSS Frame Generation** (via Streamli
 
 ## Current Status
 
-- Tested on **Scarlet Nexus** and **Code Vein**
-- Both games use Unreal Engine 4 + DirectX 12
+- Tested on **Scarlet Nexus** and **Code Vein** and **Captain Tsubasa: World Fighters**
+- All three games use Unreal Engine + DirectX 12
 - Frame Generation works
 - Some stuttering can occur in very busy scenes (expected behavior with frame generation)
 - No major ghosting observed during normal gameplay in the tested scenarios
@@ -26,6 +26,7 @@ It includes automatic detection of different UE4 view-buffer layouts to improve 
 |-----------------|--------|-------|------------|--------------------------------------------|
 | Scarlet Nexus   | UE4    | DX12  | Working    | Primary test case                          |
 | Code Vein       | UE4    | DX12  | Working    | Older UE4 view-buffer layout supported (DX12 Makes the game crashes after the end cutscene)    |
+| Code Vein       | UE5    | DX12  | Working    | UE5 Test (Flickering screen loading and menu) (**it only works good on TSR pls do NOT run it on any other ANTI-ALIASING**)    |
 
 ## Installation
 
