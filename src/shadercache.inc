@@ -56,7 +56,7 @@ static thread_local bool t_prewarm = false;     // true on our private warm-up t
 static HANDLE g_prewarmDone = nullptr;          // signalled when the warm-up is finished (the game's D3D12/DXGI creation calls wait for it)
 
 static uint64_t MvSourceKey() {
-    std::string s = std::string(kMvHlsl) + "|cs_5_1|flags=0|rootsig_v1|SNSC1";
+    std::string s = std::string(kMvHlsl) + "|cs_5_1|flags=0|rootsig_v1|SNSC2|c22";
     return Fnv64(s.data(), s.size());
 }
 static std::vector<std::wstring> CachePaths() {
@@ -232,7 +232,7 @@ static bool CompileMvShader(std::vector<uint8_t>& dxbc, std::vector<uint8_t>& rs
     rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 2; rg[0].BaseShaderRegister = 0; rg[0].OffsetInDescriptorsFromTableStart = 0;
     rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 2; rg[1].BaseShaderRegister = 0; rg[1].OffsetInDescriptorsFromTableStart = 2;
     D3D12_ROOT_PARAMETER rp[2] = {};
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 20; rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 22; rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[1].DescriptorTable.NumDescriptorRanges = 2; rp[1].DescriptorTable.pDescriptorRanges = rg; rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rsd = {}; rsd.NumParameters = 2; rsd.pParameters = rp;
     ID3DBlob* blob = nullptr; err = nullptr;
