@@ -23,14 +23,16 @@
 # camstale : frames without a fresh camera before FG is switched off (default 30; v15 used 6 -> FG flapped on short hitches)
 # bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)
 # psoretry : 1 = (v17) if the GAME fails to create a pipeline state (E_INVALIDARG), write the details to the log and retry once without the cached blob; 0 = off
-# cutdetect : v22 1 = detect camera cuts / FOV jumps (Special Shots, cutscenes), reset history and pause FG for 3 frames, 0 = off
+# cutdetect : 1 = detect camera cuts / FOV jumps (Special Shots, cutscenes) and reset the DLSS-G history (v23: FG is NO LONGER switched off for this - every FG off/on = 100+ ms hitch), 0 = off
+# cutthresh : v23 ClipToPrevClip deviation x100 that counts as a cut (default 120 = 1.20; v22 used 25 and fired on every fast camera turn)
+# cutfov    : v23 projection (FOV) change in percent that counts as a cut (default 8; v22 used 2)
 # sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)
 fg=1
 mult=2
 stage=2
 log=1
-hudless=1
-hudlessdraw=4
+hudless=0
+hudlessdraw=2
 renderw=0
 renderh=0
 tol=100
@@ -56,3 +58,5 @@ velfmt=0
 viewrect=1
 c2pauto=1
 cutdetect=1
+cutthresh=120
+cutfov=8
