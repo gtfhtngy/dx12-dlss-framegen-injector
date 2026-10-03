@@ -5,7 +5,12 @@
 # log       : 1 = write SN_DLSSG_log.txt + Streamline log files next to the exe
 # hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)
 # hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')
-# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance
+# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance. renderw=0 renderh=0 = AUTO (UE5 / TSR / dynamic screen percentage)
+# velfallback : v19 1 = if no velocity buffer is found, run FG with camera-only motion vectors (dummy zero velocity); velwait = frames to wait first
+# velfmt    : v19 extra DXGI format number accepted as velocity target (34=R16G16_FLOAT 37=R16G16_SNORM 16=R32G32_FLOAT 15=R32G32_TYPELESS, 0=none) - see the census lines in the log
+# viewrect : v20 1 = use the real view rect (viewport on the depth buffer) instead of the whole depth/velocity buffer (fixes the stale band at the bottom/right edge with dynamic resolution), 0 = off
+# c2pauto : v21 1 = switch ClipToPrevClip candidate if the locked one never moves while another does (see c2p-monitor in the log), 0 = off
+# c2pidx    : v18 (UE5) which identity-like matrix after ViewToClipNoAA is ClipToPrevClip (0 = first). Only used by the automatic camera scan
 # camauto   : 1 = automatically find the camera matrices in the UE4 view buffer when the offsets below do not fit this game (look for 'cam-scan: LOCKED' in the log)
 # projoff / noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 for Scarlet Nexus)
 # mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)
@@ -15,7 +20,10 @@
 # reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental)
 # log       : 1 = normal log, 2 = + verbose Streamline log (debug only, slow)
 # fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads
+# camstale : frames without a fresh camera before FG is switched off (default 30; v15 used 6 -> FG flapped on short hitches)
 # bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)
+# psoretry : 1 = (v17) if the GAME fails to create a pipeline state (E_INVALIDARG), write the details to the log and retry once without the cached blob; 0 = off
+# cutdetect : v22 1 = detect camera cuts / FOV jumps (Special Shots, cutscenes), reset history and pause FG for 3 frames, 0 = off
 # sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)
 fg=1
 mult=2
@@ -39,4 +47,12 @@ fgminfps=35
 reflexplace=0
 fgdelay=30
 bufmaxmb=192
+camstale=30
 psoretry=1
+c2pidx=0
+velfallback=1
+velwait=90
+velfmt=0
+viewrect=1
+c2pauto=1
+cutdetect=0
