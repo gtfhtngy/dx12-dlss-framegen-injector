@@ -1,5 +1,9 @@
 // SN_DLSSG - real NVIDIA DLSS Frame Generation (via Streamline / sl.dlss_g) injector, D3D12.
 // Proxy for winmm.dll. Written for Scarlet Nexus (UE4, D3D12) - separate from the DLAA/DLSS-SR project.
+// v18: also supports UE5 D3D12 games next to UE4 (see README 'v18'); UE4 behaviour is unchanged with the default cfg.
+// v21: c2p monitor (diagnostic + switch if the locked ClipToPrevClip never moves) - camera 'swimming / rubber-band' suspicion.
+// v20: dynamic resolution fix - FG now uses the real view rect (viewport on the depth buffer) instead of the whole buffer (stale L-shaped band at the bottom/right edge).
+// v19: UE5 game log showed vel=0 forever (no R16G16 velocity target found) -> FG never started. Now: velocity-less fallback (camera-only motion vectors) + render-target census in the log.
 //
 // What it does:
 //   1. Loads sl.interposer.dll (+ plugins next to it) and calls slInit BEFORE the game creates its D3D12 device.
@@ -71,11 +75,18 @@ struct Cfg {
     int log = 1;
     int hudless = 0;         // 1 = copy the back buffer right before the Nth draw into it and tag it as HUD-less
     int hudlessDraw = 2;     // N for hudless=1 (draw calls that target the back buffer, counted per frame)
-    int renderW = 2000, renderH = 1124, tol = 100;  // internal render resolution of the game (same defaults as the DLAA project)
+    int renderW = 2000, renderH = 1124, tol = 100;  // internal render resolution of the game (same defaults as the DLAA project). v18: renderw=0 = AUTO (UE5 / TSR / any screen percentage: same aspect as the swap chain, 1/4x..2x of its size)
     int mvOff = 492;         // float index of ClipToPrevClip in the UE4 view uniform buffer (same as DLAA 'mvoff')
     int noAAOff = 132;       // float index of ViewToClipNoAA
     int projOff = 116;       // float index of ViewToClip (jittered)
     int jitSX = 1, jitSY = 1, mvSX = 1, mvSY = 1;
+    int velFallback = 1;     // v19: 1 = if no velocity buffer is found for velwait frames, run frame generation with camera-only motion vectors (all-zero dummy velocity -> the MV shader derives MVs from depth + ClipToPrevClip)
+    int velWait = 90;        // v19: frames to wait for a real velocity buffer before the dummy is used (a real one found later replaces the dummy)
+    int velFmt = 0;          // v19: extra DXGI_FORMAT number accepted as velocity target: 34=R16G16_FLOAT 37=R16G16_SNORM 16=R32G32_FLOAT 15=R32G32_TYPELESS (0 = none). See the census lines in the log
+    int viewRect = 1;        // v20: 1 = use the REAL view rect (viewport the game renders the scene depth with) instead of the whole depth/velocity buffer (dynamic resolution: buffer > view rect -> stale L-shaped band at the bottom/right edge)
+    int cutDetect = 1;       // v22: 1 = detect camera cuts / FOV jumps / huge ClipToPrevClip jumps (Special Shots, cutscenes) and pause frame generation for a few frames + reset history
+    int c2pAuto = 1;         // v21: 1 = if the locked ClipToPrevClip candidate never moves while another identity-like candidate clearly does, switch to that one (log: "c2p-monitor: SWITCH")
+    int c2pIdx = 0;          // v18 (UE5): which identity-like matrix after ViewToClipNoAA is ClipToPrevClip (0 = first, like UE4). The log lists them ("cam-scan: identity-like matrices ...")
     int warmup = 150;        // frames to wait before enabling
     int psoRetry = 1;        // v17: 1 = if the GAME's CreateGraphicsPipelineState fails with E_INVALIDARG, log the full desc and retry once without CachedPSO
     int camStale = 30;       // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view). v16: 6 -> 30 (short hitches no longer toggle FG)
@@ -124,7 +135,7 @@ static void LoadCfg() {
                 "# log       : 1 = write SN_DLSSG_log.txt + Streamline log files next to the exe\n"
                 "# hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)\n"
                 "# hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')\n"
-                "# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance\n"
+                "# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance. renderw=0 renderh=0 = AUTO (recommended for UE5 / TSR / dynamic screen percentage)\n# c2pidx    : v18 (UE5) which identity-like matrix after ViewToClipNoAA is ClipToPrevClip (0 = first). Only used by the automatic camera scan\n"
                 "# camauto   : 1 = (default) automatically find the camera matrices in the UE4 view buffer when projoff/noaaoff/mvoff do not match this game (log: cam-scan LOCKED ...)\n# projoff/noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 in Scarlet Nexus)\n# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)\n"
                 "# warmup    : frames before frame generation is switched on\n"
                 "# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)\n"
@@ -145,21 +156,26 @@ static void LoadCfg() {
             else if (!strcmp(k, "log")) g_cfg.log = iv; else if (!strcmp(k, "hudless")) g_cfg.hudless = iv; else if (!strcmp(k, "hudlessdraw")) g_cfg.hudlessDraw = iv;
             else if (!strcmp(k, "renderw")) g_cfg.renderW = iv; else if (!strcmp(k, "renderh")) g_cfg.renderH = iv; else if (!strcmp(k, "tol")) g_cfg.tol = iv;
             else if (!strcmp(k, "mvoff")) g_cfg.mvOff = iv; else if (!strcmp(k, "noaaoff")) g_cfg.noAAOff = iv; else if (!strcmp(k, "projoff")) g_cfg.projOff = iv;
-            else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
+            else if (!strcmp(k, "velfallback")) g_cfg.velFallback = iv; else if (!strcmp(k, "velwait")) g_cfg.velWait = iv; else if (!strcmp(k, "velfmt")) g_cfg.velFmt = iv; else if (!strcmp(k, "c2pidx")) g_cfg.c2pIdx = iv; else if (!strcmp(k, "viewrect")) g_cfg.viewRect = iv ? 1 : 0; else if (!strcmp(k, "c2pauto")) g_cfg.c2pAuto = iv ? 1 : 0; else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
             else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "psoretry")) g_cfg.psoRetry = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv; else if (!strcmp(k, "camauto")) g_cfg.camAuto = iv;
             else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
             else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
             else if (!strcmp(k, "fgminfps")) g_cfg.fgMinFps = iv; else if (!strcmp(k, "reflexplace")) g_cfg.reflexPlace = iv;
             else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
-            else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
+            else if (!strcmp(k, "cutdetect")) g_cfg.cutDetect = iv ? 1 : 0; else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
         }
         fclose(f);
     }
     if (g_cfg.mult < 2) g_cfg.mult = 2;
+    if (g_cfg.velFmt != 15 && g_cfg.velFmt != 16 && g_cfg.velFmt != 34 && g_cfg.velFmt != 37) g_cfg.velFmt = 0;
+    if (g_cfg.velWait < 0) g_cfg.velWait = 0;
+    if (g_cfg.c2pIdx < 0) g_cfg.c2pIdx = 0; if (g_cfg.c2pIdx > 3) g_cfg.c2pIdx = 3;
+    if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
-    Log("SN_DLSSG build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
-    Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d mvoff=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.mvOff, g_cfg.warmup);
+    Log("SN_DLSSG v22 (UE4 + UE5, velocity fallback, view rect, c2p monitor, robust MV shader, camera-cut guard) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+    Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
+    Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d%s mvoff=%d c2pidx=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.renderW <= 0 ? " (AUTO)" : "", g_cfg.mvOff, g_cfg.c2pIdx, g_cfg.warmup);
 }
 
 static LONG CALLBACK DiagVEH(PEXCEPTION_POINTERS ep) {
@@ -297,7 +313,17 @@ static bool InitStreamline() {
 }
 
 // ------------------------------------------------------------------ resource tracking (ported from the DLAA project)
-static bool IsInternal(UINT w, UINT h) { return abs((int)w - g_cfg.renderW) <= g_cfg.tol && abs((int)h - g_cfg.renderH) <= g_cfg.tol; }
+static std::atomic<UINT> g_autoW{0}, g_autoH{0};   // v18: swap chain size, used by renderw=0 (auto) to recognise the internal-resolution buffers
+static bool IsInternal(UINT w, UINT h) {
+    if (g_cfg.renderW > 0) return abs((int)w - g_cfg.renderW) <= g_cfg.tol && abs((int)h - g_cfg.renderH) <= g_cfg.tol;   // fixed resolution (UE4 default, unchanged)
+    // AUTO (v18): same aspect as the swap chain, from 1/4x to 2x of its size (TSR / DLSS-style screen percentage 25%..200%)
+    if (w < 320 || h < 180) return false;
+    UINT sw = g_autoW.load(std::memory_order_relaxed), sh = g_autoH.load(std::memory_order_relaxed);
+    double asp = (double)w / (double)h;
+    if (!sw || !sh) return asp > 1.2 && asp < 3.8;                  // swap chain not known yet: any plausible screen aspect
+    if (w * 4 < sw || w > sw * 2) return false;
+    return fabs(asp - (double)sw / (double)sh) < 0.03;
+}
 struct ResMeta { ID3D12Resource* res = nullptr; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE; std::atomic<int> useClear{0}, useSetRT{0}, useCopySrc{0}, useCopyDst{0}, useSRV{0}; int score = 0; bool held = false; bool cand = false; };
 static std::unordered_map<void*, ResMeta> g_res;
 static std::unordered_map<SIZE_T, void*> g_rtvToRes, g_dsvToRes;
@@ -307,17 +333,30 @@ static ID3D12Device* g_device = nullptr;
 static ID3D12CommandQueue* g_queue = nullptr;          // the game's direct queue (the one the swap chain was created with)
 static std::atomic<int> g_frame{0};
 static std::atomic<int> g_effW{0}, g_effH{0};   // real size of the pinned depth/velocity buffers (0 = not known yet -> cfg renderw/renderh)
-static inline int EffW() { int v = g_effW.load(); return v ? v : g_cfg.renderW; }
-static inline int EffH() { int v = g_effH.load(); return v ? v : g_cfg.renderH; }
+static std::atomic<int> g_viewW{0}, g_viewH{0};   // v20: real view rect (top-left, <= pinned buffer size) the game renders into; 0 = unknown -> whole buffer
+static inline int EffW() { int vv = g_viewW.load(); if (vv && g_cfg.viewRect) return vv; int v = g_effW.load(); if (v) return v; if (g_cfg.renderW > 0) return g_cfg.renderW; UINT a = g_autoW.load(); return a ? (int)a : 1920; }
+static inline int EffH() { int vv = g_viewH.load(); if (vv && g_cfg.viewRect) return vv; int v = g_effH.load(); if (v) return v; if (g_cfg.renderH > 0) return g_cfg.renderH; UINT a = g_autoH.load(); return a ? (int)a : 1080; }
 static ID3D12Resource* g_pinVel = nullptr; static ID3D12Resource* g_pinDepth = nullptr;
+static ID3D12Resource* g_dummyVel = nullptr; static UINT g_dummyW = 0, g_dummyH = 0;   // v19: all-zero R16G16_UNORM 'no velocity anywhere' texture (owned by us, never in g_res)
 static std::atomic<bool> g_forceReset{false};   // next DLSS-G frame is sent with reset=true (pins changed, hitch, MV buffers re-created)
 
+static inline bool IsVelFmt(DXGI_FORMAT f) { return f == DXGI_FORMAT_R16G16_UNORM || f == DXGI_FORMAT_R16G16_TYPELESS || (g_cfg.velFmt && (int)f == g_cfg.velFmt); }   // v18: some UE5 RHI paths create the velocity target typeless (we always view it as R16G16_UNORM)
+// v19: census of render-target / UAV textures at the internal resolution that are NOT depth and NOT accepted as velocity: tells us what format the game's velocity target really has
+struct CensusKey { int fmt; UINT w, h; int flags; bool operator<(const CensusKey& o) const { if (fmt != o.fmt) return fmt < o.fmt; if (w != o.w) return w < o.w; if (h != o.h) return h < o.h; return flags < o.flags; } };
+static std::map<CensusKey, int> g_census; static std::mutex g_censusMx;
+static void CensusNote(const D3D12_RESOURCE_DESC& d) { std::lock_guard<std::mutex> lk(g_censusMx); if (g_census.size() < 80 || g_census.count({ (int)d.Format, (UINT)d.Width, d.Height, (int)d.Flags })) g_census[{ (int)d.Format, (UINT)d.Width, d.Height, (int)d.Flags }]++; }
+static void CensusLog(const char* why) {
+    std::lock_guard<std::mutex> lk(g_censusMx); Log("census[%s]: non-depth RT/UAV textures at the internal resolution (DXGI format number, size, resource flags 1=RT 4=UAV, how many views created):", why);
+    for (auto& kv : g_census) Log("  census: fmt=%d %ux%u flags=0x%X x%d", kv.first.fmt, kv.first.w, kv.first.h, kv.first.flags, kv.second);
+    if (g_census.empty()) Log("  census: (none)");
+}
 static void RegisterRes(ID3D12Resource* res) {
     if (!res) return;
     D3D12_RESOURCE_DESC d = ResDesc(res);
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
     bool depth = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
-    bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || d.Format == DXGI_FORMAT_R16G16_UNORM);
+    bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || IsVelFmt(d.Format));
+    if (!cand && !depth && (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && IsInternal((UINT)d.Width, d.Height)) CensusNote(d);
     if (!cand) { std::shared_lock<std::shared_mutex> sl(g_resMx); if (!g_res.count((void*)res)) return; }   // loading creates thousands of RTV/DSV/SRVs: no exclusive lock for those
     std::lock_guard<std::shared_mutex> lk(g_resMx);
     auto& m = g_res[(void*)res];
@@ -356,7 +395,7 @@ static bool GetSubState(void* r, UINT sub, UINT* st) { std::lock_guard<std::mute
 // ---- camera / jitter from the UE4 view uniform buffer (upload heap buffers are mapped once and kept)
 struct BufInfo { UINT64 size = 0; ID3D12Resource* res = nullptr; BYTE* map = nullptr; std::atomic<int> lastUse{0}; };
 static std::map<UINT64, BufInfo> g_bufs; static std::shared_mutex g_bufMx;
-static float g_vtcNoAA[16] = {}, g_c2p[16] = {}; static float g_jitPX = 0.f, g_jitPY = 0.f;
+static float g_vtcNoAA[16] = {}, g_c2p[16] = {}; static float g_jitPX = 0.f, g_jitPY = 0.f; static float g_jitNX = 0.f, g_jitNY = 0.f;   // v20: g_jitN* = jitter in NDC*0.5 (scaled by the CURRENT view size in BuildConstants, dynamic resolution changes it every frame)
 static std::atomic<int> g_camFrame{-1}; static std::mutex g_camMx;
 // The registry keeps one reference to every upload buffer (>=64 KB) so the mapped pointer stays valid.
 // v13 never let go of them: after a long session the 4096-entry cap was full of buffers the game had destroyed long ago,
@@ -390,7 +429,7 @@ static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0}, g_projSeen{0}, g_scanRuns{
 static std::atomic<int> g_lastJitFrame{-1000};
 static bool IsProj(const float* m, bool loose) {
     float ref = (float)EffW() / (float)EffH(); float asp = m[5] / m[0];
-    bool aspOk = loose ? (asp > 1.2f && asp < 2.6f) : fabsf(asp - ref) < 0.03f;
+    bool aspOk = loose ? (asp > 1.2f && asp < 3.8f) : fabsf(asp - ref) < 0.03f;   // v18: 3.8 (was 2.6) = 32:9 super-ultrawide
     return m[0] > 0.2f && m[5] > 0.2f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f && m[4] == 0.f && m[6] == 0.f && m[7] == 0.f
         && fabsf(m[11]) == 1.f && m[12] == 0.f && m[13] == 0.f && m[15] == 0.f && aspOk;
 }
@@ -408,6 +447,7 @@ static void DumpViewBuf(const float* p, int avail, UINT64 off, const char* why) 
     for (int i = 0; i + 4 <= avail; i += 4) fprintf(f, "%4d: %.8g %.8g %.8g %.8g\n", i, p[i], p[i + 1], p[i + 2], p[i + 3]);
     fclose(f); Log("cam-scan: wrote view-buffer dump %d to SN_DLSSG_viewbuf.txt (move/rotate the camera a bit before the next one)", nd);
 }
+static int g_c2pCand[4] = { -1, -1, -1, -1 }; static int g_c2pCandN = 0;   // v21: identity-like matrices found after ViewToClipNoAA at lock time (float offsets)
 static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     static int s_frame = -1, s_budget = 0; int fr = g_frame.load();
     if (fr != s_frame) { s_frame = fr; s_budget = 24; }   // v16: was 600 full-buffer scans per frame if (s_budget-- <= 0) return;
@@ -428,7 +468,14 @@ static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
         if (cnt > 0 && nlog < 25) { bool dup = false; for (int q = 0; q < nseen; q++) if (seen[q] == h) dup = true; if (!dup) { if (nseen < 16) seen[nseen++] = h; nlog++; Log("cam-scan: no jittered/NoAA pair, but %d projection-like matrices (buffer offset %llu, avail %d floats):%s", cnt, (unsigned long long)off, avail, line); } }
         return;
     }
-    int k = -1; for (int q = nj + 16; q + 16 <= avail; q += 4) if (LooksLikeC2P(p + q)) { k = q; break; }
+    // v18: collect up to 4 identity-like matrices after ViewToClipNoAA (UE5 has more matrices in front of / behind ClipToPrevClip); c2pidx picks one (default: the first = UE4 behaviour)
+    int k = -1; { int cand[4]; int nc = 0; static bool s_listed = false; int need = 4;   // v21: always collect all 4 (the monitor below needs every candidate)
+      for (int q = nj + 16; q + 16 <= avail && nc < need; q += 4) if (LooksLikeC2P(p + q)) cand[nc++] = q;
+      if (!s_listed && nc > 0) { s_listed = true; char l[700]; int ln = 0; l[0] = 0;
+        for (int i = 0; i < nc && ln < 600; i++) { const float* c = p + cand[i]; ln += snprintf(l + ln, sizeof l - ln, " #%d@%d[diag %.4f %.4f %.4f %.4f | z-row xy %.5f %.5f | trans xy %.5f %.5f]", i, cand[i], c[0], c[5], c[10], c[15], c[8], c[9], c[12], c[13]); }
+        Log("cam-scan: identity-like matrices after ViewToClipNoAA:%s  -> c2pidx=%d", l, g_cfg.c2pIdx); }
+      for (int i = 0; i < nc; i++) g_c2pCand[i] = cand[i]; g_c2pCandN = nc;
+      if (g_cfg.c2pIdx < nc) k = cand[g_cfg.c2pIdx]; }
     static int n = 0; static int li = -1, lj = -1, lk = -1, hits = 0;
     if (k < 0) { DumpViewBuf(p, avail, off, "pair found, no ClipToPrevClip"); if (n++ < 10) Log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)off, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
     if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (n++ < 20) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
@@ -477,11 +524,64 @@ static bool TryLegacyLayout(const float* p, int availF) {
     memcpy(vtc, a, sizeof vtc); vtc[8] = 0.f; vtc[9] = 0.f;   // ViewToClipNoAA = ViewToClip without the jitter
     { std::lock_guard<std::mutex> lk2(g_camMx);
       memcpy(g_vtcNoAA, vtc, sizeof g_vtcNoAA); memcpy(g_c2p, c2p, sizeof g_c2p);
-      g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY;
+      g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY; g_jitNX = a[8] * 0.5f * (float)g_cfg.jitSX; g_jitNY = -a[9] * 0.5f * (float)g_cfg.jitSY;
       g_camFrame = fr; }
     if (g_lastJitFrame < fr) g_lastJitFrame = fr;
     static int n = 0; if (n++ < 8) Log("camera(legacy layout): frame=%d %s jitter px=(%.4f,%.4f) m0=%.5f m5=%.5f near=%.3f viewsize=%.0fx%.0f c2p diag=%.5f %.5f %.5f %.5f", fr, dummy ? "DUMMY-identity-view" : "main-view", g_jitPX, g_jitPY, a[0], a[5], a[14], p[472], p[473], c2p[0], c2p[5], c2p[10], c2p[15]);
     return true;
+}
+// ---- v21: c2p monitor. The scan locks onto an identity-like matrix while the camera is still (menu / first frames) - at that moment ALL candidates look identical, so the
+// choice is a guess. If the chosen matrix is not the real ClipToPrevClip (e.g. a constant placeholder), frame generation gets zero camera motion for the static scenery and the
+// generated frames show the world NOT following the camera (judder / rubber-band / swimming = "the camera does things it should not"). The monitor measures, per candidate,
+// how far it is from identity while the game runs. The DLL itself only READS these matrices (it has no way to move the camera).
+struct C2pStat { int active = 0; double maxDev = 0.0; double sumDev = 0.0; };
+static C2pStat g_c2pSt[4]; static int g_c2pStFrames = 0, g_c2pLastFrame = -1, g_c2pWinStart = 0;
+static double C2pDev(const float* m) { double d = 0.0; for (int i = 0; i < 16; i++) { double e = fabs((double)m[i] - ((i % 5) == 0 ? 1.0 : 0.0)); if (!(e == e)) return 1e9; if (e > d) d = e; } return d; }
+static void C2pMonitor(const float* p, int availF, int fr) {
+    if (!g_camLocked.load(std::memory_order_relaxed) || g_c2pCandN <= 0 || fr == g_c2pLastFrame) return;
+    g_c2pLastFrame = fr;
+    if (g_c2pStFrames == 0) g_c2pWinStart = fr;
+    for (int i = 0; i < g_c2pCandN && i < 4; i++) {
+        int o = g_c2pCand[i]; if (o < 0 || o + 16 > availF) continue;
+        double d = C2pDev(p + o); if (d > 1e-6) g_c2pSt[i].active++; g_c2pSt[i].sumDev += d; if (d > g_c2pSt[i].maxDev) g_c2pSt[i].maxDev = d;
+    }
+    if (++g_c2pStFrames < 300) return;
+    static int s_nlog = 0; int used = -1; for (int i = 0; i < g_c2pCandN && i < 4; i++) if (g_c2pCand[i] == g_cfg.mvOff) used = i;
+    if (s_nlog++ < 40) {
+        char l[600]; int ln = 0; l[0] = 0;
+        for (int i = 0; i < g_c2pCandN && i < 4; i++) ln += snprintf(l + ln, sizeof l - ln, " #%d@%d active=%d/%d maxdev=%.6f avgdev=%.6f%s |", i, g_c2pCand[i], g_c2pSt[i].active, g_c2pStFrames, g_c2pSt[i].maxDev, g_c2pSt[i].sumDev / g_c2pStFrames, i == used ? " (USED)" : "");
+        Log("c2p-monitor (frames %d..%d):%s  [a real ClipToPrevClip is exactly identity only while the camera stands still]", g_c2pWinStart, fr, l);
+    }
+    if (g_cfg.c2pAuto && used >= 0 && g_c2pSt[used].maxDev < 1e-7) {   // the used matrix did not move at all in 5 s ...
+        for (int i = 0; i < g_c2pCandN && i < 4; i++) if (i != used && g_c2pSt[i].maxDev > 4e-3 && g_c2pSt[i].active >= 5) {   // ... while another one clearly did (4e-3 >> TAA jitter ~7e-4)
+            Log("c2p-monitor: SWITCH ClipToPrevClip from float %d (never moved) to float %d (maxdev %.5f) - frame generation history is reset", g_cfg.mvOff, g_c2pCand[i], g_c2pSt[i].maxDev);
+            g_cfg.mvOff = g_c2pCand[i]; g_forceReset = true; break; }
+    }
+    for (int i = 0; i < 4; i++) g_c2pSt[i] = C2pStat(); g_c2pStFrames = 0;
+}
+// ---- v22: camera-cut guard. Special Shots / cutscenes switch the camera (or its FOV) from one frame to the next. Frame generation then interpolates between two
+// unrelated pictures with motion vectors that describe the wrong camera -> whole image regions get smeared. Detected: ClipToPrevClip far from identity, or a sudden change of the
+// projection (FOV). Reaction: reset the DLSS-G history and run a few frames WITHOUT frame generation (clean real frames), then resume.
+static std::atomic<int> g_cutHold{0};
+static float g_prevM0 = 0.f, g_prevM5 = 0.f; static int g_prevCamFrame = -1;
+static int g_cutWinStart = 0, g_cutWinCount = 0, g_cutSuppressUntil = 0, g_cutTotal = 0;
+static void CamCutCheck(const float* b, const float* c, int fr) {   // called with g_camMx held, once per frame at most
+    if (!g_cfg.cutDetect || fr == g_prevCamFrame) return;
+    bool cut = false; const char* why = ""; double val = 0.0;
+    double dev = C2pDev(c);
+    if (!(dev < 0.25)) { cut = true; why = "ClipToPrevClip far from identity"; val = dev; }   // also catches NaN
+    else if (g_prevCamFrame >= 0 && g_prevM0 > 0.f && g_prevM5 > 0.f && fr - g_prevCamFrame <= 3) {
+        double d0 = fabs((double)b[0] - g_prevM0) / g_prevM0, d5 = fabs((double)b[5] - g_prevM5) / g_prevM5;
+        if (d0 > 0.02 || d5 > 0.02) { cut = true; why = "projection (FOV) jump"; val = std::max(d0, d5); }
+    }
+    g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr;
+    if (!cut || fr < g_cutSuppressUntil) return;
+    if (fr - g_cutWinStart > 120) { g_cutWinStart = fr; g_cutWinCount = 0; }
+    if (++g_cutWinCount > 8) {   // the 'cut' keeps firing = this game changes its projection every frame (e.g. two alternating views): stop guarding, never leave FG off permanently
+        g_cutSuppressUntil = fr + 900; g_cutWinCount = 0; Log("camera-cut guard: fires too often (%s) -> suspended for 900 frames", why); return; }
+    int cur = g_cutHold.load(); if (cur < 3) g_cutHold = 3;
+    g_forceReset = true; g_cutTotal++;
+    if (g_cutTotal <= 60) Log("camera cut at frame %d: %s (%.4f) -> frame generation paused for 3 frames + history reset", fr, why, val);
 }
 // Parses one view-buffer candidate (a COPY in normal memory). true = recognised as a camera view buffer.
 static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
@@ -499,9 +599,11 @@ static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
     bool jittered = (a[8] != 0.f || a[9] != 0.f);
     if (jittered) g_lastJitFrame = fr;
     else if (fr - g_lastJitFrame < 90) return true;   // un-jittered view of a non-TAA pass while TAA is active: keep the last real one (no TAA at all -> accepted after 90 frames)
+    C2pMonitor(p, availF, fr);   // v21 (read-only statistics)
     std::lock_guard<std::mutex> lk2(g_camMx);
+    CamCutCheck(b, c, fr);   // v22
     memcpy(g_vtcNoAA, b, sizeof g_vtcNoAA); memcpy(g_c2p, c, sizeof g_c2p);
-    g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY;
+    g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY; g_jitNX = a[8] * 0.5f * (float)g_cfg.jitSX; g_jitNY = -a[9] * 0.5f * (float)g_cfg.jitSY;
     g_camFrame = fr;
     static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f%s", fr, g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15], jittered ? "" : " (NO TAA jitter)");
     return true;
@@ -523,13 +625,16 @@ static bool IsKnownVA(UINT64 va) { for (int i = 0; i < 16; i++) if (g_knownVA[i]
 static void AddKnownVA(UINT64 va) { if (!IsKnownVA(va)) g_knownVA[g_knownPos.fetch_add(1) & 15].store(va); }
 static void DropKnownVA(UINT64 va) { for (int i = 0; i < 16; i++) { UINT64 e = va; g_knownVA[i].compare_exchange_strong(e, 0); } }
 static __attribute__((noinline)) void ProbeView(UINT64 va, bool known, int fr) {
-    float tmp[3072]; int nf = 0; UINT64 off = 0;
+    float tmp[4096]; int nf = 0; UINT64 off = 0;   // v18: 3072 -> 4096 floats (UE5 view buffers are bigger)
     {   // copy the head of the buffer once into normal memory (never parse straight from the write-combined mapping)
         std::shared_lock<std::shared_mutex> lk(g_bufMx);
         auto it = g_bufs.upper_bound(va); if (it == g_bufs.begin()) { g_cbvMiss++; return; } --it;
         off = va - it->first; if (off >= it->second.size) { g_cbvMiss++; return; }
-        int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 3072);
-        nf = known ? std::min(availF, 640) : availF;
+        int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 4096);
+        // v18: a known view buffer is re-read up to the locked ClipToPrevClip (UE4: 492 -> still 640 floats; UE5: it can be far beyond float 640, v17 cut it off there -> camera lost right after the lock)
+        int cap = known ? std::max(640, g_cfg.mvOff + 20) : availF;
+        if (!known && g_camLocked.load(std::memory_order_relaxed)) cap = std::max(g_cfg.mvOff + 20, 160);   // v19: offsets locked by the scan -> an unknown address only needs the head up to ClipToPrevClip (v18 copied up to 16 KB of write-combined memory per probe = ~2 ms/frame in the UE5 log)
+        nf = std::min(availF, cap);
         if (nf < 64) return;
         memcpy(tmp, it->second.map + off, (size_t)nf * 4);
         it->second.lastUse.store(fr, std::memory_order_relaxed);
@@ -580,8 +685,11 @@ using PFN_SetRootCbv = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT
 using PFN_DrawInst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 using PFN_DrawIdxInst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
 using PFN_Exec = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+using PFN_RSSetVP = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+using PFN_CLReset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
 static PFN_CreateRTV oCreateRTV; static PFN_CreateDSV oCreateDSV; static PFN_CreateSRV oCreateSRV; static PFN_CopyDescSimple oCopyDescSimple;
 static PFN_CreateCommitted oCreateCommitted; static PFN_CreatePlaced oCreatePlaced; static PFN_OMSetRT oOMSetRT; static PFN_ClearRTV oClearRTV; static PFN_ClearDSV oClearDSV;
+static PFN_RSSetVP oRSSetVP; static PFN_CLReset oCLReset;
 static PFN_CopyTex oCopyTex; static PFN_SetRootCbv oSetGCbv, oSetCCbv; static PFN_DrawInst oDrawInst; static PFN_DrawIdxInst oDrawIdxInst; static PFN_Exec oExec;
 
 // hudless capture
@@ -638,6 +746,51 @@ static HRESULT STDMETHODCALLTYPE hkCreatePlaced(ID3D12Device* d, ID3D12Heap* h, 
 static void STDMETHODCALLTYPE hkSetGCbv(ID3D12GraphicsCommandList* cl, UINT i, D3D12_GPU_VIRTUAL_ADDRESS va) { TrackCamera(va); oSetGCbv(cl, i, va); }
 static void STDMETHODCALLTYPE hkSetCCbv(ID3D12GraphicsCommandList* cl, UINT i, D3D12_GPU_VIRTUAL_ADDRESS va) { TrackCamera(va); oSetCCbv(cl, i, va); }
 
+// ---- v20: real view rect. With dynamic resolution (or any screen percentage that changes at run time) the game keeps its depth/velocity buffers at the MAXIMUM size
+// and renders into the top-left rectangle of them. The rest of the buffer holds old frames. v19 handed the WHOLE buffer to frame generation -> an L-shaped band along the
+// bottom and right edge of the picture (outside the rectangle) was interpolated from stale depth/velocity ("cached" image), and the MV scale was wrong too.
+// The view rect is the viewport the game sets while the scene depth buffer is bound: RSSetViewports + OMSetRenderTargets are tracked per thread / command list.
+static thread_local ID3D12GraphicsCommandList* t_dsvCl = nullptr; static thread_local void* t_dsvRes = nullptr;
+static thread_local ID3D12GraphicsCommandList* t_vpCl = nullptr; static thread_local UINT t_vpW = 0, t_vpH = 0;
+static std::atomic<unsigned long long> g_vpAcc{ 0 };   // largest viewport (w<<32 | h) seen on a pinned-size depth buffer since the last Present
+static std::atomic<long> g_vpNotes{ 0 };
+static void NoteViewport(void* dsvRes, UINT w, UINT h) {
+    if (!dsvRes || !w || !h) return;
+    int bw = g_effW.load(), bh = g_effH.load(); if (!bw || !bh) return;     // pinned depth size not known yet
+    { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_res.find(dsvRes); if (it == g_res.end() || !it->second.cand || (int)it->second.w != bw || (int)it->second.h != bh) return; }
+    if ((int)w > bw) w = (UINT)bw; if ((int)h > bh) h = (UINT)bh;
+    unsigned long long nv = ((unsigned long long)w << 32) | h, cur = g_vpAcc.load();
+    while ((unsigned long long)w * h > (cur >> 32) * (cur & 0xFFFFFFFFull) && !g_vpAcc.compare_exchange_weak(cur, nv)) {}
+    g_vpNotes++;
+}
+static void STDMETHODCALLTYPE hkRSSetVP(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_VIEWPORT* vp) {
+    oRSSetVP(cl, n, vp);
+    if (!g_cfg.viewRect || !n || !vp) return;
+    if (vp[0].TopLeftX != 0.f || vp[0].TopLeftY != 0.f || !(vp[0].Width >= 1.f) || !(vp[0].Height >= 1.f)) { t_vpCl = nullptr; return; }   // offset viewports (split screen etc.) are not supported -> whole buffer
+    t_vpCl = cl; t_vpW = (UINT)(vp[0].Width + 0.5f); t_vpH = (UINT)(vp[0].Height + 0.5f);
+    if (t_dsvCl == cl && t_dsvRes) NoteViewport(t_dsvRes, t_vpW, t_vpH);
+}
+static HRESULT STDMETHODCALLTYPE hkCLReset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* al, ID3D12PipelineState* pso) {
+    HRESULT hr = oCLReset(cl, al, pso);
+    if (t_dsvCl == cl) { t_dsvCl = nullptr; t_dsvRes = nullptr; }      // a recycled command list starts with no render targets / viewport
+    if (t_vpCl == cl) { t_vpCl = nullptr; t_vpW = t_vpH = 0; }
+    return hr;
+}
+// called once per Present: the largest viewport used on the depth buffer = the real view rect
+static void UpdateViewRect(int fr) {
+    if (!g_cfg.viewRect) return;
+    unsigned long long acc = g_vpAcc.exchange(0); int bw = g_effW.load(), bh = g_effH.load();
+    if (!acc || !bw || !bh) return;                                  // no viewport seen this frame (menu / loading): keep the last rect
+    int w = (int)(acc >> 32), h = (int)(acc & 0xFFFFFFFFull);
+    if (w <= 0 || h <= 0 || w > bw || h > bh) return;
+    if (w * 4 < bw || h * 4 < bh) return;                            // implausibly small (a shadow / probe pass): ignore
+    if (fabs((double)w / h - (double)bw / bh) > 0.08) return;        // the view rect keeps the aspect of the buffer
+    if (w != g_viewW.load() || h != g_viewH.load()) {
+        static int nl_ = 0;
+        if (nl_++ < 300) Log("view rect: %dx%d inside depth/velocity buffer %dx%d at frame %d%s", w, h, bw, bh, fr, (w == bw && h == bh) ? " (= whole buffer)" : "  <- buffer is bigger than the rendered area (dynamic resolution)");
+        g_viewW = w; g_viewH = h;
+    }
+}
 static void STDMETHODCALLTYPE hkOMSetRT(ID3D12GraphicsCommandList* cl, UINT num, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     oOMSetRT(cl, num, rts, single, dsv);
     t_rt.cl = cl; t_rt.rt0 = nullptr;
@@ -645,7 +798,9 @@ static void STDMETHODCALLTYPE hkOMSetRT(ID3D12GraphicsCommandList* cl, UINT num,
         D3D12_CPU_DESCRIPTOR_HANDLE h = single ? rts[0] : rts[i]; if (single && i > 0) h.ptr += i * g_rtvInc;
         void* r = LookupRTV(h); if (i == 0) t_rt.rt0 = r; NoteUse(r, 1);
     }
-    if (dsv) { void* r = nullptr; { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv->ptr); if (it != g_dsvToRes.end()) r = it->second; } NoteUse(r, 1); }
+    if (dsv) { void* r = nullptr; { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv->ptr); if (it != g_dsvToRes.end()) r = it->second; } NoteUse(r, 1);
+        t_dsvCl = cl; t_dsvRes = r; if (g_cfg.viewRect && r && t_vpCl == cl && t_vpW) NoteViewport(r, t_vpW, t_vpH); }   // v20: viewport set BEFORE the depth buffer was bound
+    else { t_dsvCl = cl; t_dsvRes = nullptr; }
 }
 static void STDMETHODCALLTYPE hkClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT* c, UINT nr, const D3D12_RECT* r) { oClearRTV(cl, rtv, c, nr, r); NoteUse(LookupRTV(rtv), 0); }
 static void STDMETHODCALLTYPE hkClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT nr, const D3D12_RECT* r) {
@@ -716,25 +871,33 @@ static void DeferRelease(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* 
 
 // ------------------------------------------------------------------ MV compute pass: UE4 velocity (R16G16_UNORM, 0 = static) + depth + ClipToPrevClip -> pixel MVs (R16G16_FLOAT) + depth copy (R32_FLOAT)
 static const char* kMvHlsl =
-"cbuffer C : register(b0) { row_major float4x4 M; uint2 dim; float2 sgn; };\n"
+"cbuffer C : register(b0) { row_major float4x4 M; uint2 dim; float2 sgn; uint2 fdim; };\n"
 "Texture2D<float2> V : register(t0);\n"
 "Texture2D<float>  D : register(t1);\n"
 "RWTexture2D<float2> O : register(u0);\n"
 "RWTexture2D<float>  OD : register(u1);\n"
+"bool bad2(float2 a) { return any(isnan(a)) || any(isinf(a)); }\n"
 "[numthreads(8,8,1)]\n"
 "void main(uint3 t : SV_DispatchThreadID)\n"
 "{\n"
-"    if (t.x >= dim.x || t.y >= dim.y) return;\n"
+"    if (t.x >= fdim.x || t.y >= fdim.y) return;\n"
+"    if (t.x >= dim.x || t.y >= dim.y) {   // outside the real view rect (dynamic resolution): never leave stale data in the buffer\n"
+"        O[t.xy] = float2(0.0, 0.0); OD[t.xy] = 0.0; return;\n"
+"    }\n"
 "    float2 v = V.Load(int3(t.xy, 0));\n"
 "    float z = D.Load(int3(t.xy, 0));\n"
-"    float2 back;\n"
+"    if (isnan(z) || isinf(z)) z = 0.0;\n"
+"    z = saturate(z);\n"
+"    float2 back = float2(0.0, 0.0);\n"
 "    if (v.x > 0.0) {\n"
 "        back = (v - 32767.0/65535.0) / (0.499*0.5);\n"
 "    } else {\n"
 "        float2 sp = float2((t.x + 0.5)/dim.x*2.0 - 1.0, 1.0 - (t.y + 0.5)/dim.y*2.0);\n"
 "        float4 pc = mul(float4(sp, z, 1.0), M);\n"
-"        back = sp - pc.xy / pc.w;\n"
+"        if (pc.w > 1e-6) back = sp - pc.xy / pc.w;   // w <= 0: point behind the previous camera -> no usable reprojection\n"
 "    }\n"
+"    // guard: NaN / Inf / absurd vectors (> 25% of the screen in one frame) are what smears whole image regions in interpolated frames\n"
+"    if (bad2(back) || abs(back.x) > 0.5 || abs(back.y) > 0.5) back = float2(0.0, 0.0);\n"
 "    O[t.xy] = float2(-back.x * 0.5 * dim.x * sgn.x, back.y * 0.5 * dim.y * sgn.y);\n"
 "    OD[t.xy] = z;\n"
 "}\n";
@@ -788,6 +951,9 @@ static bool InitMvPass(UINT W, UINT H) {
     g_mvOut = g_mvOutA[0]; g_depthOut = g_depthOutA[0];
     g_mvW = W; g_mvH = H; g_mvFailed = false; g_forceReset = true; Log("MV pass ready (%ux%u, MV R16G16_FLOAT + depth R32_FLOAT, %d buffer sets) in %u ms", W, H, MV_BUFSETS, (unsigned)(GetTickCount() - tInit)); return true;
 }
+static DXGI_FORMAT VelSrvFormat(DXGI_FORMAT f) {   // v19: SRV format for the velocity input (the HLSL reads float2 for every one of these)
+    switch (f) { case DXGI_FORMAT_R16G16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT; case DXGI_FORMAT_R16G16_SNORM: return DXGI_FORMAT_R16G16_SNORM;
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT; default: return DXGI_FORMAT_R16G16_UNORM; } }
 static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
     switch (f) {
     case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
@@ -797,7 +963,7 @@ static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
     default: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; }
 }
 // Builds a private command list, runs the MV pass on the game's queue. Returns true if g_mvOut/g_depthOut were refreshed.
-static bool RunMvPass(UINT W, UINT H, ID3D12Resource* vel, ID3D12Resource* depth) {
+static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3D12Resource* depth) {   // W/H = size of the game's buffers (allocation), VW/VH = real view rect inside them (v20)
     if (!g_device || !g_queue || !vel || !depth) return false;
     if (!InitMvPass(W, H)) return false;
     ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr; int ringSlot = -1;
@@ -847,26 +1013,38 @@ static bool RunMvPass(UINT W, UINT H, ID3D12Resource* vel, ID3D12Resource* depth
     D3D12_CPU_DESCRIPTOR_HANDLE c = CpuStart(g_mvHeap); c.ptr += (SIZE_T)base;
     D3D12_GPU_DESCRIPTOR_HANDLE g = GpuStart(g_mvHeap); g.ptr += base;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
-    sv.Format = DXGI_FORMAT_R16G16_UNORM; g_device->CreateShaderResourceView(vel, &sv, c);
+    sv.Format = VelSrvFormat(ResDesc(vel).Format); g_device->CreateShaderResourceView(vel, &sv, c);
     c.ptr += g_mvInc; sv.Format = DepthSrvFormat(ResDesc(depth).Format); g_device->CreateShaderResourceView(depth, &sv, c);
     c.ptr += g_mvInc; D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; uv.Format = DXGI_FORMAT_R16G16_FLOAT; g_device->CreateUnorderedAccessView(g_mvOut, nullptr, &uv, c);
     c.ptr += g_mvInc; uv.Format = DXGI_FORMAT_R32_FLOAT; g_device->CreateUnorderedAccessView(g_depthOut, nullptr, &uv, c);
-    struct { float m[16]; UINT w, h; float sx, sy; } k; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(k.m, g_c2p, sizeof k.m); }
-    k.w = W; k.h = H; k.sx = (float)g_cfg.mvSX; k.sy = (float)g_cfg.mvSY;
+    struct { float m[16]; UINT w, h; float sx, sy; UINT fw, fh; } k; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(k.m, g_c2p, sizeof k.m); }
+    k.w = VW; k.h = VH; k.sx = (float)g_cfg.mvSX; k.sy = (float)g_cfg.mvSY; k.fw = W; k.fh = H;
     ID3D12DescriptorHeap* hh[1] = { g_mvHeap }; cl->SetDescriptorHeaps(1, hh);
     cl->SetComputeRootSignature(g_mvRS); cl->SetPipelineState(g_mvPSO);
-    cl->SetComputeRoot32BitConstants(0, 20, &k, 0); cl->SetComputeRootDescriptorTable(1, g);
-    cl->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+    cl->SetComputeRoot32BitConstants(0, 22, &k, 0); cl->SetComputeRootDescriptorTable(1, g);
+    cl->Dispatch((W + 7) / 8, (H + 7) / 8, 1);   // v22: whole buffer (the part outside the view rect is zeroed by the shader)
     D3D12_RESOURCE_BARRIER o[2] = {}; for (int i = 0; i < 2; i++) { o[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; o[i].Transition.pResource = i ? g_depthOut : g_mvOut; o[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; o[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; o[i].Transition.StateAfter = kOutState; }
     oResBarrier(cl, 2, o);
     if (nb) oResBarrier(cl, nb, post);
     cl->Close();
     ID3D12CommandList* lists[1] = { cl }; oExec(g_queue, 1, lists);
     if (ringSlot >= 0) { g_ringVal[ringSlot] = ++g_fenceNext; g_queue->Signal(g_ringFence, g_ringVal[ringSlot]); } else DeferRelease(cl, al);
-    if (s_log++ < 3) Log("MV pass submitted: frame=%d slot=%d %ux%u transitions=%u c2p diag=%.5f %.5f %.5f %.5f", g_frame.load(), slot, W, H, nb, k.m[0], k.m[5], k.m[10], k.m[15]);
+    if (s_log++ < 3) Log("MV pass submitted: frame=%d slot=%d buffer %ux%u view %ux%u transitions=%u c2p diag=%.5f %.5f %.5f %.5f", g_frame.load(), slot, W, H, VW, VH, nb, k.m[0], k.m[5], k.m[10], k.m[15]);
     return true;
 }
 
+static ID3D12Resource* EnsureDummyVel(UINT w, UINT h) {
+    if (g_dummyVel && g_dummyW == w && g_dummyH == h) return g_dummyVel;
+    if (!g_device || !w || !h) return nullptr;
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT; hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16_UNORM; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource* r = nullptr;   // created directly in the read state the MV pass uses (never transitioned; committed resources are zero-initialised = 'no velocity' for every pixel)
+    HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, __uuidof(ID3D12Resource), (void**)&r);
+    if (FAILED(hr) || !r) { static int nf = 0; if (nf++ < 3) Log("dummy velocity %ux%u: CreateCommittedResource failed 0x%08X", w, h, (unsigned)hr); return nullptr; }
+    if (g_dummyVel) DeferResRelease(g_dummyVel);
+    g_dummyVel = r; g_dummyW = w; g_dummyH = h; Log("dummy velocity created %ux%u (camera-only motion vectors: moving characters will get wrong MVs until a real velocity buffer is found)", w, h);
+    return r;
+}
 // Drops candidate resources the game has already destroyed (only our own reference is left). v13 kept them forever (VRAM leak) and,
 // because the use-counters only ever grew, an old dead depth/velocity buffer could stay "the best" forever after a level load / settings change -> stale MVs = ghosting.
 static void PruneRes() {
@@ -893,7 +1071,7 @@ static void UpdatePins() {
     int fr = g_frame.load();
     if ((fr % 30) == 0) PruneRes();
     if (g_pinVel && g_pinDepth && (fr % 8) != 0) return;      // pins are stable: re-evaluate every 8 frames only
-    ID3D12Resource* bestVel = nullptr, * bestDep = nullptr; int bv = -1, bd = -1, curV = -1, curD = -1;
+    ID3D12Resource* bestVel = nullptr, * bestDep = nullptr, * bestVelT = nullptr; int bv = -1, bd = -1, curV = -1, curD = -1, bvT = -1;
     { std::unique_lock<std::shared_mutex> lk(g_resMx);
       for (auto& kv : g_res) { auto& m = kv.second; if (!m.cand || !IsInternal(m.w, m.h)) continue;
         int window = m.useClear.exchange(0) + m.useSetRT.exchange(0) * 2 + m.useCopySrc.exchange(0) + m.useCopyDst.exchange(0) + m.useSRV.exchange(0);
@@ -901,11 +1079,35 @@ static void UpdatePins() {
         if (m.res == g_pinDepth) curD = m.score;
         if (m.res == g_pinVel) curV = m.score;
         if ((m.flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && m.score > bd) { bd = m.score; bestDep = m.res; }
-        if (m.fmt == DXGI_FORMAT_R16G16_UNORM && m.score > bv) { bv = m.score; bestVel = m.res; } } }
+        if (m.fmt == DXGI_FORMAT_R16G16_UNORM && m.score > bv) { bv = m.score; bestVel = m.res; }
+        else if (m.fmt == DXGI_FORMAT_R16G16_TYPELESS && m.score > bvT) { bvT = m.score; bestVelT = m.res; } } }   // v18: typeless velocity only as a fallback (UE4 behaviour unchanged)
+    if (!bestVel && bestVelT) { bestVel = bestVelT; bv = bvT; }
     // hysteresis: keep the current pin unless another resource is clearly (1.5x) busier
     ID3D12Resource* nv = (g_pinVel && curV >= 0 && curV * 3 >= bv * 2) ? g_pinVel : bestVel;
     ID3D12Resource* nd = (g_pinDepth && curD >= 0 && curD * 3 >= bd * 2) ? g_pinDepth : bestDep;
-    if (nv != g_pinVel || nd != g_pinDepth) { if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (frame generation is reset)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd); g_forceReset = true; }
+    static int s_velSince = -1; static bool s_velCensus = false;
+    // v19: a velocity buffer that cannot be paired with the depth buffer (size) counts as 'not found'
+    if (nv && nd) { D3D12_RESOURCE_DESC a0 = ResDesc(nv), b0 = ResDesc(nd);
+      if (a0.Width != b0.Width || a0.Height != b0.Height) { bool pair = false; std::shared_lock<std::shared_mutex> lk(g_resMx);
+        for (auto& kv : g_res) { auto& m = kv.second; if (m.cand && IsVelFmt(m.fmt) && m.w == (UINT)b0.Width && m.h == b0.Height) { pair = true; break; } }
+        if (!pair) nv = nullptr; } }
+    if (!nv && nd) {
+        if (s_velSince < 0) s_velSince = fr;
+        if (g_cfg.velFallback && g_cfg.stage >= 2 && fr - s_velSince >= g_cfg.velWait) {
+            if (!s_velCensus) { s_velCensus = true; Log("NO velocity buffer found %d frames after the depth buffer (vel format accepted: R16G16_UNORM/TYPELESS%s) -> camera-only fallback", fr - s_velSince, g_cfg.velFmt ? " + velfmt" : ""); CensusLog("no velocity"); }
+            D3D12_RESOURCE_DESC dd0 = ResDesc(nd); ID3D12Resource* dm = EnsureDummyVel((UINT)dd0.Width, dd0.Height); if (dm) nv = dm;
+        }
+    } else if (nv) { if (s_velSince >= 0 && g_pinVel == g_dummyVel && g_dummyVel && nv != g_dummyVel) Log("real velocity buffer %p found -> dummy velocity dropped", (void*)nv); s_velSince = -1; }
+    // v18: the MV pass needs velocity and depth of the SAME size (otherwise frame generation silently never starts): if they differ, take the busiest velocity buffer that matches the depth buffer
+    if (nv && nd) { D3D12_RESOURCE_DESC a = ResDesc(nv), b = ResDesc(nd);
+      if (a.Width != b.Width || a.Height != b.Height) {
+        ID3D12Resource* alt = nullptr; int as = -1; std::shared_lock<std::shared_mutex> lk(g_resMx);
+        for (auto& kv : g_res) { auto& m = kv.second; if (!m.cand || !IsVelFmt(m.fmt) || m.w != (UINT)b.Width || m.h != b.Height) continue; if (m.score > as) { as = m.score; alt = m.res; } }
+        static int s_mm = 0; if (s_mm++ < 10) Log("pins: velocity %llux%u differs from depth %llux%u -> %s", (unsigned long long)a.Width, a.Height, (unsigned long long)b.Width, b.Height, alt ? "using a velocity buffer of the depth size" : "no velocity buffer of that size (yet)");
+        if (alt) nv = alt; } }
+    if (nv != g_pinVel || nd != g_pinDepth) { static int s_pl = 0; if (s_pl++ < 60) { D3D12_RESOURCE_DESC vv = nv ? ResDesc(nv) : D3D12_RESOURCE_DESC{}, dd2 = nd ? ResDesc(nd) : D3D12_RESOURCE_DESC{};
+        Log("pins (frame %d): velocity %p %llux%u fmt=%d | depth %p %llux%u fmt=%d", fr, (void*)nv, (unsigned long long)vv.Width, vv.Height, (int)vv.Format, (void*)nd, (unsigned long long)dd2.Width, dd2.Height, (int)dd2.Format); }
+      if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (frame generation is reset)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd); g_forceReset = true; }
     g_pinVel = nv; g_pinDepth = nd;
     if (nd) { D3D12_RESOURCE_DESC dd = ResDesc(nd); if ((int)dd.Width != g_effW.load() || (int)dd.Height != g_effH.load()) { g_effW = (int)dd.Width; g_effH = (int)dd.Height; Log("render size from pinned depth buffer: %dx%d", g_effW.load(), g_effH.load()); } }
 }
@@ -935,7 +1137,7 @@ static bool Inv4(const float* m, float* out) {
 }
 static void ToSl(const float* m, sl::float4x4& o) { for (int r = 0; r < 4; r++) o.row[r] = sl::float4(m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]); }
 static bool BuildConstants(sl::Constants& c, bool reset) {
-    float vtc[16], c2p[16], j[2]; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(vtc, g_vtcNoAA, sizeof vtc); memcpy(c2p, g_c2p, sizeof c2p); j[0] = g_jitPX; j[1] = g_jitPY; }
+    float vtc[16], c2p[16], j[2]; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(vtc, g_vtcNoAA, sizeof vtc); memcpy(c2p, g_c2p, sizeof c2p); j[0] = g_jitNX * (float)EffW(); j[1] = g_jitNY * (float)EffH(); }
     float inv1[16], inv2[16];
     if (!Inv4(vtc, inv1) || !Inv4(c2p, inv2)) return false;
     ToSl(vtc, c.cameraViewToClip); ToSl(inv1, c.clipToCameraView); ToSl(c2p, c.clipToPrevClip); ToSl(inv2, c.prevClipToClip);
@@ -1051,9 +1253,12 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
       if (dtMs > 0.0 && dtMs < 1000.0) s_ema += (dtMs - s_ema) * 0.05;
       if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
     FlushDeferredRes();
+    UpdateViewRect(fr);   // v20
     if ((fr % 120) == 0) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(); } g_tPrune = NowMs() - tp0; }
+    if (g_cfg.renderW <= 0 && (fr % 60) == 0) { DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d)) && d.BufferDesc.Width && (d.BufferDesc.Width != g_autoW.load() || d.BufferDesc.Height != g_autoH.load())) { g_autoW = d.BufferDesc.Width; g_autoH = d.BufferDesc.Height; Log("auto render size: swap chain is now %ux%u", g_autoW.load(), g_autoH.load()); } }   // v18: follow resolution changes (renderw=0)
+    if (fr == 600 || fr == 3000) CensusLog("periodic");
     if (fr == 1 || (fr % 600) == 0) {
-        DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; }
+        DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; if (g_dispW) { g_autoW = g_dispW; g_autoH = g_dispH; } }
         size_t nb_; { std::shared_lock<std::shared_mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
         Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_camFrame.load(), bbd);
         static long s_pn = 0, s_pns = 0; long pn = g_probeN.load(), pns = g_probeNs.load();
@@ -1099,11 +1304,13 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
     static int s_camStreak = 0; if (camOk) s_camStreak++; else s_camStreak = 0;
     bool delayOk = g_wasOn || s_camStreak >= g_cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
+    bool cutNow = false; { int hh = g_cutHold.load(); if (hh > 0) { g_cutHold = hh - 1; cutNow = true; } }   // v22: camera cut -> this frame goes out without frame generation
     bool inputs = false; sl::Constants consts{};
-    if (wantOn && camOk && delayOk && g_pinVel && g_pinDepth && g_queue && !g_mvPreIniting.load()) {
+    if (wantOn && camOk && delayOk && !cutNow && g_pinVel && g_pinDepth && g_queue && !g_mvPreIniting.load()) {
         D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth);
         if (vd.Width == dd.Width && vd.Height == dd.Height) {
-            double tm0 = NowMs(); bool mvok = RunMvPass((UINT)vd.Width, vd.Height, g_pinVel, g_pinDepth); g_tMv = NowMs() - tm0;
+            double tm0 = NowMs(); UINT bw = (UINT)vd.Width, bh = vd.Height, vw = bw, vh = bh; { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (UINT)gw <= bw && (UINT)gh <= bh) { vw = (UINT)gw; vh = (UINT)gh; } }
+            bool mvok = RunMvPass(bw, bh, vw, vh, g_pinVel, g_pinDepth); g_tMv = NowMs() - tm0;
             if (mvok) {
                 bool reset = g_forceReset.exchange(false) || !g_wasOn || (fr - g_lastOnFrame) > 1;
                 if (BuildConstants(consts, reset)) inputs = true;
@@ -1119,6 +1326,8 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     if (inputs) {
         sl::Extent ext{ 0, 0, (uint32_t)g_cfg.renderW, (uint32_t)g_cfg.renderH };
         D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel); ext.width = (uint32_t)vd.Width; ext.height = vd.Height;
+        const uint32_t bufW = ext.width, bufH = ext.height;   // v20: tagged extent = real view rect (top-left of the buffer); the buffer size itself stays the allocation size
+        { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (uint32_t)gw <= bufW && (uint32_t)gh <= bufH) { ext.width = (uint32_t)gw; ext.height = (uint32_t)gh; } }
         sl::Resource rDepth(sl::ResourceType::eTex2d, g_depthOut, (uint32_t)kOutState);
         sl::Resource rMv(sl::ResourceType::eTex2d, g_mvOut, (uint32_t)kOutState);
         sl::Resource rHud(sl::ResourceType::eTex2d, g_hudless, (uint32_t)D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1133,7 +1342,7 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
         opt.mode = sl::DLSSGMode::eOn; opt.numFramesToGenerate = (uint32_t)(g_cfg.mult - 1);
         opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         { DXGI_SWAP_CHAIN_DESC sd = {}; if (SUCCEEDED(sc->GetDesc(&sd))) { opt.numBackBuffers = sd.BufferCount; opt.colorWidth = sd.BufferDesc.Width; opt.colorHeight = sd.BufferDesc.Height; opt.colorBufferFormat = (uint32_t)sd.BufferDesc.Format; } }
-        opt.mvecDepthWidth = ext.width; opt.mvecDepthHeight = ext.height; opt.mvecBufferFormat = (uint32_t)DXGI_FORMAT_R16G16_FLOAT; opt.depthBufferFormat = (uint32_t)DXGI_FORMAT_R32_FLOAT;
+        opt.mvecDepthWidth = bufW; opt.mvecDepthHeight = bufH; opt.mvecBufferFormat = (uint32_t)DXGI_FORMAT_R16G16_FLOAT; opt.depthBufferFormat = (uint32_t)DXGI_FORMAT_R32_FLOAT;
         g_wasOn = true; g_lastOnFrame = fr;
     } else { opt.mode = sl::DLSSGMode::eOff; opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff; g_wasOn = false; }
     // clamp the multiplier to what the GPU supports
@@ -1224,7 +1433,7 @@ static void OnSwapChainCreated(IUnknown* queueUnk, IDXGISwapChain* sc) {
     ID3D12CommandQueue* nq = NativeQueueOf(queueUnk);
     if (nq) { D3D12_COMMAND_QUEUE_DESC qd = QDesc(nq); Log("swap chain created: queue proxy/native=%p native=%p type=%d", (void*)queueUnk, (void*)nq, (int)qd.Type); if (qd.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) g_queue = nq; }
     else Log("swap chain created with a non-D3D12 queue (D3D11?) - frame generation will not work");
-    DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; Log("swap chain %ux%u fmt=%d buffers=%u effect=%d", g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (int)d.SwapEffect); }
+    DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_autoW = g_dispW; g_autoH = g_dispH; Log("swap chain %ux%u fmt=%d buffers=%u effect=%d", g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (int)d.SwapEffect); }
     void** vt = *(void***)sc; bool a = HookVt(g_hPresent, vt, 8, (void*)hkPresent);
     IDXGISwapChain1* s1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&s1)) && s1) { HookVt(g_hPresent1, *(void***)s1, 22, (void*)hkPresent1); s1->Release(); }
@@ -1343,6 +1552,7 @@ static void InstallNativeHooks(ID3D12Device* nat) {
     oCopyTex = (PFN_CopyTex)Patch(vtCL, 16, (void*)hkCopyTex);
     oResBarrier = (PFN_ResBarrier)Patch(vtCL, 26, (void*)hkResBarrier);
     oOMSetRT = (PFN_OMSetRT)Patch(vtCL, 46, (void*)hkOMSetRT);
+    if (g_cfg.viewRect) { oRSSetVP = (PFN_RSSetVP)Patch(vtCL, 21, (void*)hkRSSetVP); oCLReset = (PFN_CLReset)Patch(vtCL, 10, (void*)hkCLReset); }   // v20
     oClearDSV = (PFN_ClearDSV)Patch(vtCL, 47, (void*)hkClearDSV);
     oClearRTV = (PFN_ClearRTV)Patch(vtCL, 48, (void*)hkClearRTV);
     oSetCCbv = (PFN_SetRootCbv)Patch(vtCL, 37, (void*)hkSetCCbv);
