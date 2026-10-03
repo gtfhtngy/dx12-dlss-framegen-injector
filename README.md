@@ -11,7 +11,7 @@ A DLL-based injector that enables **NVIDIA DLSS Frame Generation** (via Streamli
 - No major ghosting observed during normal gameplay in the tested scenarios
 - Full source code available
 
-**Important:** Compatibility with other games is currently a **hypothesis** and has not been confirmed beyond the two tested titles.
+**Important:** Compatibility with other games is currently a **hypothesis** and has not been confirmed beyond the three tested titles.
 
 ## How it works (high level)
 
