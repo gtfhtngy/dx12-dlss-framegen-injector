@@ -109,6 +109,20 @@ struct Cfg {
     int ngxLog = 0;
     int shaderCache = 1;     // 1 = build shaders before the game starts and keep them in SN_DLSSG_shaders.snsc (no run-time compile hitch)
     int splash = 1;          // 1 = show the progress window while the cache is being built (only when something has to be built)
+    // ---- v25: in-game overlay / menu, compatibility diagnostics
+    int overlay = 1;         // 1 = overlay + menu available (hotkey), 0 = never draw anything, never hook the keyboard
+    int overlayKey = 0x2D;   // virtual-key code that opens/closes the menu (cfg: overlaykey=INSERT / F10 / HOME / 0x2D ...)
+    int showFps = 0;         // HUD line: real (base) FPS = how fast the GAME renders
+    int showFgFps = 0;       // HUD line: DLSS-FG output FPS (base FPS x generated frames)
+    int showFrameTime = 0;   // HUD lines: frame time + 1% low
+    int overlayPos = 0;      // 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right
+    int overlayScale = 100;  // percent
+    int overlayOpacity = 80; // percent (background)
+    int overlayBlock = 1;    // 1 = while the menu is open, swallow the menu keys so the game does not see them
+    int overlayHook = 1;     // 1 = low-level keyboard hook (never misses a key press, can swallow keys); 0 = polling inside Present only
+    int autoSave = 1;        // 1 = every change made in the menu is written back to SN_DLSSG_cfg.txt
+    int autoReport = 1;      // 1 = write SN_DLSSG_DEBUG_REPORT.txt + show a notice when frame generation cannot work in this game
+    int msgBox = 1;          // 1 = if the overlay cannot be drawn (DX11 game, ...) show a one-time message box for a fatal incompatibility
     std::wstring slDir;      // folder with sl.interposer.dll etc. (default: next to the game exe)
 } g_cfg;
 
@@ -117,16 +131,50 @@ static FILE* g_log = nullptr;
 static std::mutex g_logMx;
 static size_t g_logBytes = 0; static DWORD g_lastFlush = 0;
 static void LogFlush() { if (!g_log) return; std::lock_guard<std::mutex> lk(g_logMx); fflush(g_log); }
+// v25: the last log lines are ALSO kept in memory (even with log=0) so the debug report can contain them
+static std::mutex g_ringMx; static std::vector<std::string> g_logRing; static size_t g_logRingPos = 0; static const size_t kLogRingMax = 400;
 static void Log(const char* fmt, ...) {
+    char buf[1536];
+    va_list ap; va_start(ap, fmt); int n = vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    if (n < 0) return; if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    { std::lock_guard<std::mutex> rk(g_ringMx);
+      if (g_logRing.size() < kLogRingMax) g_logRing.emplace_back(buf, (size_t)n); else { g_logRing[g_logRingPos] = std::string(buf, (size_t)n); g_logRingPos = (g_logRingPos + 1) % kLogRingMax; } }
     if (!g_log) return;
     std::lock_guard<std::mutex> lk(g_logMx);
     if (g_logBytes > (24u << 20)) return;                 // never let the log grow without bound in long sessions
-    va_list ap; va_start(ap, fmt); int n = vfprintf(g_log, fmt, ap); va_end(ap); fputc('\n', g_log);
-    if (n > 0) g_logBytes += (size_t)n + 1;
+    fwrite(buf, 1, (size_t)n, g_log); fputc('\n', g_log);
+    g_logBytes += (size_t)n + 1;
     DWORD now = GetTickCount(); if (now - g_lastFlush > 1000) { fflush(g_log); g_lastFlush = now; }   // flushing every line stalls the render thread
+}
+static std::vector<std::string> LogRingSnapshot() {
+    std::lock_guard<std::mutex> rk(g_ringMx); std::vector<std::string> out; out.reserve(g_logRing.size());
+    if (g_logRing.size() < kLogRingMax) out = g_logRing; else for (size_t i = 0; i < kLogRingMax; i++) out.push_back(g_logRing[(g_logRingPos + i) % kLogRingMax]);
+    return out;
 }
 static void LogW(const wchar_t* w) {
     if (!g_log) return; char b[1024]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, nullptr, nullptr); Log("%s", b);
+}
+// "INSERT", "F10", "HOME", "A", "0x2D", "45" ... -> virtual-key code (0 = none)
+static int ParseKeyName(const char* in) {
+    char t[48]; size_t n = 0; while (*in == ' ' || *in == '\t') in++;
+    for (; *in && *in != ' ' && *in != '\t' && *in != '\r' && *in != '\n' && n + 1 < sizeof t; in++) t[n++] = (char)toupper((unsigned char)*in);
+    t[n] = 0; if (!n) return 0;
+    struct { const char* n; int vk; } tbl[] = { {"NONE",0},{"INSERT",0x2D},{"INS",0x2D},{"DELETE",0x2E},{"DEL",0x2E},{"HOME",0x24},{"END",0x23},{"PAGEUP",0x21},{"PGUP",0x21},{"PAGEDOWN",0x22},{"PGDN",0x22},
+        {"PAUSE",0x13},{"SCROLL",0x91},{"SCROLLLOCK",0x91},{"TAB",0x09},{"BACKSPACE",0x08},{"CAPSLOCK",0x14},{"NUMLOCK",0x90},{"PRINTSCREEN",0x2C},
+        {"NUMPAD0",0x60},{"NUMPAD1",0x61},{"NUMPAD2",0x62},{"NUMPAD3",0x63},{"NUMPAD4",0x64},{"NUMPAD5",0x65},{"NUMPAD6",0x66},{"NUMPAD7",0x67},{"NUMPAD8",0x68},{"NUMPAD9",0x69},
+        {"MULTIPLY",0x6A},{"ADD",0x6B},{"SUBTRACT",0x6D},{"DIVIDE",0x6F},{"GRAVE",0xC0},{"TILDE",0xC0} };
+    for (auto& e : tbl) if (!strcmp(t, e.n)) return e.vk;
+    if (t[0] == 'F' && t[1] >= '0' && t[1] <= '9') { int f = atoi(t + 1); if (f >= 1 && f <= 24) return 0x6F + f; }
+    if (n == 1 && ((t[0] >= 'A' && t[0] <= 'Z') || (t[0] >= '0' && t[0] <= '9'))) return t[0];
+    char* e = nullptr; long v = strtol(t, &e, 0); if (e && !*e && v > 0 && v < 256) return (int)v;
+    return 0x2D;   // unknown name -> default
+}
+static const char* KeyNameOf(int vk) {
+    static char b[16];
+    switch (vk) { case 0: return "NONE"; case 0x2D: return "INSERT"; case 0x2E: return "DELETE"; case 0x24: return "HOME"; case 0x23: return "END"; case 0x21: return "PAGEUP"; case 0x22: return "PAGEDOWN"; case 0x13: return "PAUSE"; case 0x91: return "SCROLL"; case 0xC0: return "GRAVE"; default: break; }
+    if (vk >= 0x70 && vk <= 0x87) { snprintf(b, sizeof b, "F%d", vk - 0x6F); return b; }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) { snprintf(b, sizeof b, "%c", vk); return b; }
+    snprintf(b, sizeof b, "0x%02X", vk); return b;
 }
 static void LoadCfg() {
     std::wstring p = g_dir + L"\\SN_DLSSG_cfg.txt";
@@ -149,7 +197,14 @@ static void LoadCfg() {
                 "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
                 "# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)\n"
                 "# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)\n"
-                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n");
+                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n"
+                "# ---- v25 overlay / menu (press the overlay key in game; arrows + Enter, changes are saved here automatically)\n"
+                "# overlay      : 1 = overlay + menu available, 0 = completely off\n# overlaykey   : key that opens/closes the menu: INSERT (default), F1..F12, HOME, END, PAGEUP, ... or a virtual-key number like 0x2D\n"
+                "# showfps      : 1 = show the REAL fps (how fast the game itself renders)\n# showfgfps    : 1 = show the DLSS Frame Generation output fps\n# showframetime: 1 = show frame time + 1%% low\n"
+                "# overlaypos   : 0 = top-left 1 = top-right 2 = bottom-left 3 = bottom-right ; overlayscale / overlayopacity in percent\n"
+                "# overlayblock : 1 = while the menu is open the menu keys are NOT sent to the game ; overlayhook=0 = no keyboard hook (polling only)\n"
+                "# autosave     : 1 = changes made in the menu are written back to this file ; autoreport=1 = write SN_DLSSG_DEBUG_REPORT.txt when FG cannot work\n"
+                "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n");
             fclose(f);
         }
     } else {
@@ -172,6 +227,11 @@ static void LoadCfg() {
             else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
             else if (!strcmp(k, "cutdetect")) g_cfg.cutDetect = iv ? 1 : 0; else if (!strcmp(k, "cutthresh")) g_cfg.cutThresh100 = iv; else if (!strcmp(k, "cutfov")) g_cfg.cutFov = iv; else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
+            else if (!strcmp(k, "overlay")) g_cfg.overlay = iv ? 1 : 0; else if (!strcmp(k, "overlaykey")) g_cfg.overlayKey = ParseKeyName(v);
+            else if (!strcmp(k, "showfps")) g_cfg.showFps = iv ? 1 : 0; else if (!strcmp(k, "showfgfps")) g_cfg.showFgFps = iv ? 1 : 0; else if (!strcmp(k, "showframetime")) g_cfg.showFrameTime = iv ? 1 : 0;
+            else if (!strcmp(k, "overlaypos")) g_cfg.overlayPos = iv; else if (!strcmp(k, "overlayscale")) g_cfg.overlayScale = iv; else if (!strcmp(k, "overlayopacity")) g_cfg.overlayOpacity = iv;
+            else if (!strcmp(k, "overlayblock")) g_cfg.overlayBlock = iv ? 1 : 0; else if (!strcmp(k, "overlayhook")) g_cfg.overlayHook = iv ? 1 : 0;
+            else if (!strcmp(k, "autosave")) g_cfg.autoSave = iv ? 1 : 0; else if (!strcmp(k, "autoreport")) g_cfg.autoReport = iv ? 1 : 0; else if (!strcmp(k, "msgbox")) g_cfg.msgBox = iv ? 1 : 0;
         }
         fclose(f);
     }
@@ -180,7 +240,11 @@ static void LoadCfg() {
     if (g_cfg.velWait < 0) g_cfg.velWait = 0;
     if (g_cfg.c2pIdx < 0) g_cfg.c2pIdx = 0; if (g_cfg.c2pIdx > 3) g_cfg.c2pIdx = 3;
     if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
+    if (g_cfg.overlayPos < 0 || g_cfg.overlayPos > 3) g_cfg.overlayPos = 0;
+    g_cfg.overlayScale = std::min(250, std::max(50, g_cfg.overlayScale)); g_cfg.overlayOpacity = std::min(100, std::max(20, g_cfg.overlayOpacity));
+    if (g_cfg.fgMinFps < 0) g_cfg.fgMinFps = 0; if (g_cfg.baseFpsLimit < 0) g_cfg.baseFpsLimit = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG v25 = v24 + in-game overlay/menu (key %s), FPS / DLSS-FG FPS HUD, auto config save, compatibility check + debug report, safe start-up optimisations", KeyNameOf(g_cfg.overlayKey));
     Log("SN_DLSSG v24 (v23 + camera-registry LRU eviction (fixes FG lost after a level load), camera re-scan + hold, async buffer release, no useless Reflex sleep, FG-pause backoff) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
     Log("CFG v24 camhold=%d camholdmax=%d camrescan=%d reflexalways=%d fgminbackoff=%d fgminfps=%d bufmaxmb=%d", g_cfg.camHold, g_cfg.camHoldMax, g_cfg.camRescan, g_cfg.reflexAlways, g_cfg.fgMinBackoff, g_cfg.fgMinFps, g_cfg.bufMaxMB);
@@ -278,16 +342,24 @@ static void SlLogCb(sl::LogType t, const char* msg) { Log("[SL %d] %s", (int)t, 
 
 static bool FileExists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
+static HINSTANCE g_hSelf = nullptr;
+static std::atomic<bool> g_compatBlocked{false};   // v25: Streamline says DLSS-G is not supported on this system -> no useless per-frame work
+#include "cfgsave.inc"   // v25: write menu changes back into SN_DLSSG_cfg.txt
+#include "diag.inc"      // v25: compatibility checklist + debug report
+
 static bool InitStreamline() {
     if (g_cfg.slDir.empty()) g_cfg.slDir = g_dir;
+    // v25: cheap pre-flight (GPU vendor, files, OS, HAGS). A PC without an NVIDIA GPU can never run DLSS-G: do not even load Streamline (no risk for AMD / Intel users).
+    DiagPreflight();
+    if (!DiagHasNvidia()) { Log("no NVIDIA GPU found -> Streamline is not loaded, the game runs unmodified"); return false; }
     LogW((L"Streamline dir: " + g_cfg.slDir).c_str());
     const wchar_t* need[] = { L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss_g.dll", L"sl.reflex.dll", L"sl.pcl.dll", L"nvngx_dlssg.dll" };
     bool all = true;
     for (auto n : need) { bool ok = FileExists(g_cfg.slDir + L"\\" + n); all &= ok; LogW((std::wstring(L"  ") + n + (ok ? L": found" : L": MISSING")).c_str()); }
-    if (!FileExists(g_cfg.slDir + L"\\sl.interposer.dll")) { Log("sl.interposer.dll not found -> frame generation disabled (game runs normally)"); return false; }
+    if (!FileExists(g_cfg.slDir + L"\\sl.interposer.dll")) { Log("sl.interposer.dll not found -> frame generation disabled (game runs normally)"); DiagFatal("files", "Streamline files", "sl.interposer.dll was not found in " + Narrow(g_cfg.slDir.c_str()), "Copy the Streamline DLLs (README > Installation) next to the game exe or set sldir=."); return false; }
     if (!all) Log("WARNING: some Streamline files are missing, DLSS-G will not load");
     g_sl = LoadLibraryExW((g_cfg.slDir + L"\\sl.interposer.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!g_sl) { Log("LoadLibrary sl.interposer.dll failed err=%u", (unsigned)GetLastError()); return false; }
+    if (!g_sl) { DWORD le = GetLastError(); Log("LoadLibrary sl.interposer.dll failed err=%u", (unsigned)le); DiagFatal("sl_load", "Loading sl.interposer.dll", Fmt("LoadLibrary failed, Windows error %u", (unsigned)le), Win32Hint(le)); return false; }
     auto gp = [&](const char* n) { return (void*)GetProcAddress(g_sl, n); };
     p_slInit = (F_slInit)gp("slInit"); p_slShutdown = (F_slShutdown)gp("slShutdown"); p_slIsFeatureSupported = (F_slIsFeatureSupported)gp("slIsFeatureSupported");
     p_slGetFeatureFunction = (F_slGetFeatureFunction)gp("slGetFeatureFunction"); p_slGetNewFrameToken = (F_slGetNewFrameToken)gp("slGetNewFrameToken");
@@ -299,7 +371,9 @@ static bool InitStreamline() {
         (void*)p_slInit, (void*)p_slGetFeatureFunction, (void*)p_slGetNewFrameToken, (void*)p_slSetConstants, (void*)p_slSetTagForFrame, (void*)p_slSetTag, (void*)p_slGetNativeInterface,
         (void*)pSL_D3D12CreateDevice, (void*)pSL_CreateDXGIFactory1, (void*)pSL_CreateDXGIFactory2);
     if (!p_slInit || !p_slGetFeatureFunction || !p_slGetNewFrameToken || !p_slSetConstants || !(p_slSetTagForFrame || p_slSetTag) || !pSL_D3D12CreateDevice || !pSL_CreateDXGIFactory1) {
-        Log("interposer is missing required exports (wrong/old Streamline version?)"); return false; }
+        Log("interposer is missing required exports (wrong/old Streamline version?)");
+        DiagFatal("sl_exports", "sl.interposer.dll exports", "the interposer does not export the functions this injector needs (slInit, slGetFeatureFunction, slSetConstants, slSetTag/slSetTagForFrame, D3D12CreateDevice, CreateDXGIFactory1)", "Wrong or too old Streamline version: use the 2.x production files (tested: 2.14.1) - or this is a development/other build of the interposer.");
+        return false; }
     g_useFrameTags = (p_slSetTagForFrame != nullptr);
 
     sl::Preferences pref{};
@@ -318,6 +392,8 @@ static bool InitStreamline() {
     sl::Result r = p_slInit(pref, sl::kSDKVersion);
     Log("slInit -> %d %s (frame tags: %d)", (int)r, SlStr(r), (int)g_useFrameTags);
     g_slInitOk = (r == sl::Result::eOk);
+    if (g_slInitOk) DiagSet("sl_init", DS_OK, "Streamline initialised (slInit)", Fmt("slInit -> eOk, frame tags: %d", (int)g_useFrameTags));
+    else DiagFatal("sl_init", "Streamline initialisation (slInit)", Fmt("slInit returned %d = %s", (int)r, SlStr(r)), SlFixText(r));
     return g_slInitOk;
 }
 
@@ -1012,6 +1088,7 @@ static const int MV_SETS = 16;
 static const D3D12_RESOURCE_STATES kOutState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
 #include "shadercache.inc"   // SNSC shader cache, pre-game warm-up + progress window, EnsureMvPipeline()
+static F_CreateDXGIFactory GetOrigFactory1() { return oCreateDXGIFactory1; }   // v25: used by diag.inc
 
 static std::mutex g_mvInitMx; static std::atomic<bool> g_mvPreIniting{false};
 static bool InitMvPass(UINT W, UINT H) {
@@ -1250,6 +1327,18 @@ static std::atomic<bool> g_deviceLost{false};
 static bool g_fgSusp = false;   // v24: FG paused by fgminfps (also read by the Reflex sleep gate)
 static int g_lastOnFrame = -1; static bool g_wasOn = false; static int g_stateLog = 0; static bool g_loggedSupport = false;
 static UINT g_scW = 0, g_scH = 0;
+// ---- v25: state shared with the overlay / diagnostics (written by OnPresentBeginCore on the render thread, read for display / reports only)
+static bool g_everOn = false;                         // frame generation has been switched on at least once
+static std::atomic<double> g_fgRatio{ 1.0 };         // measured: frames presented per game frame (2.0 = 2x frame generation)
+static unsigned g_maxGen = 0;                         // numFramesToGenerateMax reported by DLSS-G (0 = not known yet)
+static unsigned g_lastStatus = 0, g_stMinWH = 0; static unsigned long long g_stVramMB = 0; static bool g_haveState = false;
+static int g_lastTagRes = -1, g_lastConstRes = -1, g_lastOptRes = -1;
+static std::atomic<int> g_busyFrames{ 0 }, g_scene3dFrames{ 0 };   // frames that rendered a lot (3D) / frames with a depth buffer pinned
+static const char* g_whyNot = "starting";            // why frame generation is not on right now (shown in the menu)
+static bool g_slDevSet = false; static int g_slDevTries = 0;
+static bool g_swapD3D12 = true; static UINT g_scBufs = 0; static int g_scFmt = 0, g_scEffect = 0;
+static void ApplyReflexOptions(const char* why);
+#include "overlay.inc"   // v25: in-game overlay + menu (keys, HUD, D3D12 text renderer), DiagRuntimeFill
 
 static void LogSupport() {
     if (g_loggedSupport || !p_slIsFeatureSupported) return; g_loggedSupport = true;
@@ -1257,20 +1346,33 @@ static void LogSupport() {
     auto pCF = (F_CreateDXGIFactory)GetProcAddress(mdx, "CreateDXGIFactory1"); if (!pCF) return;
     // note: this goes through our hook -> Streamline's proxy factory, which is fine for EnumAdapters/GetDesc
     IDXGIFactory1* f = nullptr; if (FAILED(pCF(__uuidof(IDXGIFactory1), (void**)&f)) || !f) return;
-    IDXGIAdapter* ad = nullptr;
+    IDXGIAdapter* ad = nullptr; std::string det; bool any = false, anyChecked = false; sl::Result firstBad = sl::Result::eOk;
     for (UINT i = 0; f->EnumAdapters(i, &ad) != DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC d = {}; ad->GetDesc(&d);
         sl::AdapterInfo ai{}; ai.deviceLUID = (uint8_t*)&d.AdapterLuid; ai.deviceLUIDSizeInBytes = sizeof(LUID);
         sl::Result r = p_slIsFeatureSupported(sl::kFeatureDLSS_G, ai);
         char nm[128]; WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, nm, sizeof nm, nullptr, nullptr);
         Log("DLSS-G supported on adapter %u '%s' -> %d %s", i, nm, (int)r, SlStr(r));
+        det += Fmt("  adapter %u '%s' (vendor 0x%04X): %s\n", i, nm, d.VendorId, r == sl::Result::eOk ? "SUPPORTED" : SlStr(r));
+        if (d.VendorId == 0x10DE) { anyChecked = true; if (r == sl::Result::eOk) any = true; else if (firstBad == sl::Result::eOk) firstBad = r; }   // only NVIDIA adapters count (WARP / iGPU are always 'not supported')
         ad->Release();
     }
     f->Release();
+    // Streamline's own requirement report (OS / driver versions, HAGS, V-Sync)
+    if (g_sl) { typedef sl::Result(*F_Req)(sl::Feature, sl::FeatureRequirements&); auto fr = (F_Req)GetProcAddress(g_sl, "slGetFeatureRequirements");
+        if (fr) { sl::FeatureRequirements rq{}; sl::Result rr = fr(sl::kFeatureDLSS_G, rq);
+            if (rr == sl::Result::eOk) { bool drvLow = rq.driverVersionDetected && rq.driverVersionRequired && rq.driverVersionRequired > rq.driverVersionDetected; bool osLow = rq.osVersionDetected && rq.osVersionRequired && rq.osVersionRequired > rq.osVersionDetected;
+                std::string rd = Fmt("flags=0x%X (D3D12=%d, HAGS required=%d, V-Sync must be off=%d) | OS detected %s required %s | driver detected %s required %s", (unsigned)rq.flags, ((uint32_t)rq.flags & (uint32_t)sl::FeatureRequirementFlags::eD3D12Supported) != 0, ((uint32_t)rq.flags & (uint32_t)sl::FeatureRequirementFlags::eHardwareSchedulingRequired) != 0, ((uint32_t)rq.flags & (uint32_t)sl::FeatureRequirementFlags::eVSyncOffRequired) != 0,
+                    rq.osVersionDetected.toStr().c_str(), rq.osVersionRequired.toStr().c_str(), rq.driverVersionDetected.toStr().c_str(), rq.driverVersionRequired.toStr().c_str());
+                Log("DLSS-G requirements: %s", rd.c_str());
+                DiagSet("sl_req", (drvLow || osLow) ? DS_FAIL : DS_OK, "Streamline DLSS-G requirements", rd, drvLow ? SlFixText(sl::Result::eErrorDriverOutOfDate) : osLow ? SlFixText(sl::Result::eErrorOSOutOfDate) : "", false); }
+            else DiagSet("sl_req", DS_INFO, "Streamline DLSS-G requirements", Fmt("slGetFeatureRequirements -> %d %s", (int)rr, SlStr(rr))); } }
+    if (anyChecked && !any) { g_compatBlocked = true; DiagFatal("support", "DLSS Frame Generation supported by Streamline", det, SlFixText(firstBad)); }
+    else if (any) DiagSet("support", DS_OK, "DLSS Frame Generation supported by Streamline", det);
+    else DiagSet("support", DS_WARN, "DLSS Frame Generation supported by Streamline", det + "  (no NVIDIA adapter was checked)");
 }
 // Streamline docs: slGetFeatureFunction needs the device to be set first. In the log the interposer never got it
 // (UE4 creates + destroys probe devices), so we hand it the live (proxy) device from the swap chain explicitly, once.
-static bool g_slDevSet = false; static int g_slDevTries = 0;
 static void EnsureSlDevice(IDXGISwapChain* sc) {
     if (g_slDevSet || g_slDevTries >= 5 || !g_sl || !sc) return; g_slDevTries++;
     typedef sl::Result(*F_slSetD3DDevice)(void*);
@@ -1303,6 +1405,13 @@ static void EnsureSlDeviceFromQueue(IUnknown* queueUnk) {
     }
     cq->Release();
 }
+// v25: also called from the overlay when the base-fps cap is changed in the menu
+static void ApplyReflexOptions(const char* why) {
+    if (!p_ReflexSetOptions) return;
+    sl::ReflexOptions ro{}; ro.mode = sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
+    if (g_cfg.baseFpsLimit > 0) ro.frameLimitUs = (uint32_t)(1000000 / g_cfg.baseFpsLimit);
+    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(LowLatency, cap=%d fps) [%s] -> %d %s", g_cfg.baseFpsLimit, why, (int)r, SlStr(r));
+}
 static bool InitSlRuntime() {
     if (g_slRuntimeOk) return true;
     static int tries = 0; if (tries++ > 5) return false;
@@ -1314,10 +1423,9 @@ static bool InitSlRuntime() {
     ok &= get(sl::kFeatureReflex, "slReflexSetOptions", (void*&)p_ReflexSetOptions);
     get(sl::kFeatureReflex, "slReflexSleep", (void*&)p_ReflexSleep);
     LogSupport();
-    if (!ok) { Log("Streamline runtime init incomplete (try %d)", tries); return false; }
-    sl::ReflexOptions ro{}; ro.mode = sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
-    if (g_cfg.baseFpsLimit > 0) ro.frameLimitUs = (uint32_t)(1000000 / g_cfg.baseFpsLimit);
-    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(LowLatency) -> %d %s", (int)r, SlStr(r));
+    if (!ok) { Log("Streamline runtime init incomplete (try %d)", tries); DiagSet("sl_runtime", tries >= 5 ? DS_FAIL : DS_WARN, "Streamline plugins (DLSS-G / Reflex / PCL)", Fmt("slGetFeatureFunction failed (try %d of 6): DLSS-G options=%p state=%p PCL marker=%p Reflex options=%p", tries, (void*)p_DLSSGSetOptions, (void*)p_DLSSGGetState, (void*)p_PCLSetMarker, (void*)p_ReflexSetOptions), SlFixText(sl::Result::eErrorFeatureFailedToLoad)); return false; }
+    ApplyReflexOptions("start-up");
+    DiagSet("sl_runtime", DS_OK, "Streamline plugins (DLSS-G / Reflex / PCL)", "all plugin functions resolved");
     g_slRuntimeOk = true; return true;
 }
 static void Marker(sl::PCLMarker m, const FrameCtx& c) {
@@ -1331,12 +1439,13 @@ static inline double NowMs() { if (!g_qf.QuadPart) QueryPerformanceFrequency(&g_
 struct PreInitArg { UINT w, h; };
 static DWORD WINAPI MvPreInitThread(LPVOID p) { PreInitArg a = *(PreInitArg*)p; delete (PreInitArg*)p; t_prewarm = true; try { InitMvPass(a.w, a.h); } catch (...) {} t_prewarm = false; g_mvPreIniting = false; return 0; }
 static double g_obStart = 0, g_obMs = 0, g_tSleep = 0, g_tPins = 0, g_tMv = 0, g_tPrune = 0;   // time spent in OnPresentBegin (= our own per-frame overhead) of the last frame
-static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
+static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     g_obStart = NowMs(); g_obMs = 0; g_tSleep = g_tPins = g_tMv = g_tPrune = 0;
     { static long s_lastCbv = 0; long c = g_cbvCalls.load(); g_cbvPerFrame = c - s_lastCbv; s_lastCbv = c; }
     FrameCtx ctx;
     int cur = g_frame.load(); bool hudOk = g_hudStamp.load() == cur && cur > 0;
     int fr = ++g_frame; int bbd = g_bbDraws.exchange(0);
+    if (g_cbvPerFrame.load() > 500) g_busyFrames++; if (g_pinDepth) g_scene3dFrames++;   // v25: diagnostics (is a 3D scene rendering?)
     // frame time (base fps) + maintenance
     static LARGE_INTEGER s_qf = {}, s_last = {}; static double s_ema = 16.7;
     if (!s_qf.QuadPart) QueryPerformanceFrequency(&s_qf);
@@ -1367,7 +1476,8 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
             HANDLE th = CreateThread(nullptr, 0, MvPreInitThread, a, 0, nullptr); if (th) CloseHandle(th); else { delete a; g_mvPreIniting = false; }
         }
     }
-    if (!g_slInitOk || g_cfg.stage < 1) return ctx;
+    if (!g_slInitOk || g_cfg.stage < 1) { g_whyNot = !g_slInitOk ? "Streamline not loaded" : "stage<1"; return ctx; }
+    if (g_compatBlocked.load()) { g_whyNot = "not supported on this system"; return ctx; }   // v25: Streamline said DLSS-G cannot run here -> skip tokens / Reflex / MV work
     if (!g_slRuntimeOk) { EnsureSlDevice(sc); if (!(g_device && g_slDevSet && InitSlRuntime())) return ctx; }
     if (g_cfg.reflexPlace && g_nextTok) {
         ctx.tok = g_nextTok; g_nextTok = nullptr;   // sleep + SimulationStart were issued at the end of the previous Present = the real start of this game frame
@@ -1400,7 +1510,7 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
             if (fps >= (double)(g_cfg.fgMinFps + 8)) { if (++s_highN >= need) { s_susp = false; s_lowN = 0; g_forceReset = true; Log("FG resumed: base fps %.1f (frame %d, waited %d good frames)", fps, fr, need); } } else s_highN = 0;
         }
     }
-    bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp;
+    bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp && !g_compatBlocked.load();
     int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
     // v24: camera tracker lost the view buffer (loading screen, level streaming, tracker blind spot): re-scan with relaxed checks, and - if FG was running - keep it running.
     static bool s_held = false; static int s_rescanStart = -1, s_rescanCool = 0;
@@ -1417,9 +1527,9 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     static int s_camStreak = 0; if (camOk) s_camStreak++; else s_camStreak = 0;
     bool delayOk = g_wasOn || s_camStreak >= g_cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
     bool cutNow = false; { int hh = g_cutHold.load(); if (hh > 0) { g_cutHold = hh - 1; cutNow = true; } }   // v22: camera cut -> this frame goes out without frame generation
-    bool inputs = false; sl::Constants consts{};
+    bool inputs = false; sl::Constants consts{}; D3D12_RESOURCE_DESC cachedVd = {};
     if (wantOn && camOk && delayOk && g_pinVel && g_pinDepth && g_queue && !g_mvPreIniting.load()) {
-        D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth);
+        D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth); cachedVd = vd;   // v25: reused below (was queried again)
         if (vd.Width == dd.Width && vd.Height == dd.Height) {
             double tm0 = NowMs(); UINT bw = (UINT)vd.Width, bh = vd.Height, vw = bw, vh = bh; { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (UINT)gw <= bw && (UINT)gh <= bh) { vw = (UINT)gw; vh = (UINT)gh; } }
             bool mvok = RunMvPass(bw, bh, vw, vh, g_pinVel, g_pinDepth); g_tMv = NowMs() - tm0;
@@ -1437,7 +1547,7 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     sl::DLSSGOptions opt{};
     if (inputs) {
         sl::Extent ext{ 0, 0, (uint32_t)g_cfg.renderW, (uint32_t)g_cfg.renderH };
-        D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel); ext.width = (uint32_t)vd.Width; ext.height = vd.Height;
+        const D3D12_RESOURCE_DESC& vd = cachedVd; ext.width = (uint32_t)vd.Width; ext.height = vd.Height;
         const uint32_t bufW = ext.width, bufH = ext.height;   // v20: tagged extent = real view rect (top-left of the buffer); the buffer size itself stays the allocation size
         { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (uint32_t)gw <= bufW && (uint32_t)gh <= bufH) { ext.width = (uint32_t)gw; ext.height = (uint32_t)gh; } }
         sl::Resource rDepth(sl::ResourceType::eTex2d, g_depthOut, (uint32_t)kOutState);
@@ -1450,27 +1560,38 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
         uint32_t nt = 2; if (g_cfg.hudless && hudOk && g_hudless) nt = 3;
         sl::Result r1 = g_useFrameTags ? p_slSetTagForFrame(*ctx.tok, vp, tags, nt, nullptr) : p_slSetTag(vp, tags, nt, nullptr);
         sl::Result r2 = p_slSetConstants(consts, *ctx.tok, vp);
+        g_lastTagRes = (r1 == sl::Result::eOk) ? 0 : (int)r1; g_lastConstRes = (r2 == sl::Result::eOk) ? 0 : (int)r2;
         static int s_r = 0; if (s_r < 4 || r1 != sl::Result::eOk || r2 != sl::Result::eOk) { if (s_r < 40) Log("frame=%d tags(%u)=%d %s constants=%d %s hud=%d", fr, nt, (int)r1, SlStr(r1), (int)r2, SlStr(r2), (int)(nt == 3)); s_r++; }
         opt.mode = sl::DLSSGMode::eOn; opt.numFramesToGenerate = (uint32_t)(g_cfg.mult - 1);
         opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         { DXGI_SWAP_CHAIN_DESC sd = {}; if (SUCCEEDED(sc->GetDesc(&sd))) { opt.numBackBuffers = sd.BufferCount; opt.colorWidth = sd.BufferDesc.Width; opt.colorHeight = sd.BufferDesc.Height; opt.colorBufferFormat = (uint32_t)sd.BufferDesc.Format; } }
         opt.mvecDepthWidth = bufW; opt.mvecDepthHeight = bufH; opt.mvecBufferFormat = (uint32_t)DXGI_FORMAT_R16G16_FLOAT; opt.depthBufferFormat = (uint32_t)DXGI_FORMAT_R32_FLOAT;
-        g_wasOn = true; g_lastOnFrame = fr;
+        g_wasOn = true; g_everOn = true; g_lastOnFrame = fr;
     } else { opt.mode = sl::DLSSGMode::eOff; opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff; g_wasOn = false; }
     // clamp the multiplier to what the GPU supports
-    static uint32_t s_maxGen = 0;
-    if (s_maxGen && opt.numFramesToGenerate > s_maxGen) opt.numFramesToGenerate = s_maxGen;
-    sl::Result ro = p_DLSSGSetOptions(vp, opt);
+    if (g_maxGen && opt.numFramesToGenerate > g_maxGen) opt.numFramesToGenerate = g_maxGen;
+    // v25: while frame generation is off (warm-up, menus, paused, switched off) the same 'off' options do not have to be sent every single frame - once a second is plenty
+    static bool s_lastOff = false; bool skipOpt = (opt.mode == sl::DLSSGMode::eOff) && s_lastOff && (fr % 60) != 0;
+    sl::Result ro = sl::Result::eOk; if (!skipOpt) ro = p_DLSSGSetOptions(vp, opt);
+    s_lastOff = (opt.mode == sl::DLSSGMode::eOff); g_lastOptRes = (ro == sl::Result::eOk) ? 0 : (int)ro;
     static int s_o = 0; if (ro != sl::Result::eOk && s_o++ < 20) Log("slDLSSGSetOptions(mode=%d gen=%u) -> %d %s", (int)opt.mode, opt.numFramesToGenerate, (int)ro, SlStr(ro));
     if (p_DLSSGGetState && (g_stateLog < 6 || (fr % 30) == 0) && fr > g_cfg.warmup) {
         sl::DLSSGState st{}; sl::Result rs = p_DLSSGGetState(vp, st, nullptr);
         static unsigned s_lastStatus = 0xFFFFFFFFu; bool chg = rs == sl::Result::eOk && (unsigned)st.status != s_lastStatus; if (rs == sl::Result::eOk) s_lastStatus = (unsigned)st.status;
-        if (rs == sl::Result::eOk) s_maxGen = st.numFramesToGenerateMax;
+        if (rs == sl::Result::eOk) {
+            g_maxGen = st.numFramesToGenerateMax; g_haveState = true; g_lastStatus = (unsigned)st.status; g_stMinWH = st.minWidthOrHeight; g_stVramMB = st.estimatedVRAMUsageInBytes >> 20;
+            // v25: numFramesActuallyPresented = frames DLSS-G presented for the latest game frame (1 = base only, 2 = 2x ...; verified against a real log: presented=2 at 98 real fps)
+            if (opt.mode == sl::DLSSGMode::eOn && st.status == sl::DLSSGStatus::eOk && st.numFramesActuallyPresented > 0 && g_wasOn && OvForegroundIsUs()) /* unfocused window: Streamline pauses interpolation itself */ { double m = (double)st.numFramesActuallyPresented; if (m > 8.0) m = 8.0; double o = g_fgRatio.load(); g_fgRatio.store(o <= 1.01 ? m : o + (m - o) * 0.5); }
+            else if (opt.mode != sl::DLSSGMode::eOn) g_fgRatio.store(1.0);
+        }
         if (rs == sl::Result::eOk && !(g_stateLog < 6 || chg || (fr % 600) == 0)) { /* nothing new */ }
-        else if (rs == sl::Result::eOk) { s_maxGen = st.numFramesToGenerateMax; Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
+        else if (rs == sl::Result::eOk) { Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
         else Log("slDLSSGGetState -> %d %s", (int)rs, SlStr(rs));
         g_stateLog++;
     }
+    if (!g_wasOn) g_fgRatio.store(1.0);
+    // v25: why is frame generation not on right now (menu status line)
+    g_whyNot = g_wasOn ? "" : !g_cfg.fg ? "off (switched off)" : g_cfg.stage < 2 ? "stage<2" : fr < g_cfg.warmup ? "warming up" : s_susp ? "paused (base fps below the limit)" : !camOk ? "waiting for the camera (3D scene)" : !delayOk ? "camera stabilising" : !g_pinDepth ? "waiting for the depth buffer" : !g_pinVel ? "waiting for the velocity buffer" : g_mvPreIniting.load() ? "building the motion-vector pass" : g_mvFailed ? "motion-vector pass failed" : "starting";
     // Best-effort proof that frames are really being generated: compare the game's Present() rate with the swap chain's own
     // present counter (generated frames are presented by Streamline on the same swap chain). ratio ~2.0 => frame generation works.
     {
@@ -1489,6 +1610,12 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
     Marker(sl::PCLMarker::ePresentStart, ctx);
     g_obMs = NowMs() - g_obStart;
     return ctx;
+}
+// v25: the real per-frame entry = the original per-frame logic + overlay / diagnostics (each guarded: they must never be able to break the game or frame generation)
+static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
+    FrameCtx c; try { c = OnPresentBeginCore(sc); } catch (...) { static int n = 0; if (n++ < 5) Log("exception in OnPresentBegin"); }
+    try { Ov_OnPresent(sc); } catch (...) { static int n = 0; if (n++ < 5) Log("exception in the overlay (overlay disabled)"); g_ovBroken = true; }
+    return c;
 }
 static void OnPresentEnd(const FrameCtx& ctx) {
     Marker(sl::PCLMarker::ePresentEnd, ctx);
@@ -1543,9 +1670,10 @@ static ID3D12CommandQueue* NativeQueueOf(IUnknown* q) {
 static void OnSwapChainCreated(IUnknown* queueUnk, IDXGISwapChain* sc) {
     if (!sc) return;
     ID3D12CommandQueue* nq = NativeQueueOf(queueUnk);
-    if (nq) { D3D12_COMMAND_QUEUE_DESC qd = QDesc(nq); Log("swap chain created: queue proxy/native=%p native=%p type=%d", (void*)queueUnk, (void*)nq, (int)qd.Type); if (qd.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) g_queue = nq; }
-    else Log("swap chain created with a non-D3D12 queue (D3D11?) - frame generation will not work");
-    DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_autoW = g_dispW; g_autoH = g_dispH; Log("swap chain %ux%u fmt=%d buffers=%u effect=%d", g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (int)d.SwapEffect); }
+    if (nq) { D3D12_COMMAND_QUEUE_DESC qd = QDesc(nq); Log("swap chain created: queue proxy/native=%p native=%p type=%d", (void*)queueUnk, (void*)nq, (int)qd.Type); if (qd.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) g_queue = nq; g_swapD3D12 = true; }
+    else { Log("swap chain created with a non-D3D12 queue (D3D11?) - frame generation will not work"); g_swapD3D12 = false; }
+    DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_autoW = g_dispW; g_autoH = g_dispH; g_scBufs = d.BufferCount; g_scFmt = (int)d.BufferDesc.Format; g_scEffect = (int)d.SwapEffect; Log("swap chain %ux%u fmt=%d buffers=%u effect=%d", g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (int)d.SwapEffect);
+        DiagGameFacts(g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (int)d.SwapEffect, nq != nullptr); }
     void** vt = *(void***)sc; bool a = HookVt(g_hPresent, vt, 8, (void*)hkPresent);
     IDXGISwapChain1* s1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&s1)) && s1) { HookVt(g_hPresent1, *(void***)s1, 22, (void*)hkPresent1); s1->Release(); }
@@ -1710,7 +1838,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_dir = exe; g_dir = g_dir.substr(0, g_dir.find_last_of(L'\\'));
     LoadCfg();
     if (g_cfg.log) AddVectoredExceptionHandler(1, DiagVEH);
-    if (g_cfg.stage < 1 || !g_cfg.fg) { Log("stage=%d fg=%d -> pass-through, nothing hooked", g_cfg.stage, g_cfg.fg); return 0; }
+    // v25: fg=0 no longer means 'nothing hooked' - the overlay can switch frame generation on later. stage=0 is the real pass-through switch.
+    if (g_cfg.stage < 1) { Log("stage=%d -> pass-through, nothing hooked", g_cfg.stage); return 0; }
+    if (!g_cfg.fg) Log("fg=0 in the config: frame generation starts switched OFF (everything is hooked so the in-game menu can switch it on)");
     // make sure the system D3D12/DXGI are loaded before we hook their exports (the game loads the same modules later)
     HMODULE m12 = LoadLibraryW(L"d3d12.dll"), mdx = LoadLibraryW(L"dxgi.dll");
     if (!m12 || !mdx) { Log("d3d12/dxgi load failed"); return 0; }
@@ -1727,10 +1857,13 @@ static DWORD WINAPI InitThread(LPVOID) {
     MH_STATUS es = MH_EnableHook(MH_ALL_HOOKS);
     Log("MinHook: %d hooks created, enable -> %d (D3D12CreateDevice=%p CreateDXGIFactory=%p/1=%p/2=%p)", ok, (int)es, tDev, tF, tF1, tF2);
     PrewarmStart();
+    // v25: everything below runs AFTER the hooks are live (it must not delay them): static pre-flight checks + keyboard hook for the overlay
+    try { DiagPreflight(); } catch (...) {}
+    try { Ov_StartInput(); } catch (...) {}
     // if the game already created its device before we got here, we cannot recover (log it so we know)
     return 0;
 }
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); LoadRealWinmm(); CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr); }
+    if (reason == DLL_PROCESS_ATTACH) { g_hSelf = h; DisableThreadLibraryCalls(h); LoadRealWinmm(); CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr); }
     return TRUE;
 }
