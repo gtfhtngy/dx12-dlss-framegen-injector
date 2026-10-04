@@ -104,7 +104,7 @@ are fetched automatically at build time.
 Dependencies (MinHook + Streamline headers) are fetched automatically at build time.
 Known Limitations
 
-Currently only confirmed on two UE4 DX12 titles.
+Currently only confirmed on UE4 & 5 DX12 titles.
 Stuttering can appear in very dense scenes (common with frame generation).
 Broader compatibility is untested.
 Requires official NVIDIA Streamline / DLSS-G runtime files (these are not redistributed with this project).
