@@ -70,3 +70,24 @@ camholdmax=7200
 camrescan=90
 reflexalways=0
 fgminbackoff=1
+# ---- v25 overlay / menu: press the overlay key IN GAME (default INSERT). Up/Down select, Left/Right change, Enter act. Changes are saved here automatically.
+# overlay       : 1 = overlay + menu available, 0 = completely off (no keyboard hook, nothing drawn)
+# overlaykey    : INSERT (default), F1..F12, HOME, END, PAGEUP, PAGEDOWN, PAUSE ... or a virtual-key number such as 0x2D
+# showfps       : 1 = show the REAL fps (how fast the game renders)      showfgfps : 1 = show the DLSS-FG output fps      showframetime : 1 = frame time + 1% low
+# overlaypos    : 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right   overlayscale / overlayopacity : percent
+# overlayblock  : 1 = menu keys are not passed to the game while the menu is open   overlayhook : 0 = no keyboard hook (polling only)
+# autosave      : 1 = menu changes are written back to this file
+# autoreport    : 1 = if FG cannot work, write SN_DLSSG_DEBUG_REPORT.txt and tell the user to attach it to a GitHub Issue    msgbox : 1 = one-time message box when the overlay cannot show that notice
+overlay=1
+overlaykey=INSERT
+showfps=0
+showfgfps=0
+showframetime=0
+overlaypos=0
+overlayscale=100
+overlayopacity=80
+overlayblock=1
+overlayhook=1
+autosave=1
+autoreport=1
+msgbox=1
