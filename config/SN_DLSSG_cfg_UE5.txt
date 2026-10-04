@@ -1,4 +1,4 @@
-# Scarlet Nexus - DLSS Frame Generation (Streamline) config
+# UE5 template (v18) - DLSS Frame Generation (Streamline) config  [copy next to the game exe as SN_DLSSG_cfg.txt]
 # fg        : 1 = on, 0 = off
 # mult      : 2 = 2x (1 generated frame). 3/4 need an RTX 50 series card (clamped automatically)
 # stage     : 0 = pass-through, 1 = only init Streamline + log feature support, 2 = full frame generation
@@ -35,11 +35,11 @@
 fg=1
 mult=2
 stage=2
-log=1
+log=0
 hudless=0
 hudlessdraw=2
-renderw=2000
-renderh=1124
+renderw=0
+renderh=0
 tol=100
 mvoff=492
 projoff=116
