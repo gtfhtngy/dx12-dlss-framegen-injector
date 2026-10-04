@@ -28,6 +28,16 @@ It includes automatic detection of different UE4 view-buffer layouts to improve 
 | Code Vein       | UE4    | DX12  | Working    | Older UE4 view-buffer layout supported (DX12 Makes the game crashes after the end cutscene)    |
 | Captain Tsubasa: World Fighters      | UE5    | DX12  | Working (V0.3.0 and higher)    | UE5 Test (Flickering screen loading and menu) (**it only works good on TSR pls do NOT run it on any other ANTI-ALIASING**)    |
 
+## Newly Added / Experimental Games
+
+These games were tested **after** the core development phase. The code was **not** built or tuned around them:
+they run on the same generic camera/view-buffer detection used for the three main titles.
+Results may vary, so please attach `SN_DLSSG_log.txt` and `sl.log` when reporting problems.
+
+| Game | Engine | API | Config | Status | Since | Notes |
+|------|--------|-----|--------|--------|-------|-------|
+| Silent Hill Townfall | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Working | v0.4 | - |
+
 ## Installation
 
 ### 1. Files you need
