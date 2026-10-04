@@ -99,6 +99,11 @@ struct Cfg {
     int showConsole = 0;     // only works with the 'development' Streamline DLLs
     int fgMinFps = 0;        // >0: switch frame generation OFF while the BASE fps stays below this value (busy scenes), back ON when it recovers
     int fgDelay = 30;        // frames the camera must be valid IN A ROW before frame generation is (re)enabled (stops on/off flapping during loading/fades)
+    int camHold = 1;         // v24: 1 = if the camera view buffer is lost while frame generation is running, KEEP frame generation on (last projection, identity ClipToPrevClip = optical flow only) instead of switching it off for the rest of the session
+    int camHoldMax = 7200;   // v24: max frames to hold without a camera (then FG is switched off like before)
+    int camRescan = 90;      // v24: frames without camera before the tracker re-scans the view buffer with relaxed checks (0 = never)
+    int reflexAlways = 0;    // v24: 1 = call slReflexSleep even while frame generation is off/paused (v23 did, and slept ~20 ms per frame at the 9 fps start of the game for nothing)
+    int fgMinBackoff = 1;    // v24: 1 = every FG pause by fgminfps doubles the time the base fps must stay good before FG resumes (stops the on/off flapping = 100+ ms hitch per switch)
     int bufMaxMB = 192;      // upper bound for upload buffers kept alive by the camera tracker (texture-streaming staging buffers are huge during loads)
     int reflexPlace = 0;     // 1 = call slReflexSleep + SimulationStart at the START of the game frame (end of the previous Present) instead of inside Present
     int ngxLog = 0;
@@ -163,6 +168,7 @@ static void LoadCfg() {
             else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
             else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
             else if (!strcmp(k, "fgminfps")) g_cfg.fgMinFps = iv; else if (!strcmp(k, "reflexplace")) g_cfg.reflexPlace = iv;
+            else if (!strcmp(k, "camhold")) g_cfg.camHold = iv ? 1 : 0; else if (!strcmp(k, "camholdmax")) g_cfg.camHoldMax = iv; else if (!strcmp(k, "camrescan")) g_cfg.camRescan = iv; else if (!strcmp(k, "reflexalways")) g_cfg.reflexAlways = iv ? 1 : 0; else if (!strcmp(k, "fgminbackoff")) g_cfg.fgMinBackoff = iv ? 1 : 0;
             else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
             else if (!strcmp(k, "cutdetect")) g_cfg.cutDetect = iv ? 1 : 0; else if (!strcmp(k, "cutthresh")) g_cfg.cutThresh100 = iv; else if (!strcmp(k, "cutfov")) g_cfg.cutFov = iv; else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
@@ -175,8 +181,9 @@ static void LoadCfg() {
     if (g_cfg.c2pIdx < 0) g_cfg.c2pIdx = 0; if (g_cfg.c2pIdx > 3) g_cfg.c2pIdx = 3;
     if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
-    Log("SN_DLSSG v23 (UE4 + UE5, no FG on/off toggling on camera cuts, plausible-c2p guard + auto candidate switch, cheaper prune/probes) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+    Log("SN_DLSSG v24 (v23 + camera-registry LRU eviction (fixes FG lost after a level load), camera re-scan + hold, async buffer release, no useless Reflex sleep, FG-pause backoff) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
+    Log("CFG v24 camhold=%d camholdmax=%d camrescan=%d reflexalways=%d fgminbackoff=%d fgminfps=%d bufmaxmb=%d", g_cfg.camHold, g_cfg.camHoldMax, g_cfg.camRescan, g_cfg.reflexAlways, g_cfg.fgMinBackoff, g_cfg.fgMinFps, g_cfg.bufMaxMB);
     Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d%s mvoff=%d c2pidx=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.renderW <= 0 ? " (AUTO)" : "", g_cfg.mvOff, g_cfg.c2pIdx, g_cfg.warmup);
 }
 
@@ -395,16 +402,42 @@ static void STDMETHODCALLTYPE hkResBarrier(ID3D12GraphicsCommandList* cl, UINT n
 static bool GetSubState(void* r, UINT sub, UINT* st) { std::lock_guard<std::mutex> lk(g_stateMx); auto it = g_state.find(r); if (it == g_state.end() || !it->second.known[sub]) return false; *st = it->second.st[sub]; return true; }
 
 // ---- camera / jitter from the UE4 view uniform buffer (upload heap buffers are mapped once and kept)
-struct BufInfo { UINT64 size = 0; ID3D12Resource* res = nullptr; BYTE* map = nullptr; std::atomic<int> lastUse{0}; };
+struct BufInfo { UINT64 size = 0; ID3D12Resource* res = nullptr; BYTE* map = nullptr; std::atomic<int> lastUse{0}; UINT64 seq = 0; };
 static std::map<UINT64, BufInfo> g_bufs; static std::shared_mutex g_bufMx;
 static float g_vtcNoAA[16] = {}, g_c2p[16] = {}; static float g_jitPX = 0.f, g_jitPY = 0.f; static float g_jitNX = 0.f, g_jitNY = 0.f;   // v20: g_jitN* = jitter in NDC*0.5 (scaled by the CURRENT view size in BuildConstants, dynamic resolution changes it every frame)
-static std::atomic<int> g_camFrame{-1}; static std::mutex g_camMx;
+static std::atomic<int> g_camFrame{-1}; static std::mutex g_camMx; static std::atomic<int> g_camRescan{0};   // v24: 1 = camera lost for a while: relaxed checks + scanning even though the offsets were locked before
 // The registry keeps one reference to every upload buffer (>=64 KB) so the mapped pointer stays valid.
 // v13 never let go of them: after a long session the 4096-entry cap was full of buffers the game had destroyed long ago,
 // NEW constant-buffer pages were no longer registered -> the view buffer was "not found" -> frame generation flapped on/off (stutter + ghosting).
 // Now: a buffer whose only remaining reference is ours is dead for the game -> unmap + release it.   (caller holds g_bufMx exclusively)
 static UINT64 g_bufBytes = 0; static DWORD g_lastPrune = 0; static int g_regSincePrune = 0; static long g_prunedTotal = 0;
 static UINT64 g_pruneCursor = 0;
+// v24: the last Release() of a big upload buffer frees real VRAM/system memory: 6-10 ms EACH on the render thread (log: "buffer prune 69.4 / 62.8 / 51.7 ms" in the first minute of Silent Hill Townfall,
+// while the registry lock was held and every camera probe of every worker thread had to wait). Dead buffers are now handed to a low-priority worker thread (Unmap + Release there).
+static std::mutex g_deadMx; static std::vector<ID3D12Resource*> g_deadQ; static HANDLE g_deadEv = nullptr; static bool g_deadThr = false;
+static std::atomic<long> g_evicted{0}, g_regSkipped{0}; static UINT64 g_regSeq = 0;
+static DWORD WINAPI DeadBufThread(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_deadEv, INFINITE);
+        for (;;) {
+            ID3D12Resource* r = nullptr;
+            { std::lock_guard<std::mutex> lk(g_deadMx); if (g_deadQ.empty()) break; r = g_deadQ.back(); g_deadQ.pop_back(); }
+            try { r->Unmap(0, nullptr); r->Release(); } catch (...) {}
+        }
+    }
+    return 0;
+}
+static void QueueDeadBuf(ID3D12Resource* r) {   // caller holds g_bufMx; takes only g_deadMx
+    if (!r) return;
+    { std::lock_guard<std::mutex> lk(g_deadMx);
+      if (!g_deadThr) {
+          g_deadEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+          HANDLE th = g_deadEv ? CreateThread(nullptr, 0, DeadBufThread, nullptr, 0, nullptr) : nullptr;
+          if (th) { SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(th); g_deadThr = true; }
+      }
+      if (g_deadThr) { g_deadQ.push_back(r); SetEvent(g_deadEv); return; } }
+    r->Unmap(0, nullptr); r->Release();   // no worker thread available: old behaviour
+}
 // v23: releasing a dead upload buffer frees real GPU/VRAM memory (up to ~4 us .. 1 ms each). v22 released ALL dead ones in one go on the render thread ("buffer prune 8.8 ms",
 // pruned 1965-3280 buffers at once = visible hitch every ~2600 frames in the Code Vein log). Now a call releases at most maxRelease buffers and continues where it stopped.
 static void PruneBuffersLocked(int maxRelease = 0x7fffffff) {
@@ -413,26 +446,31 @@ static void PruneBuffersLocked(int maxRelease = 0x7fffffff) {
         if (it == g_bufs.end()) it = g_bufs.begin();
         if (it == g_bufs.end()) break;
         ID3D12Resource* r = it->second.res; r->AddRef(); ULONG c = r->Release();
-        if (c <= 1) { g_bufBytes -= std::min<UINT64>(g_bufBytes, it->second.size); r->Unmap(0, nullptr); r->Release(); it = g_bufs.erase(it); g_prunedTotal++; if (++rel >= maxRelease) break; } else ++it;
+        if (c <= 1) { g_bufBytes -= std::min<UINT64>(g_bufBytes, it->second.size); QueueDeadBuf(r); it = g_bufs.erase(it); g_prunedTotal++; if (++rel >= maxRelease) break; } else ++it;
     }
     g_pruneCursor = (it == g_bufs.end()) ? 0 : it->first;
     g_lastPrune = GetTickCount(); g_regSincePrune = 0;
 }
+static void EvictLruLocked(UINT64 needBytes, size_t needCount);
 static void RegisterUploadBuf(ID3D12Resource* r) {
     if (!r) return;
     D3D12_RESOURCE_DESC d = ResDesc(r); if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width < 65536) return;
-    if (d.Width > (UINT64)g_cfg.bufMaxMB * (1ull << 20) / 4) return;          // a camera/constant-buffer page is never this big; these are texture-streaming / mesh staging buffers
+    if (d.Width > std::min<UINT64>((UINT64)g_cfg.bufMaxMB * (1ull << 20) / 4, 16ull << 20)) return;   // a camera/constant-buffer page is never this big; these are texture-streaming / mesh staging buffers (v24: hard cap 16 MB, was 48 MB: three of those filled the whole registry)
     D3D12_HEAP_PROPERTIES hp; D3D12_HEAP_FLAGS hf; if (FAILED(r->GetHeapProperties(&hp, &hf)) || hp.Type != D3D12_HEAP_TYPE_UPLOAD) return;
     std::unique_lock<std::shared_mutex> lk(g_bufMx);
     // while the game streams/loads it creates and destroys lots of big upload buffers. Every one we hold keeps its memory alive -> prune by TIME and BYTES, not by frame count
     // (frames are rare during loading screens, so the v14 "every 120 frames" prune could let hundreds of MB of dead staging memory pile up)
     DWORD now = GetTickCount();
     if (g_bufBytes > (UINT64)g_cfg.bufMaxMB * (1ull << 20) || (++g_regSincePrune >= 64 && now - g_lastPrune > 250) || g_bufs.size() >= 6000) PruneBuffersLocked((g_bufBytes > (UINT64)g_cfg.bufMaxMB * (1ull << 20) || g_bufs.size() >= 6000) ? 0x7fffffff : 32);
-    if (g_bufBytes > (UINT64)g_cfg.bufMaxMB * (1ull << 20) || g_bufs.size() >= 12000) return;
+    // v24: v23 simply REFUSED new buffers while the registry was over its byte cap. A level load (2.4 s hitch at frame 5165 in the Townfall log) fills the registry with live staging buffers the game
+    // keeps, the NEW constant-buffer pages (= the view buffer) were then never registered -> "FG not ready: camOk=0 (age 2131)" for the rest of the session. Now the least recently used buffers are dropped instead.
+    { UINT64 cap = (UINT64)g_cfg.bufMaxMB * (1ull << 20);
+      if (g_bufBytes + d.Width > cap || g_bufs.size() >= 12000) EvictLruLocked((g_bufBytes + d.Width > cap ? g_bufBytes + d.Width - cap : 0) + cap / 4, g_bufs.size() >= 12000 ? 256 : 0);   // free 25% extra so the next registrations do not sort the registry again
+      if (g_bufBytes + d.Width > cap || g_bufs.size() >= 12000) { long sk = ++g_regSkipped; if (sk <= 5 || (sk % 500) == 0) Log("upload-buffer registry full (%llu MB, %zu buffers) - could not register a %llu KB buffer (skipped total %ld)", (unsigned long long)(g_bufBytes >> 20), g_bufs.size(), (unsigned long long)(d.Width >> 10), sk); return; } }
     void* ptr = nullptr; if (FAILED(r->Map(0, nullptr, &ptr)) || !ptr) return;
     r->AddRef();
     auto& e = g_bufs[r->GetGPUVirtualAddress()];
-    e.size = d.Width; e.res = r; e.map = (BYTE*)ptr; e.lastUse.store(g_frame.load()); g_bufBytes += d.Width;
+    e.size = d.Width; e.res = r; e.map = (BYTE*)ptr; e.lastUse.store(g_frame.load()); e.seq = ++g_regSeq; g_bufBytes += d.Width;
 }
 static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0}, g_projSeen{0}, g_scanRuns{0}; static std::atomic<int> g_camLocked{0};
 static std::atomic<int> g_lastJitFrame{-1000};
@@ -489,7 +527,7 @@ static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     if (k < 0) { DumpViewBuf(p, avail, off, "pair found, no ClipToPrevClip"); if (n++ < 10) Log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)off, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
     if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (n++ < 20) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
     if (hits >= 5) {
-        g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1;
+        g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1; if (g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at projoff=%d noaaoff=%d mvoff=%d", ji, nj, k);
         Log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> put these three lines in SN_DLSSG_cfg.txt to skip the scan next time", ji, nj, k);
     }
 }
@@ -561,9 +599,9 @@ static void C2pMonitor(const float* p, int availF, int fr) {
         int o = g_c2pCand[i]; if (o < 0 || o + 16 > availF) continue;
         double d = C2pDev(p + o); if (d > 1e-6) g_c2pSt[i].active++; g_c2pSt[i].sumDev += d; if (d > g_c2pSt[i].maxDev) g_c2pSt[i].maxDev = d; if (d < g_c2pSt[i].minDev) g_c2pSt[i].minDev = d; if (!C2pPlausible(p + o)) g_c2pSt[i].bad++;
     }
-    if (++g_c2pStFrames < 300) return;
+    if (++g_c2pStFrames < ((g_c2pSwitches == 0 && fr < 1500) ? 120 : 300)) return;   // v24: first verdict after 120 frames (at the 10 fps start of Townfall 300 frames = 25 s with a dead ClipToPrevClip)
     static int s_nlog = 0; int used = -1; for (int i = 0; i < g_c2pCandN && i < 4; i++) if (g_c2pCand[i] == g_cfg.mvOff) used = i;
-    if (s_nlog++ < 40) {
+    if (s_nlog++ < 60) {
         char l[600]; int ln = 0; l[0] = 0;
         for (int i = 0; i < g_c2pCandN && i < 4; i++) ln += snprintf(l + ln, sizeof l - ln, " #%d@%d active=%d/%d maxdev=%.6f avgdev=%.6f bad=%d%s |", i, g_c2pCand[i], g_c2pSt[i].active, g_c2pStFrames, g_c2pSt[i].maxDev, g_c2pSt[i].sumDev / g_c2pStFrames, g_c2pSt[i].bad, i == used ? " (USED)" : "");
         Log("c2p-monitor (frames %d..%d):%s  [a real ClipToPrevClip is exactly identity only while the camera stands still]", g_c2pWinStart, fr, l);
@@ -613,12 +651,13 @@ static void CamCutCheck(const float* b, const float* c, int fr) {   // called wi
 static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
     bool strict = availF >= std::max(g_cfg.mvOff + 16, 148) && g_cfg.projOff >= 0 && g_cfg.noAAOff >= 0 && g_cfg.mvOff >= 0;
     const float* a = nullptr; const float* b = nullptr; const float* c = nullptr;
+    const bool rescanMode = g_camRescan.load(std::memory_order_relaxed) != 0;   // v24: while the camera is lost the aspect check is relaxed (cinematic bars / a different view aspect after a level load)
     if (strict) { a = p + g_cfg.projOff; b = p + g_cfg.noAAOff; c = p + g_cfg.mvOff;
-        if (!IsProj(a, false) || !IsProj(b, false) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) strict = false; }
+        if (!IsProj(a, rescanMode) || !IsProj(b, rescanMode) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) strict = false; }
     if (strict) { for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) strict = false; }
     if (!strict) {
         if (g_cfg.camAuto && TryLegacyLayout(p, availF)) return true;
-        if (g_cfg.camAuto && !g_camLocked.load() && availF >= 64) ScanViewBuffer(p, availF, off);
+        if (g_cfg.camAuto && (!g_camLocked.load() || rescanMode) && availF >= 64) ScanViewBuffer(p, availF, off);
         return false;
     }
     int fr = g_frame.load();
@@ -635,6 +674,7 @@ static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
     }
     g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY; g_jitNX = a[8] * 0.5f * (float)g_cfg.jitSX; g_jitNY = -a[9] * 0.5f * (float)g_cfg.jitSY;
     g_camFrame = fr;
+    if (rescanMode && g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at frame %d (relaxed aspect check)", fr);
     static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f%s", fr, g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15], jittered ? "" : " (NO TAA jitter)");
     return true;
 }
@@ -654,6 +694,24 @@ static inline unsigned HashVA(UINT64 va) { return (unsigned)(((va >> 8) * 0x9E37
 static bool IsKnownVA(UINT64 va) { for (int i = 0; i < 16; i++) if (g_knownVA[i].load(std::memory_order_relaxed) == va) return true; return false; }
 static void AddKnownVA(UINT64 va) { if (!IsKnownVA(va)) g_knownVA[g_knownPos.fetch_add(1) & 15].store(va); }
 static void DropKnownVA(UINT64 va) { for (int i = 0; i < 16; i++) { UINT64 e = va; g_knownVA[i].compare_exchange_strong(e, 0); } }
+static void EvictLruLocked(UINT64 needBytes, size_t needCount) {   // caller holds g_bufMx exclusively
+    struct K { int use; UINT64 seq; UINT64 base; };
+    std::vector<K> v; v.reserve(g_bufs.size());
+    for (auto& kv : g_bufs) v.push_back(K{ kv.second.lastUse.load(std::memory_order_relaxed), kv.second.seq, kv.first });
+    std::sort(v.begin(), v.end(), [](const K& a, const K& b) { return a.use != b.use ? a.use < b.use : a.seq < b.seq; });
+    UINT64 prot[16]; int np = 0;   // never drop a buffer that holds a recognised view buffer
+    for (int i = 0; i < 16; i++) { UINT64 k = g_knownVA[i].load(std::memory_order_relaxed); if (!k) continue; auto it = g_bufs.upper_bound(k); if (it == g_bufs.begin()) continue; --it; if (k - it->first < it->second.size) prot[np++] = it->first; }
+    UINT64 freed = 0; size_t n = 0;
+    for (const K& e : v) {
+        if (freed >= needBytes && n >= needCount) break;
+        bool pr = false; for (int i = 0; i < np; i++) if (prot[i] == e.base) pr = true;
+        if (pr) continue;
+        auto it = g_bufs.find(e.base); if (it == g_bufs.end()) continue;
+        freed += it->second.size; g_bufBytes -= std::min<UINT64>(g_bufBytes, it->second.size);
+        QueueDeadBuf(it->second.res); g_bufs.erase(it); n++; g_evicted++;
+    }
+    static int nl = 0; if (n && nl++ < 12) Log("upload-buffer registry: evicted %zu least-recently-used buffers (%llu MB) to make room (now %llu MB / cap %d MB, %zu buffers)", n, (unsigned long long)(freed >> 20), (unsigned long long)(g_bufBytes >> 20), g_cfg.bufMaxMB, g_bufs.size());
+}
 static __attribute__((noinline)) void ProbeView(UINT64 va, bool known, int fr) {
     float tmp[4096]; int nf = 0; UINT64 off = 0;   // v18: 3072 -> 4096 floats (UE5 view buffers are bigger)
     {   // copy the head of the buffer once into normal memory (never parse straight from the write-combined mapping)
@@ -663,7 +721,7 @@ static __attribute__((noinline)) void ProbeView(UINT64 va, bool known, int fr) {
         int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 4096);
         // v18: a known view buffer is re-read up to the locked ClipToPrevClip (UE4: 492 -> still 640 floats; UE5: it can be far beyond float 640, v17 cut it off there -> camera lost right after the lock)
         int cap = known ? std::max(640, g_cfg.mvOff + 20) : availF;
-        if (!known && g_camLocked.load(std::memory_order_relaxed)) cap = std::max(g_cfg.mvOff + 20, 160);   // v19: offsets locked by the scan -> an unknown address only needs the head up to ClipToPrevClip (v18 copied up to 16 KB of write-combined memory per probe = ~2 ms/frame in the UE5 log)
+        if (!known && g_camLocked.load(std::memory_order_relaxed) && !g_camRescan.load(std::memory_order_relaxed)) cap = std::max(g_cfg.mvOff + 20, 160);   // v19: offsets locked by the scan -> an unknown address only needs the head up to ClipToPrevClip (v18 copied up to 16 KB of write-combined memory per probe = ~2 ms/frame in the UE5 log)
         nf = std::min(availF, cap);
         if (nf < 64) return;
         memcpy(tmp, it->second.map + off, (size_t)nf * 4);
@@ -1189,6 +1247,7 @@ static bool BuildConstants(sl::Constants& c, bool reset) {
 struct FrameCtx { sl::FrameToken* tok = nullptr; };
 static sl::FrameToken* g_nextTok = nullptr;   // reflexplace=1: token that was already used for slReflexSleep/SimulationStart at the end of the previous Present
 static std::atomic<bool> g_deviceLost{false};
+static bool g_fgSusp = false;   // v24: FG paused by fgminfps (also read by the Reflex sleep gate)
 static int g_lastOnFrame = -1; static bool g_wasOn = false; static int g_stateLog = 0; static bool g_loggedSupport = false;
 static UINT g_scW = 0, g_scH = 0;
 
@@ -1296,6 +1355,7 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
         static long s_pn = 0, s_pns = 0; long pn = g_probeN.load(), pns = g_probeNs.load();
         Log("cam-diag: probes +%ld (%.2f ms total, %.1f us each) cbv/frame=%ld", pn - s_pn, (pns - s_pns) / 1e6, pn > s_pn ? (pns - s_pns) / 1e3 / (double)(pn - s_pn) : 0.0, g_cbvPerFrame.load()); s_pn = pn; s_pns = pns;
         Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_projSeen.load(), g_scanRuns.load(), g_camLocked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
+        Log("cam-diag: registry %llu MB / cap %d MB (%zu buffers) evicted=%ld skipped=%ld rescan=%d camAge=%d", (unsigned long long)(g_bufBytes >> 20), g_cfg.bufMaxMB, nb_, g_evicted.load(), g_regSkipped.load(), g_camRescan.load(), fr - g_camFrame.load());
     }
     { double tp0 = NowMs(); UpdatePins(); g_tPins = NowMs() - tp0; }
     // Build the MV pipeline + buffers as soon as the pins are known (long before warm-up ends), on a worker thread: the first frame with frame generation
@@ -1314,7 +1374,8 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
         Marker(sl::PCLMarker::eSimulationEnd, ctx); Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
     } else {
         if (p_slGetNewFrameToken(ctx.tok, nullptr) != sl::Result::eOk || !ctx.tok) { ctx.tok = nullptr; return ctx; }
-        if (g_cfg.reflexSleep && p_ReflexSleep) { double ts0 = NowMs(); p_ReflexSleep(*ctx.tok); g_tSleep = NowMs() - ts0; }
+        // v24: only while FG runs / is about to run. v23 slept ~20 ms per frame during the 9 fps start of the game (markers are issued back-to-back inside Present, so Reflex has nothing real to optimise against)
+        if (g_cfg.reflexSleep && p_ReflexSleep && (g_cfg.reflexAlways || (fr + 15 >= g_cfg.warmup && !g_fgSusp))) { double ts0 = NowMs(); p_ReflexSleep(*ctx.tok); g_tSleep = NowMs() - ts0; }
         Marker(sl::PCLMarker::eSimulationStart, ctx); Marker(sl::PCLMarker::eSimulationEnd, ctx);
         Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
     }
@@ -1326,14 +1387,33 @@ static FrameCtx OnPresentBegin(IDXGISwapChain* sc) {
       else { static int w = 0; if (w++ < 3) Log("swap chain has no IDXGISwapChain3 - cannot call GetCurrentBackBufferIndex"); } }
 
     // busy-scene protection: frame generation on top of a very low base fps looks bad (ghosting) and costs GPU time itself -> pause it until the base fps recovers
-    static bool s_susp = false; static int s_lowN = 0, s_highN = 0;
+    bool& s_susp = g_fgSusp; static int s_lowN = 0, s_highN = 0, s_flaps = 0, s_goodRun = 0;
     if (g_cfg.fgMinFps > 0 && fr > g_cfg.warmup) {
         double fps = 1000.0 / std::max(s_ema, 1.0);
-        if (!s_susp) { if (fps < (double)g_cfg.fgMinFps) { if (++s_lowN >= 45) { s_susp = true; s_highN = 0; Log("FG paused: base fps %.1f < %d (frame %d)", fps, g_cfg.fgMinFps, fr); } } else s_lowN = 0; }
-        else { if (fps >= (double)(g_cfg.fgMinFps + 8)) { if (++s_highN >= 120) { s_susp = false; s_lowN = 0; g_forceReset = true; Log("FG resumed: base fps %.1f (frame %d)", fps, fr); } } else s_highN = 0; }
+        if (!s_susp) {
+            if (fps < (double)g_cfg.fgMinFps) { s_goodRun = 0; if (++s_lowN >= 45) { s_susp = true; s_highN = 0; s_flaps++; Log("FG paused: base fps %.1f < %d (frame %d, pause #%d)", fps, g_cfg.fgMinFps, fr, s_flaps); } }
+            else { s_lowN = 0; if (++s_goodRun >= 1800 && s_flaps) { s_flaps = 0; Log("FG pause back-off reset (base fps stable for 1800 frames)"); } }
+        } else {
+            // v24: every pause makes the next resume harder (120, 240, 480 ... 1920 good frames). Each FG off/on = SetMaximumFrameLatency 2<->1 + RSYNC flush = a 100+ ms hitch in sl.log;
+            // the v23 log shows 15 switches in the first 2400 frames (on ~70 frames, off 140..400 frames, repeat) while the game was still compiling shaders at 12..48 fps.
+            int need = g_cfg.fgMinBackoff ? (120 << std::min(std::max(s_flaps - 1, 0), 4)) : 120;
+            if (fps >= (double)(g_cfg.fgMinFps + 8)) { if (++s_highN >= need) { s_susp = false; s_lowN = 0; g_forceReset = true; Log("FG resumed: base fps %.1f (frame %d, waited %d good frames)", fps, fr, need); } } else s_highN = 0;
+        }
     }
     bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp;
     int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
+    // v24: camera tracker lost the view buffer (loading screen, level streaming, tracker blind spot): re-scan with relaxed checks, and - if FG was running - keep it running.
+    static bool s_held = false; static int s_rescanStart = -1, s_rescanCool = 0;
+    if (g_cfg.camRescan > 0 && g_camFrame.load() >= 0 && !camOk && camAge > g_cfg.camRescan && !g_camRescan.load() && fr >= s_rescanCool) {
+        g_camRescan = 1; s_rescanStart = fr; Log("camera lost for %d frames (last view buffer at frame %d) -> re-scanning with relaxed checks (registry %llu MB, evicted %ld, skipped %ld)", camAge, g_camFrame.load(), (unsigned long long)(g_bufBytes >> 20), g_evicted.load(), g_regSkipped.load());
+    }
+    if (g_camRescan.load() && fr - s_rescanStart > 1200) { g_camRescan = 0; s_rescanCool = fr + 600; Log("camera re-scan: giving up for 600 frames (no view buffer found in 1200 frames)"); }
+    if (!camOk && g_cfg.camHold && g_camFrame.load() >= 0 && camAge <= g_cfg.camHoldMax && (g_wasOn || s_held)) {
+        { std::lock_guard<std::mutex> lkh(g_camMx); for (int i = 0; i < 16; i++) g_c2p[i] = ((i % 5) == 0) ? 1.f : 0.f; g_jitPX = g_jitPY = g_jitNX = g_jitNY = 0.f; }
+        if (!s_held) { s_held = true; Log("camera lost (age %d) while FG is running -> camhold: FG stays ON with the last projection + identity ClipToPrevClip (optical flow only) until the camera is found again", camAge); }
+        camOk = true;
+    } else if (s_held && camOk) { s_held = false; g_forceReset = true; Log("camera found again (frame %d) -> camhold released, DLSS-G history reset", fr); }
+    else if (s_held && (!g_cfg.camHold || camAge > g_cfg.camHoldMax)) { s_held = false; Log("camhold ended (age %d) -> FG off until the camera is back", camAge); }
     static int s_camStreak = 0; if (camOk) s_camStreak++; else s_camStreak = 0;
     bool delayOk = g_wasOn || s_camStreak >= g_cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
     bool cutNow = false; { int hh = g_cutHold.load(); if (hh > 0) { g_cutHold = hh - 1; cutNow = true; } }   // v22: camera cut -> this frame goes out without frame generation
