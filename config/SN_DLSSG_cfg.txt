@@ -27,10 +27,15 @@
 # cutthresh : v23 ClipToPrevClip deviation x100 that counts as a cut (default 120 = 1.20; v22 used 25 and fired on every fast camera turn)
 # cutfov    : v23 projection (FOV) change in percent that counts as a cut (default 8; v22 used 2)
 # sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)
+# camhold   : v24 1 = if the camera view buffer is lost while FG is running (level load, streaming), KEEP FG on (last projection + identity ClipToPrevClip = optical flow only) instead of switching it off for the rest of the session
+# camholdmax: v24 max frames to hold without a camera before FG is switched off (default 7200)
+# camrescan : v24 frames without a camera before the tracker re-scans with relaxed checks (aspect check relaxed, scan even though offsets were locked). 0 = never
+# reflexalways: v24 1 = slReflexSleep also while FG is off/paused/warming up (v23 behaviour; cost ~20 ms per frame at the 9 fps start of the game). 0 = only when FG runs
+# fgminbackoff: v24 1 = every FG pause (fgminfps) doubles the number of good frames needed before FG resumes (stops on/off flapping, every switch = 100+ ms hitch)
 fg=1
 mult=2
 stage=2
-log=1
+log=0
 hudless=0
 hudlessdraw=2
 renderw=2000
@@ -45,7 +50,7 @@ reflexsleep=1
 baseFpsLimit=0
 showconsole=0
 sldir=
-fgminfps=35
+fgminfps=24
 reflexplace=0
 fgdelay=30
 bufmaxmb=192
@@ -60,3 +65,8 @@ c2pauto=1
 cutdetect=1
 cutthresh=120
 cutfov=8
+camhold=1
+camholdmax=7200
+camrescan=90
+reflexalways=0
+fgminbackoff=1
