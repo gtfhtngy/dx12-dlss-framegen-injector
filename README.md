@@ -123,8 +123,5 @@ Anthropic). I directed the work, tested it on real games, and verified
 the results myself. I did not write the code by hand.
 
 Disclaimer
-This project is not affiliated with, endorsed by, or connected to NVIDIA Corporation.
 
-NVIDIA, DLSS, Streamline, and RTX are trademarks of NVIDIA Corporation.
-
-Use at your own risk. Always back up your game files.
+This is an unofficial, experimental project and is not affiliated with or endorsed by NVIDIA. It does not redistribute any NVIDIA proprietary files. Users must supply official Streamline/DLSS components themselves. Intended for single-player/offline use only. Use at your own risk. The author accepts no liability for bans, crashes, or any other consequences.
