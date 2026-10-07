@@ -121,7 +121,14 @@ See THIRD_PARTY_NOTICES.md for details.
 This project was written entirely by an AI model (Claude Sonnet 5.5, by
 Anthropic). I directed the work, tested it on real games, and verified
 the results myself. I did not write the code by hand.
+## Disclaimer
 
-Disclaimer
+This project is an **unofficial, experimental, community-developed tool**. It is **not** affiliated with, endorsed by, sponsored by, or connected to NVIDIA Corporation in any way.
 
-This is an unofficial, experimental project and is not affiliated with or endorsed by NVIDIA. It does not redistribute any NVIDIA proprietary files. Users must supply official Streamline/DLSS components themselves. Intended for single-player/offline use only. Use at your own risk. The author accepts no liability for bans, crashes, or any other consequences.
+- This software does **not** include, redistribute, or modify any NVIDIA proprietary binaries (including but not limited to `sl.*.dll`, `nvngx_dlssg.dll`, or other Streamline / DLSS components). Users must obtain those files themselves from official NVIDIA sources.
+- The project only provides code that attempts to interface with NVIDIA’s publicly available Streamline framework in unsupported games. Any use of NVIDIA technologies remains subject to NVIDIA’s own license terms.
+- This tool is intended **only for single-player / offline games**. Using it in multiplayer games or titles protected by anti-cheat systems may result in account bans. The author assumes no responsibility for such consequences.
+- The software is provided **“AS IS”**, without any warranty of any kind. The author is not responsible for crashes, instability, data loss, bans, or any other consequences arising from the use of this project.
+
+NVIDIA, DLSS, Streamline, and RTX are trademarks of NVIDIA Corporation.  
+Use at your own risk. Always back up your game files.
