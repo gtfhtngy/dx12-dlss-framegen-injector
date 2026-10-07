@@ -37,7 +37,7 @@ Results may vary, so please attach `SN_DLSSG_log.txt` and `sl.log` when reportin
 | Game | Engine | API | Config | Status | Since | Notes |
 |------|--------|-----|--------|--------|-------|-------|
 | Silent Hill Townfall | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Working | v0.4 | - |
-| Dragon Ball: Sparking Zero | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Laggy (debugging) | v0.5 | Do **NOT** test it in online mode |
+| Dragon Ball: Sparking Zero | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Working | v0.5 | Do **NOT** test it in online mode , Set (Or add) cutdetect=0 into the config file or it will be laggy |
 
 ## Installation
 
