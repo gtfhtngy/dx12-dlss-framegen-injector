@@ -91,3 +91,10 @@ overlayhook=1
 autosave=1
 autoreport=1
 msgbox=1
+# ---- v26 (game pipeline cache)
+# psocache     : 1 = persistent cache of the GAME's own pipeline states (graphics + compute): the driver compiles every shader only ONCE, ever (file SN_DLSSG_psocache.bin next to the exe;
+#                delete it to rebuild). The first launch after install / a GPU driver update still compiles normally (and fills the cache); every later launch loads the cache BEFORE the game
+#                creates its device. Pipelines that carry the game's own cached blob are not touched.
+# psocachemb   : size limit of that cache in MB (it is also held in RAM while the game runs)
+psocache=1
+psocachemb=384
