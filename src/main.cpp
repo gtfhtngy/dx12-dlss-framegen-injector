@@ -35,6 +35,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cfloat>
+#include <type_traits>
+#include <memory>
 
 #include "MinHook.h"
 #include <sl.h>
@@ -109,6 +111,9 @@ struct Cfg {
     int ngxLog = 0;
     int shaderCache = 1;     // 1 = build shaders before the game starts and keep them in SN_DLSSG_shaders.snsc (no run-time compile hitch)
     int splash = 1;          // 1 = show the progress window while the cache is being built (only when something has to be built)
+    // ---- v26: game pipeline cache
+    int psoCache = 1;        // 1 = persistent cache for the GAME's own pipeline states (graphics + compute): every shader is compiled by the driver only once (SN_DLSSG_psocache.bin)
+    int psoCacheMB = 384;    // upper bound for the pipeline cache (kept in RAM while the game runs)
     // ---- v25: in-game overlay / menu, compatibility diagnostics
     int overlay = 1;         // 1 = overlay + menu available (hotkey), 0 = never draw anything, never hook the keyboard
     int overlayKey = 0x2D;   // virtual-key code that opens/closes the menu (cfg: overlaykey=INSERT / F10 / HOME / 0x2D ...)
@@ -204,7 +209,9 @@ static void LoadCfg() {
                 "# overlaypos   : 0 = top-left 1 = top-right 2 = bottom-left 3 = bottom-right ; overlayscale / overlayopacity in percent\n"
                 "# overlayblock : 1 = while the menu is open the menu keys are NOT sent to the game ; overlayhook=0 = no keyboard hook (polling only)\n"
                 "# autosave     : 1 = changes made in the menu are written back to this file ; autoreport=1 = write SN_DLSSG_DEBUG_REPORT.txt when FG cannot work\n"
-                "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n");
+                "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n"
+                "# ---- v26: psocache = persistent cache of the GAME's pipelines (SN_DLSSG_psocache.bin)\n"
+                "psocache=1\npsocachemb=384\n");
             fclose(f);
         }
     } else {
@@ -226,6 +233,7 @@ static void LoadCfg() {
             else if (!strcmp(k, "camhold")) g_cfg.camHold = iv ? 1 : 0; else if (!strcmp(k, "camholdmax")) g_cfg.camHoldMax = iv; else if (!strcmp(k, "camrescan")) g_cfg.camRescan = iv; else if (!strcmp(k, "reflexalways")) g_cfg.reflexAlways = iv ? 1 : 0; else if (!strcmp(k, "fgminbackoff")) g_cfg.fgMinBackoff = iv ? 1 : 0;
             else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
             else if (!strcmp(k, "cutdetect")) g_cfg.cutDetect = iv ? 1 : 0; else if (!strcmp(k, "cutthresh")) g_cfg.cutThresh100 = iv; else if (!strcmp(k, "cutfov")) g_cfg.cutFov = iv; else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
+            else if (!strcmp(k, "psocache")) g_cfg.psoCache = iv ? 1 : 0; else if (!strcmp(k, "psocachemb")) g_cfg.psoCacheMB = iv;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
             else if (!strcmp(k, "overlay")) g_cfg.overlay = iv ? 1 : 0; else if (!strcmp(k, "overlaykey")) g_cfg.overlayKey = ParseKeyName(v);
             else if (!strcmp(k, "showfps")) g_cfg.showFps = iv ? 1 : 0; else if (!strcmp(k, "showfgfps")) g_cfg.showFgFps = iv ? 1 : 0; else if (!strcmp(k, "showframetime")) g_cfg.showFrameTime = iv ? 1 : 0;
@@ -242,8 +250,11 @@ static void LoadCfg() {
     if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
     if (g_cfg.overlayPos < 0 || g_cfg.overlayPos > 3) g_cfg.overlayPos = 0;
     g_cfg.overlayScale = std::min(250, std::max(50, g_cfg.overlayScale)); g_cfg.overlayOpacity = std::min(100, std::max(20, g_cfg.overlayOpacity));
+    g_cfg.psoCacheMB = std::min(4096, std::max(32, g_cfg.psoCacheMB));
     if (g_cfg.fgMinFps < 0) g_cfg.fgMinFps = 0; if (g_cfg.baseFpsLimit < 0) g_cfg.baseFpsLimit = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG v26 = v25 + persistent game pipeline (PSO) cache");
+    Log("CFG v26 psocache=%d psocachemb=%d", g_cfg.psoCache, g_cfg.psoCacheMB);
     Log("SN_DLSSG v25 = v24 + in-game overlay/menu (key %s), FPS / DLSS-FG FPS HUD, auto config save, compatibility check + debug report, safe start-up optimisations", KeyNameOf(g_cfg.overlayKey));
     Log("SN_DLSSG v24 (v23 + camera-registry LRU eviction (fixes FG lost after a level load), camera re-scan + hold, async buffer release, no useless Reflex sleep, FG-pause backoff) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
@@ -253,6 +264,7 @@ static void LoadCfg() {
 
 static LONG CALLBACK DiagVEH(PEXCEPTION_POINTERS ep) {
     DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (!g_cfg.log) return EXCEPTION_CONTINUE_SEARCH;
     if (c == 0xC0000005 || c == 0xC000001D || c == 0xC0000094 || c == 0xC00000FD || c == 0xC0000409) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 8) {
@@ -274,7 +286,6 @@ static LONG CALLBACK DiagVEH(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// ------------------------------------------------------------------ vtable patch helpers
 static void* Patch(void** vt, int idx, void* hk) {
     DWORD old; VirtualProtect(&vt[idx], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
     void* o = vt[idx]; vt[idx] = hk; VirtualProtect(&vt[idx], sizeof(void*), old, &old); return o;
@@ -284,7 +295,7 @@ struct VHook { std::unordered_map<void**, void*> orig; std::mutex mx; };
 static bool HookVt(VHook& h, void** vt, int idx, void* hk) {
     std::lock_guard<std::mutex> lk(h.mx);
     if (h.orig.count(vt)) return false;
-    h.orig[vt] = Patch(vt, idx, hk); return true;
+    void* o_ = Patch(vt, idx, hk); h.orig[vt] = o_; return true;
 }
 static void* OrigOf(VHook& h, void* obj) {
     std::lock_guard<std::mutex> lk(h.mx);
@@ -1642,20 +1653,20 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* sc, UINT s, UINT f) {
     auto o = (HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT))OrigOf(g_hPresent, sc);
     if (!o) return E_FAIL;
     bool outer = (t_depth++ == 0); FrameCtx ctx;
-    if (outer) { CheckDeviceRemoved(); try { ctx = OnPresentBegin(sc); } catch (...) { Log("exception in OnPresentBegin"); } }
+    if (outer) { CheckDeviceRemoved(); ctx = OnPresentBegin(sc); }
     double tp = NowMs();
     HRESULT r = o(sc, s, f);
     if (outer) { double dp = NowMs() - tp; if ((dp > 120.0 || (g_obMs - g_tSleep) > 8.0) && g_frame.load() > 60) { static int ns = 0; if (ns++ < 60) Log("slow frame %d: our work before Present %.1f ms [ReflexSleep %.1f (intentional wait) | UpdatePins %.1f | MV pass %.1f | buffer prune %.1f] | inside Present (DLSS-G/driver/GPU wait) %.1f ms | upload bufs held=%zu (%llu MB, pruned %ld) cbv/frame=%ld", g_frame.load(), g_obMs, g_tSleep, g_tPins, g_tMv, g_tPrune, dp, bufCount(), (unsigned long long)(g_bufBytes >> 20), g_prunedTotal, g_cbvPerFrame.load()); } }
-    if (outer) { try { OnPresentEnd(ctx); } catch (...) {} }
+    if (outer) OnPresentEnd(ctx);
     t_depth--; return r;
 }
 static HRESULT STDMETHODCALLTYPE hkPresent1(IDXGISwapChain1* sc, UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p) {
     auto o = (HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*))OrigOf(g_hPresent1, sc);
     if (!o) return E_FAIL;
     bool outer = (t_depth++ == 0); FrameCtx ctx;
-    if (outer) { CheckDeviceRemoved(); try { ctx = OnPresentBegin(sc); } catch (...) { Log("exception in OnPresentBegin"); } }
+    if (outer) { CheckDeviceRemoved(); ctx = OnPresentBegin(sc); }
     HRESULT r = o(sc, s, f, p);
-    if (outer) { try { OnPresentEnd(ctx); } catch (...) {} }
+    if (outer) OnPresentEnd(ctx);
     t_depth--; return r;
 }
 
@@ -1720,6 +1731,7 @@ static bool EnsureSL() {
 }
 // true = call the original function (our own warm-up thread, or Streamline calling back into us). Otherwise the game waits here until the shader cache is ready.
 static bool PassThrough() { if (t_prewarm) return true; WaitPrewarm(); return t_inSL || !EnsureSL(); }
+#include "psocache.inc"   // v26: persistent cache for the game's own pipeline states
 // ---- v17: PSO creation diagnostics + one retry (game crash: UE4 D3D12RHI "CreatePipelineState failed with E_INVALIDARG")
 // A PSO that succeeds is never touched. Only when the GAME's call returns E_INVALIDARG: (1) log the desc + device state,
 // (2) if the desc carries a CachedPSO blob, retry once without it (a stale/corrupt blob is a known cause of E_INVALIDARG).
@@ -1738,9 +1750,35 @@ static void LogGPsoFail(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_D
         (int)d->DepthStencilState.DepthEnable, (int)d->DepthStencilState.StencilEnable, (int)d->DepthStencilState.DepthFunc);
     if (g_log) fflush(g_log);                              // the game is about to die: do not lose these lines
 }
+// v26: CreateRootSignature hook = identity of the root signature for the pipeline cache key
+using PFN_CreateRS = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+static PFN_CreateRS oCreateRS;
+static HRESULT STDMETHODCALLTYPE hkCreateRS(ID3D12Device* dev, UINT nm, const void* blob, SIZE_T len, REFIID riid, void** ppv) {
+    HRESULT hr = oCreateRS(dev, nm, blob, len, riid, ppv);
+    if (SUCCEEDED(hr) && ppv && *ppv) NoteRootSig(*ppv, blob, len);
+    return hr;
+}
+// errors a stale / foreign cached blob can cause: E_INVALIDARG, D3D12_ERROR_ADAPTER_NOT_FOUND (0x887E0001), D3D12_ERROR_DRIVER_VERSION_MISMATCH (0x887E0002)
+static inline bool PsoRetryable(HRESULT hr) { return hr == E_INVALIDARG || hr == (HRESULT)0x887E0001 || hr == (HRESULT)0x887E0002; }
+static inline bool PsoCacheable(REFIID riid, void** ppv) { return ppv && IsEqualGUID(riid, __uuidof(ID3D12PipelineState)); }
+
 static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
+    if (!desc) return oCreateGPSO(dev, desc, riid, ppv);
+    // v26 persistent pipeline cache: known pipeline -> give the driver its cached blob (no shader compile); unknown -> compile as usual, then remember it
+    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;   // pipelines that already carry the game's own blob are left alone
+    uint64_t key = 0; bool hit = false;
+    if (cache) {
+        PsoWaitReady(); g_psoSeen++; key = HashGfxDesc(desc); PsoBlobPtr blob = PsoFind(key);
+        if (blob) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
+            HRESULT h2 = oCreateGPSO(dev, &cp, riid, ppv);
+            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
+            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached graphics pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+        }
+    }
     HRESULT hr = oCreateGPSO(dev, desc, riid, ppv);
-    if (hr != E_INVALIDARG || !desc || !g_cfg.psoRetry) return hr;
+    if (SUCCEEDED(hr)) { if (cache && !hit && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv); return hr; }
+    if (!PsoRetryable(hr) || !g_cfg.psoRetry) return hr;
     int n = ++g_psoFail;
     if (n <= 16) LogGPsoFail(dev, desc, n);
     if (desc->CachedPSO.CachedBlobSizeInBytes) {
@@ -1753,10 +1791,23 @@ static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRA
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
+    if (!desc) return oCreateCPSO(dev, desc, riid, ppv);
+    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;
+    uint64_t key = 0;
+    if (cache) {
+        PsoWaitReady(); g_psoSeen++; key = HashCompDesc(desc); PsoBlobPtr blob = PsoFind(key);
+        if (blob) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
+            HRESULT h2 = oCreateCPSO(dev, &cp, riid, ppv);
+            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
+            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached compute pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+        }
+    }
     HRESULT hr = oCreateCPSO(dev, desc, riid, ppv);
-    if (hr != E_INVALIDARG || !desc || !g_cfg.psoRetry) return hr;
+    if (SUCCEEDED(hr)) { if (cache && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv); return hr; }
+    if (!PsoRetryable(hr) || !g_cfg.psoRetry) return hr;
     int n = ++g_psoFail;
-    if (n <= 16) { Log("PSO FAIL #%d (compute, E_INVALIDARG) tid=%lu | deviceRemoved=0x%08X | rootSig=%p CS=%zu cached=%zu", n, (unsigned long)GetCurrentThreadId(), (unsigned)dev->GetDeviceRemovedReason(), (void*)desc->pRootSignature, desc->CS.BytecodeLength, desc->CachedPSO.CachedBlobSizeInBytes); }
+    if (n <= 16) { Log("PSO FAIL #%d (compute, hr=0x%08X) tid=%lu | deviceRemoved=0x%08X | rootSig=%p CS=%zu cached=%zu", n, (unsigned)hr, (unsigned long)GetCurrentThreadId(), (unsigned)dev->GetDeviceRemovedReason(), (void*)desc->pRootSignature, desc->CS.BytecodeLength, desc->CachedPSO.CachedBlobSizeInBytes); }
     if (desc->CachedPSO.CachedBlobSizeInBytes) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
         HRESULT hr2 = oCreateCPSO(dev, &cp, riid, ppv);
@@ -1764,6 +1815,31 @@ static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COM
         if (SUCCEEDED(hr2)) { g_psoRescued++; return hr2; }
     }
     if (g_log) fflush(g_log);
+    return hr;
+}
+
+// ---- v26: ID3D12Device2::CreatePipelineState (pipeline state STREAM) - same cache, stream flavour
+using PFN_CreatePSS = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const SnStreamDesc*, REFIID, void**);
+static PFN_CreatePSS oCreatePSS;
+static HRESULT STDMETHODCALLTYPE hkCreatePSS(ID3D12Device* dev, const SnStreamDesc* desc, REFIID riid, void** ppv) {
+    if (!desc || !g_cfg.psoCache || !PsoCacheable(riid, ppv)) return oCreatePSS(dev, desc, riid, ppv);
+    const uint8_t* base = (const uint8_t*)desc->pPipelineStateSubobjectStream; size_t total = (size_t)desc->SizeInBytes;
+    std::vector<SubInfo> subs;
+    long nc = ++g_psoStreamCalls; if (nc == 1) Log("pso-cache: this game creates pipelines with CreatePipelineState (state stream) - cached as well");
+    if (!ParseStream(base, total, subs) || StreamHasBlob(base, subs)) { long u = ++g_psoStreamUnknown; if (u <= 3) Log("pso-cache: a pipeline stream was not cacheable (unknown sub-object type, or it already carries the game's own blob) - passed through unchanged"); return oCreatePSS(dev, desc, riid, ppv); }
+    PsoWaitReady(); g_psoSeen++;
+    uint64_t key = HashStream(base, subs); PsoBlobPtr blob = PsoFind(key);
+    if (blob) {
+        std::vector<uint64_t> buf; size_t nb = 0;
+        if (StreamWithBlob(base, total, subs, blob, buf, nb)) {
+            SnStreamDesc d2 = { nb, buf.data() };
+            HRESULT h2 = oCreatePSS(dev, &d2, riid, ppv);
+            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
+            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached stream pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+        }
+    }
+    HRESULT hr = oCreatePSS(dev, desc, riid, ppv);
+    if (SUCCEEDED(hr) && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv);
     return hr;
 }
 
@@ -1781,23 +1857,30 @@ static void InstallNativeHooks(ID3D12Device* nat) {
         FAILED(nat->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl))) { Log("InstallNativeHooks: dummy objects failed"); return; }
     void** vtQ = *(void***)q; void** vtCL = *(void***)cl; cl->Close();
     oCreateCBVStub:;
-    if (g_cfg.psoRetry) { oCreateGPSO = (PFN_CreateGPSO)Patch(vtDev, 10, (void*)hkCreateGPSO); oCreateCPSO = (PFN_CreateCPSO)Patch(vtDev, 11, (void*)hkCreateCPSO); }
-    oCreateSRV = (PFN_CreateSRV)Patch(vtDev, 18, (void*)hkCreateSRV);
-    oCreateRTV = (PFN_CreateRTV)Patch(vtDev, 20, (void*)hkCreateRTV);
-    oCreateDSV = (PFN_CreateDSV)Patch(vtDev, 21, (void*)hkCreateDSV);
-    oCopyDescSimple = (PFN_CopyDescSimple)Patch(vtDev, 24, (void*)hkCopyDescSimple);
-    oCreateCommitted = (PFN_CreateCommitted)Patch(vtDev, 27, (void*)hkCreateCommitted);
-    oCreatePlaced = (PFN_CreatePlaced)Patch(vtDev, 29, (void*)hkCreatePlaced);
-    oExec = (PFN_Exec)Patch(vtQ, 10, (void*)hkExec);
-    oCopyTex = (PFN_CopyTex)Patch(vtCL, 16, (void*)hkCopyTex);
-    oResBarrier = (PFN_ResBarrier)Patch(vtCL, 26, (void*)hkResBarrier);
-    oOMSetRT = (PFN_OMSetRT)Patch(vtCL, 46, (void*)hkOMSetRT);
-    if (g_cfg.viewRect) { oRSSetVP = (PFN_RSSetVP)Patch(vtCL, 21, (void*)hkRSSetVP); oCLReset = (PFN_CLReset)Patch(vtCL, 10, (void*)hkCLReset); }   // v20
-    oClearDSV = (PFN_ClearDSV)Patch(vtCL, 47, (void*)hkClearDSV);
-    oClearRTV = (PFN_ClearRTV)Patch(vtCL, 48, (void*)hkClearRTV);
-    oSetCCbv = (PFN_SetRootCbv)Patch(vtCL, 37, (void*)hkSetCCbv);
-    oSetGCbv = (PFN_SetRootCbv)Patch(vtCL, 38, (void*)hkSetGCbv);
-    if (g_cfg.hudless) { oDrawInst = (PFN_DrawInst)Patch(vtCL, 12, (void*)hkDrawInst); oDrawIdxInst = (PFN_DrawIdxInst)Patch(vtCL, 13, (void*)hkDrawIdxInst); }
+    if (g_cfg.psoCache) oCreateRS = (decltype(oCreateRS))Patch(vtDev, 16, (void*)hkCreateRS);   // v26: root signature identity for the pipeline cache key (must be hooked before the pipeline hooks)
+    if (g_cfg.psoCache) {   // v26: Device2::CreatePipelineState lives in the same vtable (vtable of the device object itself: it implements ID3D12Device2 on every Windows 10 1607+)
+        static const GUID iid2 = { 0x30baa41e, 0xb15b, 0x475c, { 0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28 } };   // IID_ID3D12Device2
+        ID3D12Device* d2 = nullptr;
+        if (SUCCEEDED(nat->QueryInterface(iid2, (void**)&d2)) && d2) { void** vt2 = *(void***)d2; if (vt2 == vtDev) oCreatePSS = (decltype(oCreatePSS))Patch(vtDev, 47, (void*)hkCreatePSS); else Log("pso-cache: Device2 has a different vtable -> state-stream pipelines are not cached"); d2->Release(); }
+        else Log("pso-cache: ID3D12Device2 not available -> state-stream pipelines are not cached");
+    }
+    if (g_cfg.psoRetry || g_cfg.psoCache) { oCreateGPSO = (decltype(oCreateGPSO))Patch(vtDev, 10, (void*)hkCreateGPSO); oCreateCPSO = (decltype(oCreateCPSO))Patch(vtDev, 11, (void*)hkCreateCPSO); }
+    oCreateSRV = (decltype(oCreateSRV))Patch(vtDev, 18, (void*)hkCreateSRV);
+    oCreateRTV = (decltype(oCreateRTV))Patch(vtDev, 20, (void*)hkCreateRTV);
+    oCreateDSV = (decltype(oCreateDSV))Patch(vtDev, 21, (void*)hkCreateDSV);
+    oCopyDescSimple = (decltype(oCopyDescSimple))Patch(vtDev, 24, (void*)hkCopyDescSimple);
+    oCreateCommitted = (decltype(oCreateCommitted))Patch(vtDev, 27, (void*)hkCreateCommitted);
+    oCreatePlaced = (decltype(oCreatePlaced))Patch(vtDev, 29, (void*)hkCreatePlaced);
+    oExec = (decltype(oExec))Patch(vtQ, 10, (void*)hkExec);
+    oCopyTex = (decltype(oCopyTex))Patch(vtCL, 16, (void*)hkCopyTex);
+    oResBarrier = (decltype(oResBarrier))Patch(vtCL, 26, (void*)hkResBarrier);
+    oOMSetRT = (decltype(oOMSetRT))Patch(vtCL, 46, (void*)hkOMSetRT);
+    if (g_cfg.viewRect) { oRSSetVP = (decltype(oRSSetVP))Patch(vtCL, 21, (void*)hkRSSetVP); oCLReset = (decltype(oCLReset))Patch(vtCL, 10, (void*)hkCLReset); }   // v20
+    oClearDSV = (decltype(oClearDSV))Patch(vtCL, 47, (void*)hkClearDSV);
+    oClearRTV = (decltype(oClearRTV))Patch(vtCL, 48, (void*)hkClearRTV);
+    oSetCCbv = (decltype(oSetCCbv))Patch(vtCL, 37, (void*)hkSetCCbv);
+    oSetGCbv = (decltype(oSetGCbv))Patch(vtCL, 38, (void*)hkSetGCbv);
+    if (g_cfg.hudless) { oDrawInst = (decltype(oDrawInst))Patch(vtCL, 12, (void*)hkDrawInst); oDrawIdxInst = (decltype(oDrawIdxInst))Patch(vtCL, 13, (void*)hkDrawIdxInst); }
     cl->Release(); al->Release(); q->Release();
     g_devHooked = true; Log("native D3D12 hooks installed (device vtable=%p queue vtable=%p cl vtable=%p)", (void*)vtDev, (void*)vtQ, (void*)vtCL);
 }
@@ -1853,6 +1936,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (tF) ok += MH_CreateHook(tF, (void*)hkCreateDXGIFactory, (void**)&oCreateDXGIFactory) == MH_OK;
     if (tF1) ok += MH_CreateHook(tF1, (void*)hkCreateDXGIFactory1, (void**)&oCreateDXGIFactory1) == MH_OK;
     if (tF2) ok += MH_CreateHook(tF2, (void*)hkCreateDXGIFactory2, (void**)&oCreateDXGIFactory2) == MH_OK;
+    PsoCacheStart();   // v26: read the game-pipeline cache in the background BEFORE the game creates its device
     PrewarmInit();   // game's D3D12/DXGI creation calls will wait for the shader warm-up from the moment the hooks are live
     MH_STATUS es = MH_EnableHook(MH_ALL_HOOKS);
     Log("MinHook: %d hooks created, enable -> %d (D3D12CreateDevice=%p CreateDXGIFactory=%p/1=%p/2=%p)", ok, (int)es, tDev, tF, tF1, tF2);
