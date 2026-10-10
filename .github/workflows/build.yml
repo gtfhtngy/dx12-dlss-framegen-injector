@@ -5,16 +5,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Tools
-        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix unzip
+
+      - name: Diagnose (which commit and which files CI sees)
+        run: |
+          echo "commit: $GITHUB_SHA  ref: $GITHUB_REF"
+          ls -la src/*.inc
+          echo "--- first line of detect.inc:";    head -1 src/detect.inc
+          echo "--- first line of pso_hooks.inc:"; head -1 src/pso_hooks.inc
+
       - name: Sanity check (each .inc must contain its own code)
         run: |
-          head -1 src/detect.inc | grep -q 'detect.inc' && grep -q 'AcScanFiles' src/detect.inc
-          head -1 src/pso_hooks.inc | grep -q 'pso_hooks.inc' && grep -q 'hkCreateGPSO' src/pso_hooks.inc
+          head -1 src/detect.inc | grep -q 'detect.inc' || { echo "::error::src/detect.inc has wrong content (first line is not its header)"; exit 1; }
+          grep -q 'AcScanFiles' src/detect.inc        || { echo "::error::src/detect.inc is missing AcScanFiles"; exit 1; }
+          if grep -q 'hkCreateRS' src/detect.inc; then echo "::error::src/detect.inc contains pso_hooks code"; exit 1; fi
+          head -1 src/pso_hooks.inc | grep -q 'pso_hooks.inc' || { echo "::error::src/pso_hooks.inc has wrong content"; exit 1; }
+          grep -q 'hkCreateGPSO' src/pso_hooks.inc    || { echo "::error::src/pso_hooks.inc is missing hkCreateGPSO"; exit 1; }
+
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix unzip
+
       - name: Unit tests + camera replay
         run: sh tests/run_tests.sh
+
       - name: Build winmm.dll (MinHook + Streamline headers are fetched by build.sh)
         run: cd src && sh ./build.sh
+
       - name: Upload winmm.dll (the NVIDIA Streamline DLLs are NOT included - see README)
         uses: actions/upload-artifact@v4
         with:
