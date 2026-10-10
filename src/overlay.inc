@@ -17,12 +17,14 @@ static LARGE_INTEGER g_ovQf = {};
 static inline double OvNowMs() { if (!g_ovQf.QuadPart) QueryPerformanceFrequency(&g_ovQf); LARGE_INTEGER n; QueryPerformanceCounter(&n); return (double)n.QuadPart * 1000.0 / (double)g_ovQf.QuadPart; }
 static bool OvForegroundIsUs() { HWND h = GetForegroundWindow(); if (!h) return false; DWORD pid = 0; GetWindowThreadProcessId(h, &pid); return pid == GetCurrentProcessId(); }
 
-enum OvItem { I_FG, I_MULT, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_MINFPS, I_CAP, I_REFLEX, I_CAMHOLD, I_CUT, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_CLOSE, I_COUNT };
+enum { C_TEXT, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_TITLE };
+enum OvItem { I_FG, I_PRESET, I_MULT, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWVRAM, I_MINFPS, I_CAP, I_OUTCAP, I_REFLEX, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
 struct OvGlobals {
     std::atomic<bool> menuOpen{ false }; int sel = 0;
     std::atomic<unsigned> qHead{ 0 }, qTail{ 0 }; unsigned char q[64] = {};
     std::atomic<bool> hookOk{ false }, drawnOnce{ false };
     std::string msg; DWORD msgTick = 0; bool msgBad = false;
+    std::string toast; DWORD toastTick = 0; int toastCol = 0;   // v27: short on-screen note for hotkeys
 } g_ov;
 
 // ------------------------------------------------------------------ keyboard
@@ -38,10 +40,10 @@ static LRESULT CALLBACK OvKbProc(int code, WPARAM w, LPARAM l) {
             unsigned vk = k->vkCode & 0xFF; bool down = (w == WM_KEYDOWN || w == WM_SYSKEYDOWN), up = (w == WM_KEYUP || w == WM_SYSKEYUP);
             if (up) { g_ovHeld[vk] = false; if (g_ovSwallowed[vk]) { g_ovSwallowed[vk] = false; return 1; } }
             else if (down && g_cfg.overlay) {
-                bool isOv = (int)vk == g_cfg.overlayKey && vk != 0; bool menu = g_ov.menuOpen.load();
-                if ((isOv || (menu && OvIsNavKey(vk))) && OvForegroundIsUs()) {
-                    if (isOv) { if (!g_ovHeld[vk]) { g_ovHeld[vk] = true; OvPush((unsigned char)vk); } } else OvPush((unsigned char)vk);
-                    if (menu && g_cfg.overlayBlock) { g_ovSwallowed[vk] = true; return 1; }
+                bool isOv = (int)vk == g_cfg.overlayKey && vk != 0; bool menu = g_ov.menuOpen.load(); bool isHot = vk != 0 && ((int)vk == g_cfg.fgKey || (int)vk == g_cfg.hudKey);
+                if ((isOv || isHot || (menu && OvIsNavKey(vk))) && OvForegroundIsUs()) {
+                    if (isOv || isHot) { if (!g_ovHeld[vk]) { g_ovHeld[vk] = true; OvPush((unsigned char)vk); } } else OvPush((unsigned char)vk);
+                    if (menu && g_cfg.overlayBlock && !isHot) { g_ovSwallowed[vk] = true; return 1; }
                 }
             }
         }
@@ -69,7 +71,7 @@ static void OvPoll() {
         if (d && !prev[vk]) { OvPush((unsigned char)vk); nextRep[vk] = now + 350; }
         else if (d && repeat && now >= nextRep[vk]) { OvPush((unsigned char)vk); nextRep[vk] = now + 80; }
         prev[vk] = d; };
-    chk((unsigned)g_cfg.overlayKey, false);
+    chk((unsigned)g_cfg.overlayKey, false); if (g_cfg.fgKey) chk((unsigned)g_cfg.fgKey, false); if (g_cfg.hudKey) chk((unsigned)g_cfg.hudKey, false);
     if (g_ov.menuOpen.load()) { chk(VK_UP, true); chk(VK_DOWN, true); chk(VK_LEFT, true); chk(VK_RIGHT, true); chk(VK_RETURN, false); chk(VK_ESCAPE, false); chk(VK_NUMPAD8, true); chk(VK_NUMPAD2, true); chk(VK_NUMPAD4, true); chk(VK_NUMPAD6, true); chk(VK_NUMPAD5, false); }
 }
 
@@ -132,32 +134,63 @@ template <size_t N> static int StepCycle(const int(&a)[N], int cur, int dir) {  
     int bi = 0, bd = 1 << 30; for (size_t i = 0; i < N; i++) { int d = abs(a[i] - cur); if (d < bd) { bd = d; bi = (int)i; } }
     bi = (bi + dir + (int)N) % (int)N; return a[bi];
 }
+static void OvToast(const std::string& s, int col) { g_ov.toast = s; g_ov.toastTick = GetTickCount(); g_ov.toastCol = col; }
 static void OvSay(const std::string& s, bool bad = false) { g_ov.msg = s; g_ov.msgTick = GetTickCount(); g_ov.msgBad = bad; }
 static DWORD WINAPI OvReportThread(LPVOID) { DiagWriteReport("manual (menu)"); return 0; }
 static void OvCloseMenu() { g_ov.menuOpen = false; CfgSaveSoon(); if (g_bannerSeen.load()) g_bannerActive = false; }
+static const int kOutCapSteps[] = { 0, -1, 60, 72, 90, 120, 144, 165, 240 };
+static int OutCapCycle(int cur, int dir) { int n = (int)(sizeof kOutCapSteps / sizeof kOutCapSteps[0]), i = 0; for (int k = 0; k < n; k++) if (kOutCapSteps[k] == cur) i = k; return kOutCapSteps[(i + (dir >= 0 ? 1 : n - 1)) % n]; }
+static void OvPresetCustom() { if (g_cfg.preset) { g_cfg.preset = 0; CfgSet("preset", "custom"); } }   // a hand-made change to a preset key makes the preset 'custom'
+static void OvApplyPreset(int id) {
+    g_cfg.preset = id; CfgSet("preset", SnPresetName(id)); if (id == SN_PRESET_CUSTOM) return;
+    ApplyPresetValues(id); if (!g_cfg.fgMinFps) g_fgSusp = false;
+    CfgSetInt("fgminfps", g_cfg.fgMinFps); CfgSetInt("fgdelay", g_cfg.fgDelay); CfgSetInt("camstale", g_cfg.camStale); CfgSetInt("mult", g_cfg.mult);
+    Log("menu: preset %s (fgminfps=%d fgdelay=%d camstale=%d mult=%d)", SnPresetName(id), g_cfg.fgMinFps, g_cfg.fgDelay, g_cfg.camStale, g_cfg.mult);
+}
+static void OvToggleFg() {
+    if (g_acTripped.load()) { OvToast("Frame Generation stays OFF: anti-cheat found", C_RED); return; }
+    g_cfg.fg = g_cfg.fg ? 0 : 1; if (g_cfg.fg) g_forceReset = true; Log("hotkey: frame generation = %d (this session only)", g_cfg.fg);
+    OvToast(g_cfg.fg ? "Frame Generation: ON" : "Frame Generation: OFF", g_cfg.fg ? C_GREEN : C_YELLOW);
+}
+static void OvToggleHud() {
+    static int sv = 0, sg = 0, sf = 0, sm = 0; bool any = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram;
+    if (any) { sv = g_cfg.showFps; sg = g_cfg.showFgFps; sf = g_cfg.showFrameTime; sm = g_cfg.showVram; g_cfg.showFps = g_cfg.showFgFps = g_cfg.showFrameTime = g_cfg.showVram = 0; OvToast("HUD: OFF", C_GRAY); }
+    else { if (sv || sg || sf || sm) { g_cfg.showFps = sv; g_cfg.showFgFps = sg; g_cfg.showFrameTime = sf; g_cfg.showVram = sm; } else { g_cfg.showFps = 1; g_cfg.showFgFps = 1; } OvToast("HUD: ON", C_GREEN); }
+}
 static void OvAdjust(int item, int dir, bool enter) {
     auto tog = [&](int& v, const char* key, const char* name) { v = v ? 0 : 1; CfgSetInt(key, v); Log("menu: %s = %d", name, v); };
     switch (item) {
-    case I_FG: tog(g_cfg.fg, "fg", "frame generation"); if (g_cfg.fg) g_forceReset = true; break;
-    case I_MULT: { int mx = g_maxGen ? (int)g_maxGen + 1 : 2; int m = g_cfg.mult + dir; if (m > mx) m = 2; if (m < 2) m = mx; g_cfg.mult = m; CfgSetInt("mult", m); Log("menu: multiplier = %d", m); break; }
+    case I_FG: if (g_acTripped.load()) { OvSay("Frame generation is blocked: an anti-cheat was found.", true); break; } tog(g_cfg.fg, "fg", "frame generation"); if (g_cfg.fg) g_forceReset = true; break;
+    case I_PRESET: OvApplyPreset((g_cfg.preset + (dir >= 0 ? 1 : SN_PRESET_COUNT - 1)) % SN_PRESET_COUNT); break;
+    case I_MULT: { int mx = g_maxGen ? (int)g_maxGen + 1 : 2; int m = g_cfg.mult + dir; if (m > mx) m = 2; if (m < 2) m = mx; g_cfg.mult = m; CfgSetInt("mult", m); OvPresetCustom(); Log("menu: multiplier = %d", m); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break; }
     case I_SHOWFPS: tog(g_cfg.showFps, "showfps", "show real fps"); break;
     case I_SHOWFG: tog(g_cfg.showFgFps, "showfgfps", "show DLSS-FG fps"); break;
     case I_SHOWFT: tog(g_cfg.showFrameTime, "showframetime", "show frame time"); break;
-    case I_MINFPS: g_cfg.fgMinFps = StepCycle(kMinFpsSteps, g_cfg.fgMinFps, dir >= 0 ? 1 : -1); if (!g_cfg.fgMinFps) g_fgSusp = false; CfgSetInt("fgminfps", g_cfg.fgMinFps); break;
+    case I_SHOWVRAM: tog(g_cfg.showVram, "showvram", "show DLSS-G VRAM"); g_vramReq = true; break;
+    case I_MINFPS: g_cfg.fgMinFps = StepCycle(kMinFpsSteps, g_cfg.fgMinFps, dir >= 0 ? 1 : -1); if (!g_cfg.fgMinFps) g_fgSusp = false; CfgSetInt("fgminfps", g_cfg.fgMinFps); OvPresetCustom(); break;
     case I_CAP: g_cfg.baseFpsLimit = StepCycle(kCapSteps, g_cfg.baseFpsLimit, dir >= 0 ? 1 : -1); CfgSetInt("baseFpsLimit", g_cfg.baseFpsLimit); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break;
+    case I_OUTCAP: g_cfg.fpsCap = OutCapCycle(g_cfg.fpsCap, dir); CfgSet("fpscap", g_cfg.fpsCap < 0 ? "auto" : std::to_string(g_cfg.fpsCap)); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break;
+    case I_HUDLESS: { int nv = g_cfg.hudless == 0 ? 2 : g_cfg.hudless == 2 ? 1 : 0; if (dir < 0) nv = g_cfg.hudless == 0 ? 1 : g_cfg.hudless == 1 ? 2 : 0; g_cfg.hudless = nv; CfgSetInt("hudless", nv); if (nv) EnsureDrawHooks(); if (nv == 2) HudCalReset(); Log("menu: hudless = %d", nv); break; }
     case I_REFLEX: tog(g_cfg.reflexSleep, "reflexsleep", "reflex sleep"); break;
+    case I_REFLEXMODE: { int m = (g_cfg.reflexMode + (dir >= 0 ? 1 : 2)) % 3; g_cfg.reflexMode = m; CfgSet("reflexmode", SnReflexModeName(m)); Log("menu: reflex mode = %s", SnReflexModeName(m));
+        if (g_slRuntimeOk) ApplyReflexOptions("menu"); if (m == 0) OvSay("Reflex OFF: Frame Generation needs Reflex markers - if FG stops, switch back to Low latency.", true); break; }
     case I_CAMHOLD: tog(g_cfg.camHold, "camhold", "camera hold"); break;
     case I_CUT: tog(g_cfg.cutDetect, "cutdetect", "cut detection"); break;
+    case I_MENUDET: tog(g_cfg.menuDetect, "menudetect", "full-screen menu detection"); break;
+    case I_DYNRES: tog(g_cfg.dynRes, "dynres", "dynamic resolution flag"); break;
     case I_POS: g_cfg.overlayPos = (g_cfg.overlayPos + (dir >= 0 ? 1 : 3)) % 4; CfgSetInt("overlaypos", g_cfg.overlayPos); break;
     case I_SCALE: g_cfg.overlayScale = StepCycle(kScaleSteps, g_cfg.overlayScale, dir >= 0 ? 1 : -1); CfgSetInt("overlayscale", g_cfg.overlayScale); break;
     case I_OPACITY: g_cfg.overlayOpacity = StepCycle(kOpacitySteps, g_cfg.overlayOpacity, dir >= 0 ? 1 : -1); CfgSetInt("overlayopacity", g_cfg.overlayOpacity); break;
     case I_REPORT: if (enter) { HANDLE h = CreateThread(nullptr, 0, OvReportThread, nullptr, 0, nullptr); if (h) CloseHandle(h); OvSay("Debug report is being written next to the game exe: " SN_REPORT_NAME); } break;
+    case I_BUNDLE: if (enter) { BundleStart(); OvSay("Creating the support zip ..."); } break;
     case I_CLOSE: if (enter) OvCloseMenu(); break;
     }
 }
 static void OvProcessKeys() {
     if (!g_ov.hookOk.load()) OvPoll();
     while (int vk = OvPop()) {
+        if (g_cfg.fgKey && vk == g_cfg.fgKey && vk != g_cfg.overlayKey) { OvToggleFg(); continue; }
+        if (g_cfg.hudKey && vk == g_cfg.hudKey && vk != g_cfg.overlayKey) { OvToggleHud(); continue; }
         if (vk == g_cfg.overlayKey) { if (g_ov.menuOpen.load()) OvCloseMenu(); else { g_ov.menuOpen = true; g_bannerSeen = true; Log("overlay menu opened"); } continue; }
         if (!g_ov.menuOpen.load()) continue;
         switch (vk) {
@@ -172,7 +205,6 @@ static void OvProcessKeys() {
 }
 
 // ------------------------------------------------------------------ panel content
-enum { C_TEXT, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_TITLE };
 struct OvLine { std::string t; int col = C_TEXT; bool sel = false; };
 static void OvWrap(std::vector<OvLine>& out, const std::string& s, int col, size_t width, const char* indent = "") {
     size_t p = 0; bool first = true;
@@ -193,10 +225,11 @@ static void OvBuild(std::vector<OvLine>& L) {
         OvWrap(L, std::string("(If you are still in a menu / loading screen, wait until gameplay.)  Press ") + KeyNameOf(g_cfg.overlayKey) + " to open the menu and dismiss this notice.", C_GRAY, 58);
     }
     // ---- HUD lines
-    bool anyHud = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime;
+    bool anyHud = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram;
     if (anyHud) {
         if (g_cfg.showFps) { char b[96]; snprintf(b, sizeof b, "Real FPS : %6.1f", g_st.fps); L.push_back({ b, C_TEXT, false }); }
         if (g_cfg.showFrameTime) { char b[96]; snprintf(b, sizeof b, "Frame    : %5.2f ms   1%% low %5.1f", g_st.ft, g_st.low1); L.push_back({ b, C_TEXT, false }); }
+        if (g_cfg.showVram) { char b[96]; if (g_wasOn && g_stVramMB > 0) snprintf(b, sizeof b, "FG VRAM  : ~%llu MB (DLSS-G)", g_stVramMB); else snprintf(b, sizeof b, "FG VRAM  : %s", g_wasOn ? "measuring ..." : "- (FG off)"); L.push_back({ b, C_TEXT, false }); }
         if (g_cfg.showFgFps) {
             char b[128];
             if (!g_slInitOk) { L.push_back({ "DLSS-FG  : unavailable (Streamline not loaded)", C_RED, false }); }
@@ -205,10 +238,11 @@ static void OvBuild(std::vector<OvLine>& L) {
             else { snprintf(b, sizeof b, "DLSS-FG  : OFF  (%s)", g_whyNot[0] ? g_whyNot : "off"); L.push_back({ b, C_GRAY, false }); }
         }
     }
+    if (!g_ov.menuOpen.load() && !g_ov.toast.empty() && GetTickCount() - g_ov.toastTick < 2500) L.push_back({ g_ov.toast, g_ov.toastCol, false });
     // ---- menu
     if (g_ov.menuOpen.load()) {
         if (!L.empty()) L.push_back({ "", C_TEXT, false });
-        L.push_back({ "SN_DLSSG v25  -  DLSS Frame Generation", C_TITLE, false });
+        L.push_back({ "SN_DLSSG " SN_VERSION "  -  DLSS Frame Generation", C_TITLE, false });
         { DiagRuntime rt; DiagRuntimeFill(rt); std::string gpu; { for (auto& g : g_gpus) if (g.nvidia && !g.software) { gpu = g.name; break; } }
           if (!gpu.empty()) L.push_back({ "GPU      : " + gpu, C_GRAY, false });
           char b[160];
@@ -223,22 +257,32 @@ static void OvBuild(std::vector<OvLine>& L) {
         auto row = [&](int id, const char* label, const std::string& val) { char b[160]; snprintf(b, sizeof b, "%s %-26s %s", g_ov.sel == id ? ">" : " ", label, val.c_str()); L.push_back({ b, C_TEXT, g_ov.sel == id }); };
         static const char* posN[] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
         row(I_FG, "Frame Generation", OnOff(g_cfg.fg));
+        { static const char* pn[] = { "Custom", "Quality", "Balanced", "Performance" }; row(I_PRESET, "Preset", pn[g_cfg.preset & 3]); }
         row(I_MULT, "Multiplier", Fmt("%dx%s", g_cfg.mult, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : ""));
         row(I_SHOWFPS, "Show REAL fps", OnOff(g_cfg.showFps));
         row(I_SHOWFG, "Show DLSS-FG fps", OnOff(g_cfg.showFgFps));
         row(I_SHOWFT, "Show frame time / 1% low", OnOff(g_cfg.showFrameTime));
+        row(I_SHOWVRAM, "Show DLSS-G VRAM estimate", OnOff(g_cfg.showVram));
         row(I_MINFPS, "Pause FG below base fps", g_cfg.fgMinFps ? Fmt("%d fps", g_cfg.fgMinFps) : std::string("OFF"));
         row(I_CAP, "Base fps cap (Reflex)", g_cfg.baseFpsLimit ? Fmt("%d fps", g_cfg.baseFpsLimit) : std::string("OFF"));
+        { std::string v = g_cfg.fpsCap == 0 ? "OFF" : g_cfg.fpsCap < 0 ? (g_refreshHz.load() ? Fmt("AUTO  (%d Hz -> %d fps)", g_refreshHz.load(), SnAutoOutCap(g_refreshHz.load())) : std::string("AUTO  (refresh unknown)")) : Fmt("%d fps", g_cfg.fpsCap);
+          int bl = EffectiveBaseLimit(); if (g_cfg.fpsCap != 0 && bl > 0) v += Fmt("  base<=%d", bl); row(I_OUTCAP, "Output fps cap (VRR)", v); }
         row(I_REFLEX, "Reflex sleep (needed by FG)", OnOff(g_cfg.reflexSleep));
+        { static const char* rn[] = { "OFF (not recommended)", "Low latency", "Low latency + Boost" }; row(I_REFLEXMODE, "Reflex mode", rn[g_cfg.reflexMode % 3]); }
         row(I_CAMHOLD, "Keep FG when camera is lost", OnOff(g_cfg.camHold));
         row(I_CUT, "Camera-cut detection", OnOff(g_cfg.cutDetect));
+        row(I_MENUDET, "Full-screen menu detection", OnOff(g_cfg.menuDetect));
+        row(I_DYNRES, "Dynamic resolution (auto-detect)", OnOff(g_cfg.dynRes));
+        { std::string v = g_cfg.hudless == 0 ? "OFF" : g_cfg.hudless == 1 ? Fmt("ON  (draw %d)", g_cfg.hudlessDraw) : g_hc.phase.load() == 4 ? std::string("AUTO: no clear result (see log)") : Fmt("AUTO: learning %d/6 votes", HudCalVotes()); row(I_HUDLESS, "HUD-less capture", v); }
         row(I_POS, "Overlay position", posN[g_cfg.overlayPos & 3]);
         row(I_SCALE, "Overlay size", Fmt("%d%%", g_cfg.overlayScale));
         row(I_OPACITY, "Overlay opacity", Fmt("%d%%", g_cfg.overlayOpacity));
         row(I_REPORT, "Write debug report now", "[Enter]");
+        row(I_BUNDLE, "Create support zip (logs)", "[Enter]");
         row(I_CLOSE, "Close menu", "[Enter]");
         L.push_back({ "", C_TEXT, false });
         L.push_back({ std::string("Up/Down select   Left/Right change   Enter act   ") + KeyNameOf(g_cfg.overlayKey) + "/Esc close", C_GRAY, false });
+        if (g_cfg.fgKey || g_cfg.hudKey) L.push_back({ std::string("Hotkeys (this session): ") + (g_cfg.fgKey ? std::string(KeyNameOf(g_cfg.fgKey)) + " = FG on/off   " : std::string()) + (g_cfg.hudKey ? std::string(KeyNameOf(g_cfg.hudKey)) + " = HUD on/off" : std::string()), C_GRAY, false });
         if (g_cfg.autoSave) { if (g_cfgSaveState.load() < 0) L.push_back({ "Cannot write SN_DLSSG_cfg.txt (read-only folder?)", C_RED, false }); else L.push_back({ "Changes are saved to SN_DLSSG_cfg.txt automatically", C_GRAY, false }); }
         if (!g_ov.msg.empty() && GetTickCount() - g_ov.msgTick < 6000) OvWrap(L, g_ov.msg, g_ov.msgBad ? C_RED : C_GREEN, 58);
     }
@@ -254,7 +298,7 @@ static void OvPanelFree() {
 static bool OvPanelEnsure(int px) {
     if (g_pn.dc && g_pn.px == px) return true;
     OvPanelFree();
-    int cw = (px * 40 + 63) & ~63, ch = px * 46; if (cw > 4096) cw = 4096; if (ch > 4096) ch = 4096;
+    int cw = (px * 40 + 63) & ~63, ch = px * 80; if (cw > 4096) cw = 4096; if (ch > 4096) ch = 4096;
     HDC dc = CreateCompatibleDC(nullptr); if (!dc) return false;
     BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = cw; bi.bmiHeader.biHeight = -ch; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr; HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0); if (!bmp || !bits) { DeleteDC(dc); if (bmp) DeleteObject(bmp); return false; }
@@ -488,6 +532,7 @@ static void Ov_OnPresent(IDXGISwapChain* sc) {
     if (g_cfg.overlay) OvProcessKeys();
     if ((fr % 30) == 0) DiagEvaluate(false);
     CfgPoll();
+    { std::string bm; bool bb = false; if (BundlePoll(bm, bb)) OvSay(bm, bb); }
     if (fr == 5) { try { DiagPreflight(); } catch (...) {} }
     if (!g_cfg.overlay || g_ovBroken) return;
     OvDraw(sc);
