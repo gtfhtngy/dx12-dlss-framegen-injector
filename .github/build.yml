@@ -1,0 +1,18 @@
+name: build
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix unzip
+      - name: Unit tests + camera replay
+        run: sh tests/run_tests.sh
+      - name: Build winmm.dll (MinHook + Streamline headers are fetched by build.sh)
+        run: cd src && sh ./build.sh
+      - name: Upload winmm.dll (the NVIDIA Streamline DLLs are NOT included - see README)
+        uses: actions/upload-artifact@v4
+        with:
+          name: winmm-dll
+          path: src/winmm.dll
