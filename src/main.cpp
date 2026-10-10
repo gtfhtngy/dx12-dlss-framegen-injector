@@ -14,7 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
-#define SN_VERSION "v27"
+#define SN_VERSION "v30"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -1168,7 +1168,7 @@ static UINT g_scW = 0, g_scH = 0;
 static bool g_everOn = false;                         // frame generation has been switched on at least once
 static std::atomic<double> g_fgRatio{ 1.0 };         // measured: frames presented per game frame (2.0 = 2x frame generation)
 static unsigned g_maxGen = 0;                         // numFramesToGenerateMax reported by DLSS-G (0 = not known yet)
-static unsigned g_lastStatus = 0, g_stMinWH = 0; static unsigned long long g_stVramMB = 0; static bool g_haveState = false;
+static unsigned g_lastStatus = 0, g_stMinWH = 0; static unsigned long long g_stVramMB = 0; static bool g_haveState = false; static std::atomic<bool> g_vramReq{ true };   // v30: VRAM estimate is requested only on demand
 static int g_lastTagRes = -1, g_lastConstRes = -1, g_lastOptRes = -1;
 static std::atomic<int> g_busyFrames{ 0 }, g_scene3dFrames{ 0 };   // frames that rendered a lot (3D) / frames with a depth buffer pinned
 static const char* g_whyNot = "starting";            // why frame generation is not on right now (shown in the menu)
@@ -1264,10 +1264,10 @@ static void UpdateRefreshRate(IDXGISwapChain* sc) {
 // v25: also called from the overlay when the base-fps cap is changed in the menu
 static void ApplyReflexOptions(const char* why) {
     if (!p_ReflexSetOptions) return;
-    sl::ReflexOptions ro{}; ro.mode = sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
+    sl::ReflexOptions ro{}; ro.mode = g_cfg.reflexMode == 0 ? sl::ReflexMode::eOff : g_cfg.reflexMode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
     int lim = EffectiveBaseLimit(); g_appliedLimit = lim;
     if (lim > 0) ro.frameLimitUs = (uint32_t)(1000000 / lim);
-    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(LowLatency, base cap=%d fps | basefpslimit=%d fpscap=%d refresh=%d) [%s] -> %d %s", lim, g_cfg.baseFpsLimit, g_cfg.fpsCap, g_refreshHz.load(), why, (int)r, SlStr(r));
+    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(%s, base cap=%d fps | basefpslimit=%d fpscap=%d refresh=%d) [%s] -> %d %s", SnReflexModeName(g_cfg.reflexMode), lim, g_cfg.baseFpsLimit, g_cfg.fpsCap, g_refreshHz.load(), why, (int)r, SlStr(r));
 }
 static bool InitSlRuntime() {
     if (g_slRuntimeOk) return true;
@@ -1410,6 +1410,8 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         const D3D12_RESOURCE_DESC& vd = cachedVd; ext.width = (uint32_t)vd.Width; ext.height = vd.Height;
         const uint32_t bufW = ext.width, bufH = ext.height;   // v20: tagged extent = real view rect (top-left of the buffer); the buffer size itself stays the allocation size
         { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (uint32_t)gw <= bufW && (uint32_t)gh <= bufH) { ext.width = (uint32_t)gw; ext.height = (uint32_t)gh; } }
+        static uint32_t s_pw = 0, s_ph = 0; static int s_extChg = 0;   // v30: count real changes of the view extent (dynamic-resolution detection)
+        if ((s_pw || s_ph) && (ext.width != s_pw || ext.height != s_ph)) s_extChg++; s_pw = ext.width; s_ph = ext.height;
         sl::Resource rDepth(sl::ResourceType::eTex2d, g_depthOut, (uint32_t)kOutState);
         sl::Resource rMv(sl::ResourceType::eTex2d, g_mvOut, (uint32_t)kOutState);
         sl::Resource rHud(sl::ResourceType::eTex2d, g_hudless, (uint32_t)D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1424,6 +1426,10 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         static int s_r = 0; if (s_r < 4 || r1 != sl::Result::eOk || r2 != sl::Result::eOk) { if (s_r < 40) Log("frame=%d tags(%u)=%d %s constants=%d %s hud=%d", fr, nt, (int)r1, SlStr(r1), (int)r2, SlStr(r2), (int)(nt == 3)); s_r++; }
         opt.mode = sl::DLSSGMode::eOn; opt.numFramesToGenerate = (uint32_t)(g_cfg.mult - 1);
         opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        if (g_cfg.menuDetect) opt.flags = opt.flags | sl::DLSSGFlags::eEnableFullscreenMenuDetection;                       // v29
+        // v30: dynres=1 is automatic - the flag is only sent after the view rect has really changed 3+ times (a fixed-resolution game never gets it: Streamline documents a performance / quality loss then)
+        if (g_cfg.dynRes && s_extChg >= 3) { opt.flags = opt.flags | sl::DLSSGFlags::eDynamicResolutionEnabled; opt.dynamicResWidth = ext.width; opt.dynamicResHeight = ext.height;
+            static bool s_dl = false; if (!s_dl) { s_dl = true; Log("dynres: view rect keeps changing (%d changes) -> eDynamicResolutionEnabled sent", s_extChg); } }
         { DXGI_SWAP_CHAIN_DESC sd = {}; if (SUCCEEDED(sc->GetDesc(&sd))) { opt.numBackBuffers = sd.BufferCount; opt.colorWidth = sd.BufferDesc.Width; opt.colorHeight = sd.BufferDesc.Height; opt.colorBufferFormat = (uint32_t)sd.BufferDesc.Format; } }
         opt.mvecDepthWidth = bufW; opt.mvecDepthHeight = bufH; opt.mvecBufferFormat = (uint32_t)DXGI_FORMAT_R16G16_FLOAT; opt.depthBufferFormat = (uint32_t)DXGI_FORMAT_R32_FLOAT;
         g_wasOn = true; g_everOn = true; g_lastOnFrame = fr;
@@ -1439,7 +1445,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         sl::DLSSGState st{}; sl::Result rs = p_DLSSGGetState(vp, st, nullptr);
         static unsigned s_lastStatus = 0xFFFFFFFFu; bool chg = rs == sl::Result::eOk && (unsigned)st.status != s_lastStatus; if (rs == sl::Result::eOk) s_lastStatus = (unsigned)st.status;
         if (rs == sl::Result::eOk) {
-            g_maxGen = st.numFramesToGenerateMax; g_haveState = true; g_lastStatus = (unsigned)st.status; g_stMinWH = st.minWidthOrHeight; g_stVramMB = st.estimatedVRAMUsageInBytes >> 20;
+            g_maxGen = st.numFramesToGenerateMax; g_haveState = true; g_lastStatus = (unsigned)st.status; g_stMinWH = st.minWidthOrHeight; if (st.estimatedVRAMUsageInBytes) g_stVramMB = st.estimatedVRAMUsageInBytes >> 20;
             // v25: numFramesActuallyPresented = frames DLSS-G presented for the latest game frame (1 = base only, 2 = 2x ...; verified against a real log: presented=2 at 98 real fps)
             if (opt.mode == sl::DLSSGMode::eOn && st.status == sl::DLSSGStatus::eOk && st.numFramesActuallyPresented > 0 && g_wasOn && OvForegroundIsUs()) /* unfocused window: Streamline pauses interpolation itself */ { double m = (double)st.numFramesActuallyPresented; if (m > 8.0) m = 8.0; double o = g_fgRatio.load(); g_fgRatio.store(o <= 1.01 ? m : o + (m - o) * 0.5); }
             else if (opt.mode != sl::DLSSGMode::eOn) g_fgRatio.store(1.0);
@@ -1448,6 +1454,12 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         else if (rs == sl::Result::eOk) { Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
         else Log("slDLSSGGetState -> %d %s", (int)rs, SlStr(rs));
         g_stateLog++;
+    }
+    // v30: the VRAM estimate is expensive (Streamline: "too expensive to do per frame") -> ask for it ONCE per FG start / size change / menu toggle, never every frame
+    if (g_cfg.showVram && p_DLSSGGetState && inputs && opt.mode == sl::DLSSGMode::eOn && fr > g_cfg.warmup) {
+        static uint64_t s_vk = 0; uint64_t vk = ((uint64_t)opt.colorWidth * 73856093ull) ^ ((uint64_t)opt.colorHeight * 19349663ull) ^ ((uint64_t)opt.mvecDepthWidth * 83492791ull) ^ ((uint64_t)opt.mvecDepthHeight * 2654435761ull) ^ ((uint64_t)opt.numFramesToGenerate << 5) ^ opt.numBackBuffers;
+        if (g_vramReq.exchange(false) || vk != s_vk) { s_vk = vk; sl::DLSSGOptions eo = opt; eo.flags = eo.flags | sl::DLSSGFlags::eRequestVRAMEstimate; sl::DLSSGState vs{};
+            if (p_DLSSGGetState(vp, vs, &eo) == sl::Result::eOk && vs.estimatedVRAMUsageInBytes) { g_stVramMB = vs.estimatedVRAMUsageInBytes >> 20; Log("DLSS-G VRAM estimate: %llu MB (one-off query)", (unsigned long long)g_stVramMB); } }
     }
     if (!g_wasOn) g_fgRatio.store(1.0);
     if (g_slRuntimeOk && (fr % 30) == 0 && EffectiveBaseLimit() != g_appliedLimit) ApplyReflexOptions("fps cap / state change");   // v27
