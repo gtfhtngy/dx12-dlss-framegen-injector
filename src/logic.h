@@ -16,6 +16,14 @@
 struct SnPreset { int fgMinFps, fgDelay, camStale, mult; };
 enum { SN_PRESET_CUSTOM = 0, SN_PRESET_QUALITY = 1, SN_PRESET_BALANCED = 2, SN_PRESET_PERFORMANCE = 3, SN_PRESET_COUNT = 4 };
 static inline std::string SnLower(const std::string& s) { std::string r = s; for (auto& c : r) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a'); return r; }
+// v29: Reflex mode name <-> id. 0 = off, 1 = low latency (default / only mode before v29), 2 = low latency + boost
+static inline int SnReflexModeParse(const char* s) {
+    std::string t; for (; s && *s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n'; s++) t += *s; t = SnLower(t);
+    if (t == "off" || t == "0") return 0;
+    if (t == "boost" || t == "lowlatencyboost" || t == "lowlatencywithboost" || t == "2") return 2;
+    return 1;
+}
+static inline const char* SnReflexModeName(int m) { return m == 0 ? "off" : m == 2 ? "boost" : "lowlatency"; }
 static inline int SnPresetParse(const char* s) {
     std::string t; for (; s && *s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n'; s++) t += *s; t = SnLower(t);
     if (t == "quality") return SN_PRESET_QUALITY; if (t == "balanced") return SN_PRESET_BALANCED; if (t == "performance") return SN_PRESET_PERFORMANCE;
