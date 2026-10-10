@@ -69,6 +69,11 @@ struct Cfg {
     int crashDump = 1;       // 1 = mini-dump + summary next to the exe when a crash happens in this injector / Streamline / the driver (or an unhandled crash)
     int engine = 0;          // detected only when the config is created (4 / 5 / 0 = unknown), info only
     int autoLearn = 1;       // 1 = scan results (projoff/noaaoff/mvoff, hudless=2 result) are written back to the config
+    // ---- v29
+    int menuDetect = 0;      // 1 = DLSS-G flag eEnableFullscreenMenuDetection (DLSS-G recognises full-screen menus / loading screens itself and stops generating there)
+    int dynRes = 0;          // 1 = DLSS-G flag eDynamicResolutionEnabled (+ dynamicResWidth/Height = current view rect): for games whose render resolution changes while playing
+    int reflexMode = 1;      // 0 = off | 1 = low latency (before v29 the only mode) | 2 = low latency + boost.  FG needs Reflex markers; "off" is not recommended while FG runs
+    int showVram = 0;        // HUD line: VRAM that DLSS-G itself reports (estimatedVRAMUsageInBytes). Turning it on also sets eRequestVRAMEstimate
     std::wstring slDir;      // folder with sl.interposer.dll etc. (default: next to the game exe)
 } g_cfg;
 
@@ -197,6 +202,8 @@ static void LoadCfg() {
             else if (!strcmp(k, "fpscap")) { std::string lv = SnLower(v); g_cfg.fpsCap = (lv.compare(0, 4, "auto") == 0) ? -1 : (lv.compare(0, 3, "off") == 0 ? 0 : std::max(0, iv)); }
             else if (!strcmp(k, "fgkey")) g_cfg.fgKey = ParseKeyName(v); else if (!strcmp(k, "hudkey")) g_cfg.hudKey = ParseKeyName(v);
             else if (!strcmp(k, "anticheat")) g_cfg.antiCheat = iv ? 1 : 0; else if (!strcmp(k, "crashdump")) g_cfg.crashDump = iv ? 1 : 0; else if (!strcmp(k, "autolearn")) g_cfg.autoLearn = iv ? 1 : 0;
+            else if (!strcmp(k, "menudetect")) g_cfg.menuDetect = iv ? 1 : 0; else if (!strcmp(k, "dynres")) g_cfg.dynRes = iv ? 1 : 0;
+            else if (!strcmp(k, "reflexmode")) g_cfg.reflexMode = SnReflexModeParse(v); else if (!strcmp(k, "showvram")) g_cfg.showVram = iv ? 1 : 0;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
             else if (!strcmp(k, "overlay")) g_cfg.overlay = iv ? 1 : 0; else if (!strcmp(k, "overlaykey")) g_cfg.overlayKey = ParseKeyName(v);
             else if (!strcmp(k, "showfps")) g_cfg.showFps = iv ? 1 : 0; else if (!strcmp(k, "showfgfps")) g_cfg.showFgFps = iv ? 1 : 0; else if (!strcmp(k, "showframetime")) g_cfg.showFrameTime = iv ? 1 : 0;
@@ -218,6 +225,9 @@ static void LoadCfg() {
     if (g_cfg.hudless < 0 || g_cfg.hudless > 2) g_cfg.hudless = 0; if (g_cfg.fpsCap < -1) g_cfg.fpsCap = 0; if (g_cfg.fpsCap > 1000) g_cfg.fpsCap = 1000;
     if (g_cfg.fgKey == g_cfg.overlayKey) g_cfg.fgKey = 0; if (g_cfg.hudKey == g_cfg.overlayKey || g_cfg.hudKey == g_cfg.fgKey) g_cfg.hudKey = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG v30 = v29 with performance fixes: VRAM estimate only on demand (was per frame), dynamic-resolution flag only when the view rect really changes");
+    Log("SN_DLSSG v29 = v28 + DLSS-G options: full-screen menu detection, dynamic resolution flag, Reflex mode (off / low latency / boost), DLSS-G VRAM estimate in the HUD");
+    Log("CFG v29 menudetect=%d dynres=%d reflexmode=%s showvram=%d", g_cfg.menuDetect, g_cfg.dynRes, SnReflexModeName(g_cfg.reflexMode), g_cfg.showVram);
     Log("SN_DLSSG v28 = v27 + micro-stutter fixes: HUD-less capture only on the real swap-chain back buffer (stale pointer cache re-created the HUD-less texture hundreds of times), no FG history reset on same-size depth swap / short camera hold");
     Log("SN_DLSSG v27 = v26 + presets, output fps cap (VRR), hotkeys, hudless=2 auto detection, anti-cheat guard, crash mini-dumps + support zip, auto-saved scan results");
     Log("CFG v27 preset=%s fpscap=%d fgkey=%s hudkey=%s hudless=%d anticheat=%d crashdump=%d autolearn=%d", SnPresetName(g_cfg.preset), g_cfg.fpsCap, KeyNameOf(g_cfg.fgKey), KeyNameOf(g_cfg.hudKey), g_cfg.hudless, g_cfg.antiCheat, g_cfg.crashDump, g_cfg.autoLearn);
