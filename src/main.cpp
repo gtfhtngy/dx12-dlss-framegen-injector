@@ -14,6 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
+#define SN_VERSION "v27"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -46,6 +47,8 @@
 #include <sl_pcl.h>
 
 // ------------------------------------------------------------------ winmm forwarding (same as FG v5)
+#include "logic.h"      // v27: pure helpers (presets, fps cap, hudless decision, anti-cheat names, zip ...)
+#include "camcore.h"    // v27: pure view-buffer scan core (also used by tests/replay_viewbuf.cpp)
 #include "winmm_stubs.inc"
 extern "C" { void* g_fwd[WINMM_EXPORT_COUNT]; }
 static HMODULE g_realWinmm = nullptr;
@@ -69,198 +72,7 @@ static D3D12_COMMAND_QUEUE_DESC QDesc(ID3D12CommandQueue* q) { return VRet<D3D12
 static D3D12_CPU_DESCRIPTOR_HANDLE CpuStart(ID3D12DescriptorHeap* h) { return VRet<D3D12_CPU_DESCRIPTOR_HANDLE>(h, 9); }
 static D3D12_GPU_DESCRIPTOR_HANDLE GpuStart(ID3D12DescriptorHeap* h) { return VRet<D3D12_GPU_DESCRIPTOR_HANDLE>(h, 10); }
 
-// ------------------------------------------------------------------ config / log
-struct Cfg {
-    int fg = 1;              // master switch
-    int mult = 2;            // output frames per game frame (2 = numFramesToGenerate 1). Clamped to what the GPU supports
-    int stage = 2;           // 0 = pass-through (no Streamline), 1 = Streamline init + support query only, 2 = frame generation, (hudless is separate)
-    int log = 1;
-    int hudless = 0;         // 1 = copy the back buffer right before the Nth draw into it and tag it as HUD-less
-    int hudlessDraw = 2;     // N for hudless=1 (draw calls that target the back buffer, counted per frame)
-    int renderW = 2000, renderH = 1124, tol = 100;  // internal render resolution of the game (same defaults as the DLAA project). v18: renderw=0 = AUTO (UE5 / TSR / any screen percentage: same aspect as the swap chain, 1/4x..2x of its size)
-    int mvOff = 492;         // float index of ClipToPrevClip in the UE4 view uniform buffer (same as DLAA 'mvoff')
-    int noAAOff = 132;       // float index of ViewToClipNoAA
-    int projOff = 116;       // float index of ViewToClip (jittered)
-    int jitSX = 1, jitSY = 1, mvSX = 1, mvSY = 1;
-    int velFallback = 1;     // v19: 1 = if no velocity buffer is found for velwait frames, run frame generation with camera-only motion vectors (all-zero dummy velocity -> the MV shader derives MVs from depth + ClipToPrevClip)
-    int velWait = 90;        // v19: frames to wait for a real velocity buffer before the dummy is used (a real one found later replaces the dummy)
-    int velFmt = 0;          // v19: extra DXGI_FORMAT number accepted as velocity target: 34=R16G16_FLOAT 37=R16G16_SNORM 16=R32G32_FLOAT 15=R32G32_TYPELESS (0 = none). See the census lines in the log
-    int viewRect = 1;        // v20: 1 = use the REAL view rect (viewport the game renders the scene depth with) instead of the whole depth/velocity buffer (dynamic resolution: buffer > view rect -> stale L-shaped band at the bottom/right edge)
-    int cutThresh100 = 120;  // v23: camera-cut guard fires only if ClipToPrevClip deviates from identity by >= cutthresh/100 (v22 used 0.25 -> fired on every fast camera turn in Code Vein)
-    int cutFov = 8;          // v23: ... or the projection (FOV) changes by >= cutfov percent between two frames (v22: 2)
-    int cutDetect = 1;       // v22: 1 = detect camera cuts / FOV jumps / huge ClipToPrevClip jumps (Special Shots, cutscenes) and pause frame generation for a few frames + reset history
-    int c2pAuto = 1;         // v21: 1 = if the locked ClipToPrevClip candidate never moves while another identity-like candidate clearly does, switch to that one (log: "c2p-monitor: SWITCH")
-    int c2pIdx = 0;          // v18 (UE5): which identity-like matrix after ViewToClipNoAA is ClipToPrevClip (0 = first, like UE4). The log lists them ("cam-scan: identity-like matrices ...")
-    int warmup = 150;        // frames to wait before enabling
-    int psoRetry = 1;        // v17: 1 = if the GAME's CreateGraphicsPipelineState fails with E_INVALIDARG, log the full desc and retry once without CachedPSO
-    int camStale = 30;       // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view). v16: 6 -> 30 (short hitches no longer toggle FG)
-    int farPlane = 1000000;
-    int camAuto = 1;         // 1 = if the view buffer is not found at projoff/noaaoff/mvoff, scan the buffer and lock onto the real offsets (other UE4 games)
-    int reflexSleep = 1;     // 1 = call slReflexSleep every frame (needed for DLSS-G pacing)
-    int baseFpsLimit = 0;    // Reflex frame limiter for the BASE frame rate (needs reflexsleep=1)
-    int showConsole = 0;     // only works with the 'development' Streamline DLLs
-    int fgMinFps = 0;        // >0: switch frame generation OFF while the BASE fps stays below this value (busy scenes), back ON when it recovers
-    int fgDelay = 30;        // frames the camera must be valid IN A ROW before frame generation is (re)enabled (stops on/off flapping during loading/fades)
-    int camHold = 1;         // v24: 1 = if the camera view buffer is lost while frame generation is running, KEEP frame generation on (last projection, identity ClipToPrevClip = optical flow only) instead of switching it off for the rest of the session
-    int camHoldMax = 7200;   // v24: max frames to hold without a camera (then FG is switched off like before)
-    int camRescan = 90;      // v24: frames without camera before the tracker re-scans the view buffer with relaxed checks (0 = never)
-    int reflexAlways = 0;    // v24: 1 = call slReflexSleep even while frame generation is off/paused (v23 did, and slept ~20 ms per frame at the 9 fps start of the game for nothing)
-    int fgMinBackoff = 1;    // v24: 1 = every FG pause by fgminfps doubles the time the base fps must stay good before FG resumes (stops the on/off flapping = 100+ ms hitch per switch)
-    int bufMaxMB = 192;      // upper bound for upload buffers kept alive by the camera tracker (texture-streaming staging buffers are huge during loads)
-    int reflexPlace = 0;     // 1 = call slReflexSleep + SimulationStart at the START of the game frame (end of the previous Present) instead of inside Present
-    int ngxLog = 0;
-    int shaderCache = 1;     // 1 = build shaders before the game starts and keep them in SN_DLSSG_shaders.snsc (no run-time compile hitch)
-    int splash = 1;          // 1 = show the progress window while the cache is being built (only when something has to be built)
-    // ---- v26: game pipeline cache
-    int psoCache = 1;        // 1 = persistent cache for the GAME's own pipeline states (graphics + compute): every shader is compiled by the driver only once (SN_DLSSG_psocache.bin)
-    int psoCacheMB = 384;    // upper bound for the pipeline cache (kept in RAM while the game runs)
-    // ---- v25: in-game overlay / menu, compatibility diagnostics
-    int overlay = 1;         // 1 = overlay + menu available (hotkey), 0 = never draw anything, never hook the keyboard
-    int overlayKey = 0x2D;   // virtual-key code that opens/closes the menu (cfg: overlaykey=INSERT / F10 / HOME / 0x2D ...)
-    int showFps = 0;         // HUD line: real (base) FPS = how fast the GAME renders
-    int showFgFps = 0;       // HUD line: DLSS-FG output FPS (base FPS x generated frames)
-    int showFrameTime = 0;   // HUD lines: frame time + 1% low
-    int overlayPos = 0;      // 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right
-    int overlayScale = 100;  // percent
-    int overlayOpacity = 80; // percent (background)
-    int overlayBlock = 1;    // 1 = while the menu is open, swallow the menu keys so the game does not see them
-    int overlayHook = 1;     // 1 = low-level keyboard hook (never misses a key press, can swallow keys); 0 = polling inside Present only
-    int autoSave = 1;        // 1 = every change made in the menu is written back to SN_DLSSG_cfg.txt
-    int autoReport = 1;      // 1 = write SN_DLSSG_DEBUG_REPORT.txt + show a notice when frame generation cannot work in this game
-    int msgBox = 1;          // 1 = if the overlay cannot be drawn (DX11 game, ...) show a one-time message box for a fatal incompatibility
-    std::wstring slDir;      // folder with sl.interposer.dll etc. (default: next to the game exe)
-} g_cfg;
-
-static std::wstring g_dir;
-static FILE* g_log = nullptr;
-static std::mutex g_logMx;
-static size_t g_logBytes = 0; static DWORD g_lastFlush = 0;
-static void LogFlush() { if (!g_log) return; std::lock_guard<std::mutex> lk(g_logMx); fflush(g_log); }
-// v25: the last log lines are ALSO kept in memory (even with log=0) so the debug report can contain them
-static std::mutex g_ringMx; static std::vector<std::string> g_logRing; static size_t g_logRingPos = 0; static const size_t kLogRingMax = 400;
-static void Log(const char* fmt, ...) {
-    char buf[1536];
-    va_list ap; va_start(ap, fmt); int n = vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    if (n < 0) return; if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
-    { std::lock_guard<std::mutex> rk(g_ringMx);
-      if (g_logRing.size() < kLogRingMax) g_logRing.emplace_back(buf, (size_t)n); else { g_logRing[g_logRingPos] = std::string(buf, (size_t)n); g_logRingPos = (g_logRingPos + 1) % kLogRingMax; } }
-    if (!g_log) return;
-    std::lock_guard<std::mutex> lk(g_logMx);
-    if (g_logBytes > (24u << 20)) return;                 // never let the log grow without bound in long sessions
-    fwrite(buf, 1, (size_t)n, g_log); fputc('\n', g_log);
-    g_logBytes += (size_t)n + 1;
-    DWORD now = GetTickCount(); if (now - g_lastFlush > 1000) { fflush(g_log); g_lastFlush = now; }   // flushing every line stalls the render thread
-}
-static std::vector<std::string> LogRingSnapshot() {
-    std::lock_guard<std::mutex> rk(g_ringMx); std::vector<std::string> out; out.reserve(g_logRing.size());
-    if (g_logRing.size() < kLogRingMax) out = g_logRing; else for (size_t i = 0; i < kLogRingMax; i++) out.push_back(g_logRing[(g_logRingPos + i) % kLogRingMax]);
-    return out;
-}
-static void LogW(const wchar_t* w) {
-    if (!g_log) return; char b[1024]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, nullptr, nullptr); Log("%s", b);
-}
-// "INSERT", "F10", "HOME", "A", "0x2D", "45" ... -> virtual-key code (0 = none)
-static int ParseKeyName(const char* in) {
-    char t[48]; size_t n = 0; while (*in == ' ' || *in == '\t') in++;
-    for (; *in && *in != ' ' && *in != '\t' && *in != '\r' && *in != '\n' && n + 1 < sizeof t; in++) t[n++] = (char)toupper((unsigned char)*in);
-    t[n] = 0; if (!n) return 0;
-    struct { const char* n; int vk; } tbl[] = { {"NONE",0},{"INSERT",0x2D},{"INS",0x2D},{"DELETE",0x2E},{"DEL",0x2E},{"HOME",0x24},{"END",0x23},{"PAGEUP",0x21},{"PGUP",0x21},{"PAGEDOWN",0x22},{"PGDN",0x22},
-        {"PAUSE",0x13},{"SCROLL",0x91},{"SCROLLLOCK",0x91},{"TAB",0x09},{"BACKSPACE",0x08},{"CAPSLOCK",0x14},{"NUMLOCK",0x90},{"PRINTSCREEN",0x2C},
-        {"NUMPAD0",0x60},{"NUMPAD1",0x61},{"NUMPAD2",0x62},{"NUMPAD3",0x63},{"NUMPAD4",0x64},{"NUMPAD5",0x65},{"NUMPAD6",0x66},{"NUMPAD7",0x67},{"NUMPAD8",0x68},{"NUMPAD9",0x69},
-        {"MULTIPLY",0x6A},{"ADD",0x6B},{"SUBTRACT",0x6D},{"DIVIDE",0x6F},{"GRAVE",0xC0},{"TILDE",0xC0} };
-    for (auto& e : tbl) if (!strcmp(t, e.n)) return e.vk;
-    if (t[0] == 'F' && t[1] >= '0' && t[1] <= '9') { int f = atoi(t + 1); if (f >= 1 && f <= 24) return 0x6F + f; }
-    if (n == 1 && ((t[0] >= 'A' && t[0] <= 'Z') || (t[0] >= '0' && t[0] <= '9'))) return t[0];
-    char* e = nullptr; long v = strtol(t, &e, 0); if (e && !*e && v > 0 && v < 256) return (int)v;
-    return 0x2D;   // unknown name -> default
-}
-static const char* KeyNameOf(int vk) {
-    static char b[16];
-    switch (vk) { case 0: return "NONE"; case 0x2D: return "INSERT"; case 0x2E: return "DELETE"; case 0x24: return "HOME"; case 0x23: return "END"; case 0x21: return "PAGEUP"; case 0x22: return "PAGEDOWN"; case 0x13: return "PAUSE"; case 0x91: return "SCROLL"; case 0xC0: return "GRAVE"; default: break; }
-    if (vk >= 0x70 && vk <= 0x87) { snprintf(b, sizeof b, "F%d", vk - 0x6F); return b; }
-    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) { snprintf(b, sizeof b, "%c", vk); return b; }
-    snprintf(b, sizeof b, "0x%02X", vk); return b;
-}
-static void LoadCfg() {
-    std::wstring p = g_dir + L"\\SN_DLSSG_cfg.txt";
-    FILE* f = _wfopen(p.c_str(), L"r");
-    if (!f) {
-        f = _wfopen(p.c_str(), L"w");
-        if (f) {
-            fprintf(f,
-                "# Scarlet Nexus - DLSS Frame Generation (Streamline) config\n"
-                "# fg        : 1 = on, 0 = off\n"
-                "# mult      : 2 = 2x (1 generated frame). 3/4 need an RTX 50 series card (clamped automatically)\n"
-                "# stage     : 0 = pass-through, 1 = only init Streamline + log feature support, 2 = full frame generation\n"
-                "# log       : 1 = write SN_DLSSG_log.txt + Streamline log files next to the exe\n"
-                "# hudless   : 1 = experimental HUD-less capture (copy of the back buffer right before the Nth draw to it)\n"
-                "# hudlessdraw: N for hudless=1 (try 2,3,4,... until UI artifacts disappear; see log 'bbdraws')\n"
-                "# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance. renderw=0 renderh=0 = AUTO (recommended for UE5 / TSR / dynamic screen percentage)\n# c2pidx    : v18 (UE5) which identity-like matrix after ViewToClipNoAA is ClipToPrevClip (0 = first). Only used by the automatic camera scan\n"
-                "# camauto   : 1 = (default) automatically find the camera matrices in the UE4 view buffer when projoff/noaaoff/mvoff do not match this game (log: cam-scan LOCKED ...)\n# projoff/noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 in Scarlet Nexus)\n# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)\n"
-                "# warmup    : frames before frame generation is switched on\n"
-                "# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)\n"
-                "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
-                "# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)\n"
-                "# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)\n"
-                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n"
-                "# ---- v25 overlay / menu (press the overlay key in game; arrows + Enter, changes are saved here automatically)\n"
-                "# overlay      : 1 = overlay + menu available, 0 = completely off\n# overlaykey   : key that opens/closes the menu: INSERT (default), F1..F12, HOME, END, PAGEUP, ... or a virtual-key number like 0x2D\n"
-                "# showfps      : 1 = show the REAL fps (how fast the game itself renders)\n# showfgfps    : 1 = show the DLSS Frame Generation output fps\n# showframetime: 1 = show frame time + 1%% low\n"
-                "# overlaypos   : 0 = top-left 1 = top-right 2 = bottom-left 3 = bottom-right ; overlayscale / overlayopacity in percent\n"
-                "# overlayblock : 1 = while the menu is open the menu keys are NOT sent to the game ; overlayhook=0 = no keyboard hook (polling only)\n"
-                "# autosave     : 1 = changes made in the menu are written back to this file ; autoreport=1 = write SN_DLSSG_DEBUG_REPORT.txt when FG cannot work\n"
-                "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n"
-                "# ---- v26: psocache = persistent cache of the GAME's pipelines (SN_DLSSG_psocache.bin)\n"
-                "psocache=1\npsocachemb=384\n");
-            fclose(f);
-        }
-    } else {
-        char line[512];
-        while (fgets(line, sizeof line, f)) {
-            char k[64], v[400] = {};
-            if (line[0] == '#') continue;
-            if (sscanf(line, " %63[^=]=%399[^\r\n]", k, v) < 1) continue;
-            int iv = atoi(v);
-            if (!strcmp(k, "fg")) g_cfg.fg = iv; else if (!strcmp(k, "mult")) g_cfg.mult = iv; else if (!strcmp(k, "stage")) g_cfg.stage = iv;
-            else if (!strcmp(k, "log")) g_cfg.log = iv; else if (!strcmp(k, "hudless")) g_cfg.hudless = iv; else if (!strcmp(k, "hudlessdraw")) g_cfg.hudlessDraw = iv;
-            else if (!strcmp(k, "renderw")) g_cfg.renderW = iv; else if (!strcmp(k, "renderh")) g_cfg.renderH = iv; else if (!strcmp(k, "tol")) g_cfg.tol = iv;
-            else if (!strcmp(k, "mvoff")) g_cfg.mvOff = iv; else if (!strcmp(k, "noaaoff")) g_cfg.noAAOff = iv; else if (!strcmp(k, "projoff")) g_cfg.projOff = iv;
-            else if (!strcmp(k, "velfallback")) g_cfg.velFallback = iv; else if (!strcmp(k, "velwait")) g_cfg.velWait = iv; else if (!strcmp(k, "velfmt")) g_cfg.velFmt = iv; else if (!strcmp(k, "c2pidx")) g_cfg.c2pIdx = iv; else if (!strcmp(k, "viewrect")) g_cfg.viewRect = iv ? 1 : 0; else if (!strcmp(k, "c2pauto")) g_cfg.c2pAuto = iv ? 1 : 0; else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
-            else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "psoretry")) g_cfg.psoRetry = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv; else if (!strcmp(k, "camauto")) g_cfg.camAuto = iv;
-            else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
-            else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
-            else if (!strcmp(k, "fgminfps")) g_cfg.fgMinFps = iv; else if (!strcmp(k, "reflexplace")) g_cfg.reflexPlace = iv;
-            else if (!strcmp(k, "camhold")) g_cfg.camHold = iv ? 1 : 0; else if (!strcmp(k, "camholdmax")) g_cfg.camHoldMax = iv; else if (!strcmp(k, "camrescan")) g_cfg.camRescan = iv; else if (!strcmp(k, "reflexalways")) g_cfg.reflexAlways = iv ? 1 : 0; else if (!strcmp(k, "fgminbackoff")) g_cfg.fgMinBackoff = iv ? 1 : 0;
-            else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
-            else if (!strcmp(k, "cutdetect")) g_cfg.cutDetect = iv ? 1 : 0; else if (!strcmp(k, "cutthresh")) g_cfg.cutThresh100 = iv; else if (!strcmp(k, "cutfov")) g_cfg.cutFov = iv; else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
-            else if (!strcmp(k, "psocache")) g_cfg.psoCache = iv ? 1 : 0; else if (!strcmp(k, "psocachemb")) g_cfg.psoCacheMB = iv;
-            else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
-            else if (!strcmp(k, "overlay")) g_cfg.overlay = iv ? 1 : 0; else if (!strcmp(k, "overlaykey")) g_cfg.overlayKey = ParseKeyName(v);
-            else if (!strcmp(k, "showfps")) g_cfg.showFps = iv ? 1 : 0; else if (!strcmp(k, "showfgfps")) g_cfg.showFgFps = iv ? 1 : 0; else if (!strcmp(k, "showframetime")) g_cfg.showFrameTime = iv ? 1 : 0;
-            else if (!strcmp(k, "overlaypos")) g_cfg.overlayPos = iv; else if (!strcmp(k, "overlayscale")) g_cfg.overlayScale = iv; else if (!strcmp(k, "overlayopacity")) g_cfg.overlayOpacity = iv;
-            else if (!strcmp(k, "overlayblock")) g_cfg.overlayBlock = iv ? 1 : 0; else if (!strcmp(k, "overlayhook")) g_cfg.overlayHook = iv ? 1 : 0;
-            else if (!strcmp(k, "autosave")) g_cfg.autoSave = iv ? 1 : 0; else if (!strcmp(k, "autoreport")) g_cfg.autoReport = iv ? 1 : 0; else if (!strcmp(k, "msgbox")) g_cfg.msgBox = iv ? 1 : 0;
-        }
-        fclose(f);
-    }
-    if (g_cfg.mult < 2) g_cfg.mult = 2;
-    if (g_cfg.velFmt != 15 && g_cfg.velFmt != 16 && g_cfg.velFmt != 34 && g_cfg.velFmt != 37) g_cfg.velFmt = 0;
-    if (g_cfg.velWait < 0) g_cfg.velWait = 0;
-    if (g_cfg.c2pIdx < 0) g_cfg.c2pIdx = 0; if (g_cfg.c2pIdx > 3) g_cfg.c2pIdx = 3;
-    if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
-    if (g_cfg.overlayPos < 0 || g_cfg.overlayPos > 3) g_cfg.overlayPos = 0;
-    g_cfg.overlayScale = std::min(250, std::max(50, g_cfg.overlayScale)); g_cfg.overlayOpacity = std::min(100, std::max(20, g_cfg.overlayOpacity));
-    g_cfg.psoCacheMB = std::min(4096, std::max(32, g_cfg.psoCacheMB));
-    if (g_cfg.fgMinFps < 0) g_cfg.fgMinFps = 0; if (g_cfg.baseFpsLimit < 0) g_cfg.baseFpsLimit = 0;
-    if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
-    Log("SN_DLSSG v26 = v25 + persistent game pipeline (PSO) cache");
-    Log("CFG v26 psocache=%d psocachemb=%d", g_cfg.psoCache, g_cfg.psoCacheMB);
-    Log("SN_DLSSG v25 = v24 + in-game overlay/menu (key %s), FPS / DLSS-FG FPS HUD, auto config save, compatibility check + debug report, safe start-up optimisations", KeyNameOf(g_cfg.overlayKey));
-    Log("SN_DLSSG v24 (v23 + camera-registry LRU eviction (fixes FG lost after a level load), camera re-scan + hold, async buffer release, no useless Reflex sleep, FG-pause backoff) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
-    Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
-    Log("CFG v24 camhold=%d camholdmax=%d camrescan=%d reflexalways=%d fgminbackoff=%d fgminfps=%d bufmaxmb=%d", g_cfg.camHold, g_cfg.camHoldMax, g_cfg.camRescan, g_cfg.reflexAlways, g_cfg.fgMinBackoff, g_cfg.fgMinFps, g_cfg.bufMaxMB);
-    Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d%s mvoff=%d c2pidx=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.renderW <= 0 ? " (AUTO)" : "", g_cfg.mvOff, g_cfg.c2pIdx, g_cfg.warmup);
-}
+#include "config.inc"   // v27: Cfg struct, Log, key names, LoadCfg
 
 static LONG CALLBACK DiagVEH(PEXCEPTION_POINTERS ep) {
     DWORD c = ep->ExceptionRecord->ExceptionCode;
@@ -561,16 +373,8 @@ static void RegisterUploadBuf(ID3D12Resource* r) {
 }
 static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0}, g_projSeen{0}, g_scanRuns{0}; static std::atomic<int> g_camLocked{0};
 static std::atomic<int> g_lastJitFrame{-1000};
-static bool IsProj(const float* m, bool loose) {
-    float ref = (float)EffW() / (float)EffH(); float asp = m[5] / m[0];
-    bool aspOk = loose ? (asp > 1.2f && asp < 3.8f) : fabsf(asp - ref) < 0.03f;   // v18: 3.8 (was 2.6) = 32:9 super-ultrawide
-    return m[0] > 0.2f && m[5] > 0.2f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f && m[4] == 0.f && m[6] == 0.f && m[7] == 0.f
-        && fabsf(m[11]) == 1.f && m[12] == 0.f && m[13] == 0.f && m[15] == 0.f && aspOk;
-}
-static bool LooksLikeC2P(const float* c) {
-    for (int i = 0; i < 16; i++) if (!std::isfinite(c[i]) || fabsf(c[i]) > 4.f) return false;
-    return fabsf(c[0] - 1.f) < 0.5f && fabsf(c[5] - 1.f) < 0.5f && fabsf(c[10] - 1.f) < 0.5f && fabsf(c[15] - 1.f) < 0.5f;
-}
+static bool IsProj(const float* m, bool loose) { return CamIsProj(m, loose, (float)EffW() / (float)EffH()); }   // v27: pure part lives in camcore.h
+static bool LooksLikeC2P(const float* c) { return CamLooksLikeC2P(c); }
 // Auto-detect: find ViewToClip (jittered) + ViewToClipNoAA (+16..64 floats later) + ClipToPrevClip (identity-like) in a UE4 view uniform buffer
 static void DumpViewBuf(const float* p, int avail, UINT64 off, const char* why) {
     static int nd = 0, lastFr = -100000; int fr = g_frame.load();
@@ -587,13 +391,7 @@ static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     if (fr != s_frame) { s_frame = fr; s_budget = 24; }   // v16: was 600 full-buffer scans per frame if (s_budget-- <= 0) return;
     g_scanRuns++;
     int ji = -1, nj = -1;
-    for (int i = 0; i + 16 <= avail && ji < 0; i += 4) {
-        if (!IsProj(p + i, true)) continue; g_projSeen++;
-        for (int j = i + 4; j <= i + 128 && j + 16 <= avail; j += 4) {
-            const float* a = p + i; const float* b = p + j;
-            if (IsProj(b, true) && fabsf(b[8]) < 1e-9f && fabsf(b[9]) < 1e-9f && fabsf(a[0] - b[0]) <= 1e-5f * fabsf(a[0]) && fabsf(a[5] - b[5]) <= 1e-5f * fabsf(a[5]) && ((a[8] != 0.f || a[9] != 0.f) || !memcmp(a, b, 64))) { ji = i; nj = j; break; }
-        }
-    }
+    { long ps = 0; CamFindPair(p, avail, &ji, &nj, &ps); g_projSeen += ps; }   // v27: pure core in camcore.h
     if (ji < 0) {
         static unsigned seen[16]; static int nseen = 0, nlog = 0; unsigned h = 2166136261u; int cnt = 0; char line[900]; int len = 0; line[0] = 0;
         for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(p + i, true)) { cnt++; h = (h ^ (unsigned)i) * 16777619u; if (len < 760) len += snprintf(line + len, sizeof line - len, " [%d: m0=%.4f m5=%.4f m8=%.5f m9=%.5f m10=%.3f m11=%.1f m14=%.3f]", i, p[i], p[i + 5], p[i + 8], p[i + 9], p[i + 10], p[i + 11], p[i + 14]); }
@@ -604,7 +402,7 @@ static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     }
     // v18: collect up to 4 identity-like matrices after ViewToClipNoAA (UE5 has more matrices in front of / behind ClipToPrevClip); c2pidx picks one (default: the first = UE4 behaviour)
     int k = -1; { int cand[4]; int nc = 0; static bool s_listed = false; int need = 4;   // v21: always collect all 4 (the monitor below needs every candidate)
-      for (int q = nj + 16; q + 16 <= avail && nc < need; q += 4) if (LooksLikeC2P(p + q)) cand[nc++] = q;
+      (void)need; nc = CamCollectC2P(p, avail, nj, cand);
       if (!s_listed && nc > 0) { s_listed = true; char l[700]; int ln = 0; l[0] = 0;
         for (int i = 0; i < nc && ln < 600; i++) { const float* c = p + cand[i]; ln += snprintf(l + ln, sizeof l - ln, " #%d@%d[diag %.4f %.4f %.4f %.4f | z-row xy %.5f %.5f | trans xy %.5f %.5f]", i, cand[i], c[0], c[5], c[10], c[15], c[8], c[9], c[12], c[13]); }
         Log("cam-scan: identity-like matrices after ViewToClipNoAA:%s  -> c2pidx=%d", l, g_cfg.c2pIdx); }
@@ -614,8 +412,8 @@ static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     if (k < 0) { DumpViewBuf(p, avail, off, "pair found, no ClipToPrevClip"); if (n++ < 10) Log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)off, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
     if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (n++ < 20) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
     if (hits >= 5) {
-        g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1; if (g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at projoff=%d noaaoff=%d mvoff=%d", ji, nj, k);
-        Log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> put these three lines in SN_DLSSG_cfg.txt to skip the scan next time", ji, nj, k);
+        g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1; if (g_cfg.autoLearn) { CfgSetInt("projoff", ji); CfgSetInt("noaaoff", nj); CfgSetInt("mvoff", k); } if (g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at projoff=%d noaaoff=%d mvoff=%d", ji, nj, k);
+        Log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> saved to SN_DLSSG_cfg.txt automatically (autolearn=1) so the next start skips the scan", ji, nj, k);
     }
 }
 
@@ -704,7 +502,7 @@ static void C2pMonitor(const float* p, int availF, int fr) {
                 if (ok && (best < 0 || c.active > g_c2pSt[best].active)) best = i; }
             if (best >= 0) {
                 Log("c2p-monitor: SWITCH ClipToPrevClip from float %d (%s) to float %d (active %d/%d maxdev %.5f) - frame generation history is reset", g_cfg.mvOff, usedInvalid ? "INVALID: constant / implausible matrix" : "never moved", g_c2pCand[best], g_c2pSt[best].active, F, g_c2pSt[best].maxDev);
-                g_cfg.mvOff = g_c2pCand[best]; g_forceReset = true; g_c2pSwitches++; }
+                g_cfg.mvOff = g_c2pCand[best]; g_forceReset = true; g_c2pSwitches++; if (g_cfg.autoLearn) CfgSetInt("mvoff", g_cfg.mvOff); }
             else if (usedInvalid) { static int w = 0; if (w++ < 6) Log("c2p-monitor: the USED ClipToPrevClip (float %d) is invalid and no other candidate looks usable - implausible frames are sent as identity (camera-only motion off, optical flow only)", g_cfg.mvOff); }
         }
     }
@@ -873,8 +671,11 @@ static PFN_CopyTex oCopyTex; static PFN_SetRootCbv oSetGCbv, oSetCCbv; static PF
 struct RtTrack { ID3D12GraphicsCommandList* cl = nullptr; void* rt0 = nullptr; };
 static thread_local RtTrack t_rt;
 static std::atomic<int> g_bbDraws{0}, g_hudStamp{-1};
-static std::unordered_map<void*, bool> g_bbCache;
-static UINT g_dispW = 0, g_dispH = 0;
+struct BbEntry { int fr; bool bb; };
+static std::unordered_map<void*, BbEntry> g_bbCache;   // v28: entries are valid for ONE frame only (v27 cached by raw pointer forever: a freed UE5 render target whose COM object address was reused kept 'is back buffer = true')
+static std::atomic<void*> g_scBuf[8]; static std::atomic<int> g_scBufN{0}; static std::atomic<bool> g_scBufSeen{false};   // v28: the swap chain's real back buffers
+static UINT g_dispW = 0, g_dispH = 0; static int g_scFmt = 0;   // v28: g_scFmt declared here (used by IsBackbufferRes)
+static void DeferResRelease(ID3D12Resource* r);
 static ID3D12Resource* g_hudless = nullptr; static D3D12_RESOURCE_STATES g_hudCur = D3D12_RESOURCE_STATE_COPY_DEST; static UINT g_hudW = 0, g_hudH = 0; static DXGI_FORMAT g_hudFmt = DXGI_FORMAT_UNKNOWN;
 static std::mutex g_hudMx;
 
@@ -993,10 +794,28 @@ static void STDMETHODCALLTYPE hkCopyTex(ID3D12GraphicsCommandList* cl, const D3D
 // ---- HUD-less capture: copy of the back buffer right before the Nth draw that targets it
 static bool IsBackbufferRes(void* r) {
     if (!r || !g_dispW) return false;
-    { std::lock_guard<std::shared_mutex> lk(g_resMx); auto it = g_bbCache.find(r); if (it != g_bbCache.end()) return it->second; }
+    // v28: 1) identity: the swap chain's own buffers (refreshed every Present). Once one of them has been seen as a render target this is the only criterion.
+    int nb = g_scBufN.load(std::memory_order_acquire);
+    for (int i = 0; i < nb && i < 8; i++) if (g_scBuf[i].load(std::memory_order_relaxed) == r) { g_scBufSeen.store(true, std::memory_order_relaxed); return true; }
+    if (nb > 0 && g_scBufSeen.load(std::memory_order_relaxed)) return false;
+    // 2) fallback (identity never matched, e.g. the proxy hands out different pointers): size + format of the swap chain, cached for the current frame only
+    int fr = g_frame.load(std::memory_order_relaxed);
+    { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_bbCache.find(r); if (it != g_bbCache.end() && it->second.fr == fr) return it->second.bb; }
     D3D12_RESOURCE_DESC d = ResDesc((ID3D12Resource*)r);
-    bool bb = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_dispW && d.Height == g_dispH && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && d.MipLevels == 1 && d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1;
-    std::lock_guard<std::shared_mutex> lk(g_resMx); g_bbCache[r] = bb; return bb;
+    bool bb = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == g_dispW && d.Height == g_dispH && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && d.MipLevels == 1 && d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1 && (g_scFmt == 0 || (int)d.Format == g_scFmt);
+    std::lock_guard<std::shared_mutex> lk(g_resMx); g_bbCache[r] = BbEntry{ fr, bb }; if (g_bbCache.size() > 4096) g_bbCache.clear(); return bb;
+}
+// v28: remember the swap chain's real back buffers (called from Present; GetBuffer is cheap, done every 120 frames and when the buffer count / size changes)
+static void RefreshScBuffers(IDXGISwapChain* sc, int fr) {
+    static int s_last = -1000; static UINT s_w = 0, s_h = 0, s_n = 0;
+    DXGI_SWAP_CHAIN_DESC d = {}; if (!sc || FAILED(sc->GetDesc(&d))) return;
+    if (fr - s_last < 120 && d.BufferDesc.Width == s_w && d.BufferDesc.Height == s_h && d.BufferCount == s_n) return;
+    s_last = fr; s_w = d.BufferDesc.Width; s_h = d.BufferDesc.Height; s_n = d.BufferCount;
+    void* tmp[8] = {}; int n = 0;
+    for (UINT i = 0; i < d.BufferCount && i < 8; i++) { ID3D12Resource* b = nullptr; if (SUCCEEDED(sc->GetBuffer(i, __uuidof(ID3D12Resource), (void**)&b)) && b) { tmp[n++] = (void*)b; b->Release(); } }   // the game keeps its own references: the pointers stay valid
+    g_scBufN.store(0, std::memory_order_release); for (int i = 0; i < n; i++) g_scBuf[i].store(tmp[i], std::memory_order_relaxed); g_scBufN.store(n, std::memory_order_release);
+    { std::lock_guard<std::shared_mutex> lk(g_resMx); g_bbCache.clear(); }
+    static int nl = 0; if (nl++ < 6) Log("back buffers: %d tracked by identity (%ux%u fmt=%d)", n, s_w, s_h, (int)d.BufferDesc.Format);
 }
 static void TransitionOne(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
     D3D12_RESOURCE_BARRIER x = {}; x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource = r; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -1005,8 +824,9 @@ static void TransitionOne(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, D3D1
 static void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb) {
     std::lock_guard<std::mutex> lk(g_hudMx);
     D3D12_RESOURCE_DESC d = ResDesc(bb);
+    if (d.Width != g_dispW || d.Height != g_dispH || (g_scFmt != 0 && (int)d.Format != g_scFmt)) return;   // v28: DLSS-G needs the HUD-less image in exactly the back buffer's size + format
     if (!g_hudless || g_hudW != d.Width || g_hudH != d.Height || g_hudFmt != d.Format) {
-        if (g_hudless) { g_hudless->Release(); g_hudless = nullptr; }
+        if (g_hudless) { DeferResRelease(g_hudless); g_hudless = nullptr; }   // v28: the GPU may still read it (v27 released it at once)
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = d.Width; rd.Height = d.Height; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = d.Format; rd.SampleDesc.Count = 1;
         HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), (void**)&g_hudless);
@@ -1021,12 +841,14 @@ static void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb) {
     TransitionOne(cl, g_hudless, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     g_hudCur = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
+#include "hudcal.inc"   // v27: hudless=2 auto detection of hudlessdraw
 static void NoteDraw(ID3D12GraphicsCommandList* cl, const char* kind, UINT count) {
     if (t_rt.cl != cl || !IsBackbufferRes(t_rt.rt0)) return;
     int n = ++g_bbDraws;
     static std::atomic<int> logged{0};
     if (logged.load() < 160 && g_frame.load() > 200 && g_frame.load() < 215) { logged++; Log("bbdraw frame=%d #%d %s count=%u", g_frame.load(), n, kind, count); }
-    if (g_cfg.hudless && n == g_cfg.hudlessDraw && g_hudStamp.load() != g_frame.load() && g_device) { CaptureHudless(cl, (ID3D12Resource*)t_rt.rt0); g_hudStamp = g_frame.load(); }
+    if (g_cfg.hudless == 2) HudCalOnDraw(cl, (ID3D12Resource*)t_rt.rt0, n, strstr(kind, "Indexed") ? 2 : 1, count);   // kind = "DrawInstanced" / "DrawIndexedInstanced"
+    if (g_cfg.hudless == 1 && n == g_cfg.hudlessDraw && g_hudStamp.load() != g_frame.load() && g_device) { CaptureHudless(cl, (ID3D12Resource*)t_rt.rt0); g_hudStamp = g_frame.load(); }
 }
 static void STDMETHODCALLTYPE hkDrawInst(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) { NoteDraw(cl, "DrawInstanced", a); oDrawInst(cl, a, b, c, d); }
 static void STDMETHODCALLTYPE hkDrawIdxInst(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) { NoteDraw(cl, "DrawIndexedInstanced", a); oDrawIdxInst(cl, a, b, c, d, e); }
@@ -1285,7 +1107,11 @@ static void UpdatePins() {
         if (alt) nv = alt; } }
     if (nv != g_pinVel || nd != g_pinDepth) { static int s_pl = 0; if (s_pl++ < 60) { D3D12_RESOURCE_DESC vv = nv ? ResDesc(nv) : D3D12_RESOURCE_DESC{}, dd2 = nd ? ResDesc(nd) : D3D12_RESOURCE_DESC{};
         Log("pins (frame %d): velocity %p %llux%u fmt=%d | depth %p %llux%u fmt=%d", fr, (void*)nv, (unsigned long long)vv.Width, vv.Height, (int)vv.Format, (void*)nd, (unsigned long long)dd2.Width, dd2.Height, (int)dd2.Format); }
-      if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (frame generation is reset)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd); g_forceReset = true; }
+      // v28: swapping the depth buffer for another one of the SAME size does not need a DLSS-G history reset (DLSS-G only ever sees our own copy g_depthOut). v27 reset on every swap:\n      // 44 resets in one session (UE5 rotates its pooled depth targets) = a visible hitch each time. Velocity change / size change / first pin still reset.
+      bool needReset = (nv != g_pinVel) || !g_pinDepth || !nd;
+      if (!needReset && g_pinDepth && nd) { D3D12_RESOURCE_DESC o = ResDesc(g_pinDepth), n2 = ResDesc(nd); if (o.Width != n2.Width || o.Height != n2.Height) needReset = true; }
+      if (g_pinVel || g_pinDepth) Log("pins changed at frame %d: vel %p -> %p, depth %p -> %p (%s)", fr, (void*)g_pinVel, (void*)nv, (void*)g_pinDepth, (void*)nd, needReset ? "frame generation is reset" : "same-size depth swap: no reset");
+      if (needReset) g_forceReset = true; }
     g_pinVel = nv; g_pinDepth = nd;
     if (nd) { D3D12_RESOURCE_DESC dd = ResDesc(nd); if ((int)dd.Width != g_effW.load() || (int)dd.Height != g_effH.load()) { g_effW = (int)dd.Width; g_effH = (int)dd.Height; Log("render size from pinned depth buffer: %dx%d", g_effW.load(), g_effH.load()); } }
 }
@@ -1347,9 +1173,15 @@ static int g_lastTagRes = -1, g_lastConstRes = -1, g_lastOptRes = -1;
 static std::atomic<int> g_busyFrames{ 0 }, g_scene3dFrames{ 0 };   // frames that rendered a lot (3D) / frames with a depth buffer pinned
 static const char* g_whyNot = "starting";            // why frame generation is not on right now (shown in the menu)
 static bool g_slDevSet = false; static int g_slDevTries = 0;
-static bool g_swapD3D12 = true; static UINT g_scBufs = 0; static int g_scFmt = 0, g_scEffect = 0;
+static bool g_swapD3D12 = true; static UINT g_scBufs = 0; static int g_scEffect = 0;
 static void ApplyReflexOptions(const char* why);
+static int EffectiveBaseLimit();                                   // v27: Reflex base-fps limit incl. the output fps cap
+static void EnsureDrawHooks(); static void HudCalReset(); static int HudCalVotes();
+static void BundleStart(); static bool BundlePoll(std::string& msg, bool& bad);   // crash.inc
+static std::atomic<int> g_refreshHz{ 0 };                           // refresh rate of the monitor the game window is on (0 = unknown)
 #include "overlay.inc"   // v25: in-game overlay + menu (keys, HUD, D3D12 text renderer), DiagRuntimeFill
+
+#include "crash.inc"   // v27: crash mini-dumps + support zip
 
 static void LogSupport() {
     if (g_loggedSupport || !p_slIsFeatureSupported) return; g_loggedSupport = true;
@@ -1416,12 +1248,26 @@ static void EnsureSlDeviceFromQueue(IUnknown* queueUnk) {
     }
     cq->Release();
 }
+static int g_appliedLimit = -1;
+// v27: base-fps limit for Reflex = user's basefpslimit and/or (output fps cap / frames per game frame)
+static int EffectiveBaseLimit() {
+    int mult = g_cfg.mult; if (g_maxGen && mult > (int)g_maxGen + 1) mult = (int)g_maxGen + 1;
+    return SnBaseLimit(SnResolveOutCap(g_cfg.fpsCap, g_refreshHz.load()), g_cfg.baseFpsLimit, mult, g_wasOn && !g_fgSusp);
+}
+static void UpdateRefreshRate(IDXGISwapChain* sc) {
+    DXGI_SWAP_CHAIN_DESC d = {}; if (!sc || FAILED(sc->GetDesc(&d)) || !d.OutputWindow) return;
+    HMONITOR mon = MonitorFromWindow(d.OutputWindow, MONITOR_DEFAULTTONEAREST); MONITORINFOEXW mi = {}; mi.cbSize = sizeof mi; if (!mon || !GetMonitorInfoW(mon, &mi)) return;
+    DEVMODEW dm = {}; dm.dmSize = sizeof dm; if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return;
+    int hz = (int)dm.dmDisplayFrequency; if (hz <= 1) hz = 0;
+    if (hz != g_refreshHz.load()) { g_refreshHz = hz; Log("display refresh rate of the game's monitor: %d Hz -> fpscap auto = %d fps output", hz, SnAutoOutCap(hz)); }
+}
 // v25: also called from the overlay when the base-fps cap is changed in the menu
 static void ApplyReflexOptions(const char* why) {
     if (!p_ReflexSetOptions) return;
     sl::ReflexOptions ro{}; ro.mode = sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
-    if (g_cfg.baseFpsLimit > 0) ro.frameLimitUs = (uint32_t)(1000000 / g_cfg.baseFpsLimit);
-    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(LowLatency, cap=%d fps) [%s] -> %d %s", g_cfg.baseFpsLimit, why, (int)r, SlStr(r));
+    int lim = EffectiveBaseLimit(); g_appliedLimit = lim;
+    if (lim > 0) ro.frameLimitUs = (uint32_t)(1000000 / lim);
+    sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(LowLatency, base cap=%d fps | basefpslimit=%d fpscap=%d refresh=%d) [%s] -> %d %s", lim, g_cfg.baseFpsLimit, g_cfg.fpsCap, g_refreshHz.load(), why, (int)r, SlStr(r));
 }
 static bool InitSlRuntime() {
     if (g_slRuntimeOk) return true;
@@ -1454,8 +1300,9 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     g_obStart = NowMs(); g_obMs = 0; g_tSleep = g_tPins = g_tMv = g_tPrune = 0;
     { static long s_lastCbv = 0; long c = g_cbvCalls.load(); g_cbvPerFrame = c - s_lastCbv; s_lastCbv = c; }
     FrameCtx ctx;
-    int cur = g_frame.load(); bool hudOk = g_hudStamp.load() == cur && cur > 0;
+    int cur = g_frame.load(); bool hudOk = g_hudStamp.load() == cur && cur > 0 && g_hudless && g_hudW == g_dispW && g_hudH == g_dispH;   // v28: size must equal the back buffer
     int fr = ++g_frame; int bbd = g_bbDraws.exchange(0);
+    RefreshScBuffers(sc, fr);   // v28
     if (g_cbvPerFrame.load() > 500) g_busyFrames++; if (g_pinDepth) g_scene3dFrames++;   // v25: diagnostics (is a 3D scene rendering?)
     // frame time (base fps) + maintenance
     static LARGE_INTEGER s_qf = {}, s_last = {}; static double s_ema = 16.7;
@@ -1464,6 +1311,8 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
       if (dtMs > 0.0 && dtMs < 1000.0) s_ema += (dtMs - s_ema) * 0.05;
       if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
     FlushDeferredRes();
+    HudCalOnPresent(fr); AcLateCheck(fr); if (fr == 300 || fr == 1800) CrashChain();   // v27
+    if (fr == 10 || (fr % 300) == 0) UpdateRefreshRate(sc);
     UpdateViewRect(fr);   // v20
     if ((fr % 20) == 0) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(24); } g_tPrune = NowMs() - tp0; }   // v23: small slices (was: everything every 120 frames)
     if (g_cfg.renderW <= 0 && (fr % 60) == 0) { DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d)) && d.BufferDesc.Width && (d.BufferDesc.Width != g_autoW.load() || d.BufferDesc.Height != g_autoH.load())) { g_autoW = d.BufferDesc.Width; g_autoH = d.BufferDesc.Height; Log("auto render size: swap chain is now %ux%u", g_autoW.load(), g_autoH.load()); } }   // v18: follow resolution changes (renderw=0)
@@ -1521,19 +1370,19 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
             if (fps >= (double)(g_cfg.fgMinFps + 8)) { if (++s_highN >= need) { s_susp = false; s_lowN = 0; g_forceReset = true; Log("FG resumed: base fps %.1f (frame %d, waited %d good frames)", fps, fr, need); } } else s_highN = 0;
         }
     }
-    bool wantOn = g_cfg.fg && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp && !g_compatBlocked.load();
+    bool wantOn = g_cfg.fg && !g_acTripped.load() && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp && !g_compatBlocked.load();
     int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
     // v24: camera tracker lost the view buffer (loading screen, level streaming, tracker blind spot): re-scan with relaxed checks, and - if FG was running - keep it running.
-    static bool s_held = false; static int s_rescanStart = -1, s_rescanCool = 0;
+    static bool s_held = false; static int s_rescanStart = -1, s_rescanCool = 0, s_heldSince = 0;
     if (g_cfg.camRescan > 0 && g_camFrame.load() >= 0 && !camOk && camAge > g_cfg.camRescan && !g_camRescan.load() && fr >= s_rescanCool) {
         g_camRescan = 1; s_rescanStart = fr; Log("camera lost for %d frames (last view buffer at frame %d) -> re-scanning with relaxed checks (registry %llu MB, evicted %ld, skipped %ld)", camAge, g_camFrame.load(), (unsigned long long)(g_bufBytes >> 20), g_evicted.load(), g_regSkipped.load());
     }
     if (g_camRescan.load() && fr - s_rescanStart > 1200) { g_camRescan = 0; s_rescanCool = fr + 600; Log("camera re-scan: giving up for 600 frames (no view buffer found in 1200 frames)"); }
     if (!camOk && g_cfg.camHold && g_camFrame.load() >= 0 && camAge <= g_cfg.camHoldMax && (g_wasOn || s_held)) {
         { std::lock_guard<std::mutex> lkh(g_camMx); for (int i = 0; i < 16; i++) g_c2p[i] = ((i % 5) == 0) ? 1.f : 0.f; g_jitPX = g_jitPY = g_jitNX = g_jitNY = 0.f; }
-        if (!s_held) { s_held = true; Log("camera lost (age %d) while FG is running -> camhold: FG stays ON with the last projection + identity ClipToPrevClip (optical flow only) until the camera is found again", camAge); }
+        if (!s_held) { s_held = true; s_heldSince = fr; Log("camera lost (age %d) while FG is running -> camhold: FG stays ON with the last projection + identity ClipToPrevClip (optical flow only) until the camera is found again", camAge); }
         camOk = true;
-    } else if (s_held && camOk) { s_held = false; g_forceReset = true; Log("camera found again (frame %d) -> camhold released, DLSS-G history reset", fr); }
+    } else if (s_held && camOk) { s_held = false; bool longHold = (fr - s_heldSince) > 240; if (longHold) g_forceReset = true; Log("camera found again (frame %d) -> camhold released after %d frames%s", fr, fr - s_heldSince, longHold ? ", DLSS-G history reset" : " (short hold: history kept)"); }   // v28: a short hold keeps the history (v27 reset every time = hitch)
     else if (s_held && (!g_cfg.camHold || camAge > g_cfg.camHoldMax)) { s_held = false; Log("camhold ended (age %d) -> FG off until the camera is back", camAge); }
     static int s_camStreak = 0; if (camOk) s_camStreak++; else s_camStreak = 0;
     bool delayOk = g_wasOn || s_camStreak >= g_cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
@@ -1568,7 +1417,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
             sl::ResourceTag(&rDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &ext),
             sl::ResourceTag(&rMv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &ext),
             sl::ResourceTag(&rHud, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, nullptr) };
-        uint32_t nt = 2; if (g_cfg.hudless && hudOk && g_hudless) nt = 3;
+        uint32_t nt = 2; if (g_cfg.hudless == 1 && hudOk && g_hudless) nt = 3;
         sl::Result r1 = g_useFrameTags ? p_slSetTagForFrame(*ctx.tok, vp, tags, nt, nullptr) : p_slSetTag(vp, tags, nt, nullptr);
         sl::Result r2 = p_slSetConstants(consts, *ctx.tok, vp);
         g_lastTagRes = (r1 == sl::Result::eOk) ? 0 : (int)r1; g_lastConstRes = (r2 == sl::Result::eOk) ? 0 : (int)r2;
@@ -1601,6 +1450,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         g_stateLog++;
     }
     if (!g_wasOn) g_fgRatio.store(1.0);
+    if (g_slRuntimeOk && (fr % 30) == 0 && EffectiveBaseLimit() != g_appliedLimit) ApplyReflexOptions("fps cap / state change");   // v27
     // v25: why is frame generation not on right now (menu status line)
     g_whyNot = g_wasOn ? "" : !g_cfg.fg ? "off (switched off)" : g_cfg.stage < 2 ? "stage<2" : fr < g_cfg.warmup ? "warming up" : s_susp ? "paused (base fps below the limit)" : !camOk ? "waiting for the camera (3D scene)" : !delayOk ? "camera stabilising" : !g_pinDepth ? "waiting for the depth buffer" : !g_pinVel ? "waiting for the velocity buffer" : g_mvPreIniting.load() ? "building the motion-vector pass" : g_mvFailed ? "motion-vector pass failed" : "starting";
     // Best-effort proof that frames are really being generated: compare the game's Present() rate with the swap chain's own
@@ -1732,117 +1582,14 @@ static bool EnsureSL() {
 // true = call the original function (our own warm-up thread, or Streamline calling back into us). Otherwise the game waits here until the shader cache is ready.
 static bool PassThrough() { if (t_prewarm) return true; WaitPrewarm(); return t_inSL || !EnsureSL(); }
 #include "psocache.inc"   // v26: persistent cache for the game's own pipeline states
-// ---- v17: PSO creation diagnostics + one retry (game crash: UE4 D3D12RHI "CreatePipelineState failed with E_INVALIDARG")
-// A PSO that succeeds is never touched. Only when the GAME's call returns E_INVALIDARG: (1) log the desc + device state,
-// (2) if the desc carries a CachedPSO blob, retry once without it (a stale/corrupt blob is a known cause of E_INVALIDARG).
-using PFN_CreateGPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
-using PFN_CreateCPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
-static PFN_CreateGPSO oCreateGPSO; static PFN_CreateCPSO oCreateCPSO;
-static std::atomic<int> g_psoFail{0}, g_psoRescued{0};
-static void LogGPsoFail(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, int n) {
-    HRESULT rem = dev ? dev->GetDeviceRemovedReason() : E_POINTER;
-    Log("PSO FAIL #%d (graphics, E_INVALIDARG) tid=%lu | deviceRemoved=0x%08X | rootSig=%p VS=%zu PS=%zu GS=%zu HS=%zu DS=%zu cached=%zu | inputElems=%u rtCount=%u rtv=[%d %d %d %d %d %d %d %d] dsv=%d | samples=%u/%u mask=0x%X topo=%d cut=%d flags=0x%X | blend: alpha2cov=%d indep=%d rt0(en=%d logic=%d wm=0x%X) | raster: fill=%d cull=%d depthClip=%d msaa=%d forced=%u | ds: z=%d s=%d func=%d",
-        n, (unsigned long)GetCurrentThreadId(), (unsigned)rem, (void*)d->pRootSignature, d->VS.BytecodeLength, d->PS.BytecodeLength, d->GS.BytecodeLength, d->HS.BytecodeLength, d->DS.BytecodeLength, d->CachedPSO.CachedBlobSizeInBytes,
-        d->InputLayout.NumElements, d->NumRenderTargets, (int)d->RTVFormats[0], (int)d->RTVFormats[1], (int)d->RTVFormats[2], (int)d->RTVFormats[3], (int)d->RTVFormats[4], (int)d->RTVFormats[5], (int)d->RTVFormats[6], (int)d->RTVFormats[7], (int)d->DSVFormat,
-        d->SampleDesc.Count, d->SampleDesc.Quality, (unsigned)d->SampleMask, (int)d->PrimitiveTopologyType, (int)d->IBStripCutValue, (unsigned)d->Flags,
-        (int)d->BlendState.AlphaToCoverageEnable, (int)d->BlendState.IndependentBlendEnable, (int)d->BlendState.RenderTarget[0].BlendEnable, (int)d->BlendState.RenderTarget[0].LogicOpEnable, (unsigned)d->BlendState.RenderTarget[0].RenderTargetWriteMask,
-        (int)d->RasterizerState.FillMode, (int)d->RasterizerState.CullMode, (int)d->RasterizerState.DepthClipEnable, (int)d->RasterizerState.MultisampleEnable, (unsigned)d->RasterizerState.ForcedSampleCount,
-        (int)d->DepthStencilState.DepthEnable, (int)d->DepthStencilState.StencilEnable, (int)d->DepthStencilState.DepthFunc);
-    if (g_log) fflush(g_log);                              // the game is about to die: do not lose these lines
+#include "pso_hooks.inc"   // v27: PSO creation hooks (diagnostics, retry, persistent cache)
+static void** g_vtCLHook = nullptr; static std::atomic<bool> g_drawHooked{ false };
+// v27: the draw-call hooks cost a little per draw, so they exist only when hudless != 0 - and can be added at run time (menu). The ORIGINAL pointer is stored BEFORE the patch is visible.
+static void EnsureDrawHooks() {
+    if (!g_vtCLHook || g_drawHooked.exchange(true)) return;
+    oDrawInst = (decltype(oDrawInst))g_vtCLHook[12]; oDrawIdxInst = (decltype(oDrawIdxInst))g_vtCLHook[13];
+    Patch(g_vtCLHook, 12, (void*)hkDrawInst); Patch(g_vtCLHook, 13, (void*)hkDrawIdxInst); Log("draw-call hooks installed (hudless)");
 }
-// v26: CreateRootSignature hook = identity of the root signature for the pipeline cache key
-using PFN_CreateRS = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
-static PFN_CreateRS oCreateRS;
-static HRESULT STDMETHODCALLTYPE hkCreateRS(ID3D12Device* dev, UINT nm, const void* blob, SIZE_T len, REFIID riid, void** ppv) {
-    HRESULT hr = oCreateRS(dev, nm, blob, len, riid, ppv);
-    if (SUCCEEDED(hr) && ppv && *ppv) NoteRootSig(*ppv, blob, len);
-    return hr;
-}
-// errors a stale / foreign cached blob can cause: E_INVALIDARG, D3D12_ERROR_ADAPTER_NOT_FOUND (0x887E0001), D3D12_ERROR_DRIVER_VERSION_MISMATCH (0x887E0002)
-static inline bool PsoRetryable(HRESULT hr) { return hr == E_INVALIDARG || hr == (HRESULT)0x887E0001 || hr == (HRESULT)0x887E0002; }
-static inline bool PsoCacheable(REFIID riid, void** ppv) { return ppv && IsEqualGUID(riid, __uuidof(ID3D12PipelineState)); }
-
-static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
-    if (!desc) return oCreateGPSO(dev, desc, riid, ppv);
-    // v26 persistent pipeline cache: known pipeline -> give the driver its cached blob (no shader compile); unknown -> compile as usual, then remember it
-    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;   // pipelines that already carry the game's own blob are left alone
-    uint64_t key = 0; bool hit = false;
-    if (cache) {
-        PsoWaitReady(); g_psoSeen++; key = HashGfxDesc(desc); PsoBlobPtr blob = PsoFind(key);
-        if (blob) {
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
-            HRESULT h2 = oCreateGPSO(dev, &cp, riid, ppv);
-            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached graphics pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
-        }
-    }
-    HRESULT hr = oCreateGPSO(dev, desc, riid, ppv);
-    if (SUCCEEDED(hr)) { if (cache && !hit && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv); return hr; }
-    if (!PsoRetryable(hr) || !g_cfg.psoRetry) return hr;
-    int n = ++g_psoFail;
-    if (n <= 16) LogGPsoFail(dev, desc, n);
-    if (desc->CachedPSO.CachedBlobSizeInBytes) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
-        HRESULT hr2 = oCreateGPSO(dev, &cp, riid, ppv);
-        if (n <= 16) Log("PSO FAIL #%d: retry without CachedPSO -> hr=0x%08X", n, (unsigned)hr2);
-        if (SUCCEEDED(hr2)) { g_psoRescued++; Log("PSO rescued (total rescued=%d of %d failures)", g_psoRescued.load(), n); if (g_log) fflush(g_log); return hr2; }
-    }
-    if (g_log) fflush(g_log);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
-    if (!desc) return oCreateCPSO(dev, desc, riid, ppv);
-    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;
-    uint64_t key = 0;
-    if (cache) {
-        PsoWaitReady(); g_psoSeen++; key = HashCompDesc(desc); PsoBlobPtr blob = PsoFind(key);
-        if (blob) {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
-            HRESULT h2 = oCreateCPSO(dev, &cp, riid, ppv);
-            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached compute pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
-        }
-    }
-    HRESULT hr = oCreateCPSO(dev, desc, riid, ppv);
-    if (SUCCEEDED(hr)) { if (cache && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv); return hr; }
-    if (!PsoRetryable(hr) || !g_cfg.psoRetry) return hr;
-    int n = ++g_psoFail;
-    if (n <= 16) { Log("PSO FAIL #%d (compute, hr=0x%08X) tid=%lu | deviceRemoved=0x%08X | rootSig=%p CS=%zu cached=%zu", n, (unsigned)hr, (unsigned long)GetCurrentThreadId(), (unsigned)dev->GetDeviceRemovedReason(), (void*)desc->pRootSignature, desc->CS.BytecodeLength, desc->CachedPSO.CachedBlobSizeInBytes); }
-    if (desc->CachedPSO.CachedBlobSizeInBytes) {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
-        HRESULT hr2 = oCreateCPSO(dev, &cp, riid, ppv);
-        if (n <= 16) Log("PSO FAIL #%d: retry without CachedPSO -> hr=0x%08X", n, (unsigned)hr2);
-        if (SUCCEEDED(hr2)) { g_psoRescued++; return hr2; }
-    }
-    if (g_log) fflush(g_log);
-    return hr;
-}
-
-// ---- v26: ID3D12Device2::CreatePipelineState (pipeline state STREAM) - same cache, stream flavour
-using PFN_CreatePSS = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const SnStreamDesc*, REFIID, void**);
-static PFN_CreatePSS oCreatePSS;
-static HRESULT STDMETHODCALLTYPE hkCreatePSS(ID3D12Device* dev, const SnStreamDesc* desc, REFIID riid, void** ppv) {
-    if (!desc || !g_cfg.psoCache || !PsoCacheable(riid, ppv)) return oCreatePSS(dev, desc, riid, ppv);
-    const uint8_t* base = (const uint8_t*)desc->pPipelineStateSubobjectStream; size_t total = (size_t)desc->SizeInBytes;
-    std::vector<SubInfo> subs;
-    long nc = ++g_psoStreamCalls; if (nc == 1) Log("pso-cache: this game creates pipelines with CreatePipelineState (state stream) - cached as well");
-    if (!ParseStream(base, total, subs) || StreamHasBlob(base, subs)) { long u = ++g_psoStreamUnknown; if (u <= 3) Log("pso-cache: a pipeline stream was not cacheable (unknown sub-object type, or it already carries the game's own blob) - passed through unchanged"); return oCreatePSS(dev, desc, riid, ppv); }
-    PsoWaitReady(); g_psoSeen++;
-    uint64_t key = HashStream(base, subs); PsoBlobPtr blob = PsoFind(key);
-    if (blob) {
-        std::vector<uint64_t> buf; size_t nb = 0;
-        if (StreamWithBlob(base, total, subs, blob, buf, nb)) {
-            SnStreamDesc d2 = { nb, buf.data() };
-            HRESULT h2 = oCreatePSS(dev, &d2, riid, ppv);
-            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached stream pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
-        }
-    }
-    HRESULT hr = oCreatePSS(dev, desc, riid, ppv);
-    if (SUCCEEDED(hr) && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv);
-    return hr;
-}
-
 static bool g_devHooked = false; static std::mutex g_devHookMx;
 
 static void InstallNativeHooks(ID3D12Device* nat) {
@@ -1880,7 +1627,7 @@ static void InstallNativeHooks(ID3D12Device* nat) {
     oClearRTV = (decltype(oClearRTV))Patch(vtCL, 48, (void*)hkClearRTV);
     oSetCCbv = (decltype(oSetCCbv))Patch(vtCL, 37, (void*)hkSetCCbv);
     oSetGCbv = (decltype(oSetGCbv))Patch(vtCL, 38, (void*)hkSetGCbv);
-    if (g_cfg.hudless) { oDrawInst = (decltype(oDrawInst))Patch(vtCL, 12, (void*)hkDrawInst); oDrawIdxInst = (decltype(oDrawIdxInst))Patch(vtCL, 13, (void*)hkDrawIdxInst); }
+    g_vtCLHook = vtCL; if (g_cfg.hudless) EnsureDrawHooks();   // v27: also installable later from the menu
     cl->Release(); al->Release(); q->Release();
     g_devHooked = true; Log("native D3D12 hooks installed (device vtable=%p queue vtable=%p cl vtable=%p)", (void*)vtDev, (void*)vtQ, (void*)vtCL);
 }
@@ -1920,6 +1667,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_dir = exe; g_dir = g_dir.substr(0, g_dir.find_last_of(L'\\'));
     LoadCfg();
+    if (g_cfg.antiCheat) { std::string lab, wh; if (AcScanFiles(lab, wh) || AcScanModules(lab, wh)) { g_acTripped = true; AcNotice(lab, wh); return 0; } }   // v27: BEFORE anything is hooked
+    else Log("anticheat=0: anti-cheat guard skipped");
+    CrashInit();   // v27
     if (g_cfg.log) AddVectoredExceptionHandler(1, DiagVEH);
     // v25: fg=0 no longer means 'nothing hooked' - the overlay can switch frame generation on later. stage=0 is the real pass-through switch.
     if (g_cfg.stage < 1) { Log("stage=%d -> pass-through, nothing hooked", g_cfg.stage); return 0; }
