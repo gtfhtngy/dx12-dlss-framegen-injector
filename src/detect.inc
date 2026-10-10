@@ -1,114 +1,70 @@
-// pso_hooks.inc (v27, split out of main.cpp unchanged): device hooks for CreateGraphicsPipelineState / CreateComputePipelineState / state streams / CreateRootSignature
-// (PSO failure diagnostics + retry without CachedPSO, and the v26 persistent pipeline cache glue). Needs psocache.inc (included right before it).
+// detect.inc (v27) - things the injector finds out about the game BEFORE it hooks anything:
+//   * which Unreal Engine major version the exe is (4 / 5) - only used to write the right default config the first time (no game database, nothing to maintain)
+//   * whether an anti-cheat is present (files next to the exe / loaded modules). Then the injector switches itself OFF (anticheat=1, default).
+// Pure name lists + the scan loop live in logic.h (SnAcName, SnScanUeVersion); this file only walks the file system / the module list.
 #pragma once
-// ---- v17: PSO creation diagnostics + one retry (game crash: UE4 D3D12RHI "CreatePipelineState failed with E_INVALIDARG")
-// A PSO that succeeds is never touched. Only when the GAME's call returns E_INVALIDARG: (1) log the desc + device state,
-// (2) if the desc carries a CachedPSO blob, retry once without it (a stale/corrupt blob is a known cause of E_INVALIDARG).
-using PFN_CreateGPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
-using PFN_CreateCPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
-static PFN_CreateGPSO oCreateGPSO; static PFN_CreateCPSO oCreateCPSO;
-static std::atomic<int> g_psoFail{0}, g_psoRescued{0};
-static void LogGPsoFail(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, int n) {
-    HRESULT rem = dev ? dev->GetDeviceRemovedReason() : E_POINTER;
-    Log("PSO FAIL #%d (graphics, E_INVALIDARG) tid=%lu | deviceRemoved=0x%08X | rootSig=%p VS=%zu PS=%zu GS=%zu HS=%zu DS=%zu cached=%zu | inputElems=%u rtCount=%u rtv=[%d %d %d %d %d %d %d %d] dsv=%d | samples=%u/%u mask=0x%X topo=%d cut=%d flags=0x%X | blend: alpha2cov=%d indep=%d rt0(en=%d logic=%d wm=0x%X) | raster: fill=%d cull=%d depthClip=%d msaa=%d forced=%u | ds: z=%d s=%d func=%d",
-        n, (unsigned long)GetCurrentThreadId(), (unsigned)rem, (void*)d->pRootSignature, d->VS.BytecodeLength, d->PS.BytecodeLength, d->GS.BytecodeLength, d->HS.BytecodeLength, d->DS.BytecodeLength, d->CachedPSO.CachedBlobSizeInBytes,
-        d->InputLayout.NumElements, d->NumRenderTargets, (int)d->RTVFormats[0], (int)d->RTVFormats[1], (int)d->RTVFormats[2], (int)d->RTVFormats[3], (int)d->RTVFormats[4], (int)d->RTVFormats[5], (int)d->RTVFormats[6], (int)d->RTVFormats[7], (int)d->DSVFormat,
-        d->SampleDesc.Count, d->SampleDesc.Quality, (unsigned)d->SampleMask, (int)d->PrimitiveTopologyType, (int)d->IBStripCutValue, (unsigned)d->Flags,
-        (int)d->BlendState.AlphaToCoverageEnable, (int)d->BlendState.IndependentBlendEnable, (int)d->BlendState.RenderTarget[0].BlendEnable, (int)d->BlendState.RenderTarget[0].LogicOpEnable, (unsigned)d->BlendState.RenderTarget[0].RenderTargetWriteMask,
-        (int)d->RasterizerState.FillMode, (int)d->RasterizerState.CullMode, (int)d->RasterizerState.DepthClipEnable, (int)d->RasterizerState.MultisampleEnable, (unsigned)d->RasterizerState.ForcedSampleCount,
-        (int)d->DepthStencilState.DepthEnable, (int)d->DepthStencilState.StencilEnable, (int)d->DepthStencilState.DepthFunc);
-    if (g_log) fflush(g_log);                              // the game is about to die: do not lose these lines
-}
-// v26: CreateRootSignature hook = identity of the root signature for the pipeline cache key
-using PFN_CreateRS = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
-static PFN_CreateRS oCreateRS;
-static HRESULT STDMETHODCALLTYPE hkCreateRS(ID3D12Device* dev, UINT nm, const void* blob, SIZE_T len, REFIID riid, void** ppv) {
-    HRESULT hr = oCreateRS(dev, nm, blob, len, riid, ppv);
-    if (SUCCEEDED(hr) && ppv && *ppv) NoteRootSig(*ppv, blob, len);
-    return hr;
-}
-// errors a stale / foreign cached blob can cause: E_INVALIDARG, D3D12_ERROR_ADAPTER_NOT_FOUND (0x887E0001), D3D12_ERROR_DRIVER_VERSION_MISMATCH (0x887E0002)
-static inline bool PsoRetryable(HRESULT hr) { return hr == E_INVALIDARG || hr == (HRESULT)0x887E0001 || hr == (HRESULT)0x887E0002; }
-static inline bool PsoCacheable(REFIID riid, void** ppv) { return ppv && IsEqualGUID(riid, __uuidof(ID3D12PipelineState)); }
+#include <tlhelp32.h>
 
-static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
-    if (!desc) return oCreateGPSO(dev, desc, riid, ppv);
-    // v26 persistent pipeline cache: known pipeline -> give the driver its cached blob (no shader compile); unknown -> compile as usual, then remember it
-    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;   // pipelines that already carry the game's own blob are left alone
-    uint64_t key = 0; bool hit = false;
-    if (cache) {
-        PsoWaitReady(); g_psoSeen++; key = HashGfxDesc(desc); PsoBlobPtr blob = PsoFind(key);
-        if (blob) {
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
-            HRESULT h2 = oCreateGPSO(dev, &cp, riid, ppv);
-            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached graphics pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+// 4 = UE4, 5 = UE5, 0 = not found. Reads the .rdata / .data of the game's own exe image once (only when no config exists yet).
+static int DetectUeVersion() {
+    HMODULE m = GetModuleHandleW(nullptr); if (!m) return 0;
+    const uint8_t* base = (const uint8_t*)m; auto dos = (const IMAGE_DOS_HEADER*)base; if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew); if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt); int best = 0; DWORD t0 = GetTickCount();
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections && best < 5; i++) {
+        char nm[9] = {}; memcpy(nm, sec[i].Name, 8); if (strcmp(nm, ".rdata") && strcmp(nm, ".data")) continue;
+        const uint8_t* p = base + sec[i].VirtualAddress; size_t left = sec[i].Misc.VirtualSize; if (left > (size_t)(512u << 20)) left = (size_t)(512u << 20);
+        while (left && best < 5) {   // walk committed, readable regions only (never touch a page that could fault)
+            MEMORY_BASIC_INFORMATION mbi; if (!VirtualQuery(p, &mbi, sizeof mbi)) break;
+            size_t len = std::min<size_t>(left, (size_t)(((const uint8_t*)mbi.BaseAddress + mbi.RegionSize) - p)); if (!len) break;
+            if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                const size_t blk = 4u << 20; for (size_t o = 0; o < len && best < 5; o += blk - 16) { size_t n = std::min(blk, len - o); best = std::max(best, SnScanUeVersion(p + o, n)); if (n < blk) break; }
+            }
+            p += len; left -= len;
         }
     }
-    HRESULT hr = oCreateGPSO(dev, desc, riid, ppv);
-    if (SUCCEEDED(hr)) { if (cache && !hit && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv); return hr; }
-    if (!PsoRetryable(hr) || !g_cfg.psoRetry) return hr;
-    int n = ++g_psoFail;
-    if (n <= 16) LogGPsoFail(dev, desc, n);
-    if (desc->CachedPSO.CachedBlobSizeInBytes) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
-        HRESULT hr2 = oCreateGPSO(dev, &cp, riid, ppv);
-        if (n <= 16) Log("PSO FAIL #%d: retry without CachedPSO -> hr=0x%08X", n, (unsigned)hr2);
-        if (SUCCEEDED(hr2)) { g_psoRescued++; Log("PSO rescued (total rescued=%d of %d failures)", g_psoRescued.load(), n); if (g_log) fflush(g_log); return hr2; }
-    }
-    if (g_log) fflush(g_log);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
-    if (!desc) return oCreateCPSO(dev, desc, riid, ppv);
-    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;
-    uint64_t key = 0;
-    if (cache) {
-        PsoWaitReady(); g_psoSeen++; key = HashCompDesc(desc); PsoBlobPtr blob = PsoFind(key);
-        if (blob) {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
-            HRESULT h2 = oCreateCPSO(dev, &cp, riid, ppv);
-            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached compute pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
-        }
-    }
-    HRESULT hr = oCreateCPSO(dev, desc, riid, ppv);
-    if (SUCCEEDED(hr)) { if (cache && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv); return hr; }
-    if (!PsoRetryable(hr) || !g_cfg.psoRetry) return hr;
-    int n = ++g_psoFail;
-    if (n <= 16) { Log("PSO FAIL #%d (compute, hr=0x%08X) tid=%lu | deviceRemoved=0x%08X | rootSig=%p CS=%zu cached=%zu", n, (unsigned)hr, (unsigned long)GetCurrentThreadId(), (unsigned)dev->GetDeviceRemovedReason(), (void*)desc->pRootSignature, desc->CS.BytecodeLength, desc->CachedPSO.CachedBlobSizeInBytes); }
-    if (desc->CachedPSO.CachedBlobSizeInBytes) {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = nullptr; cp.CachedPSO.CachedBlobSizeInBytes = 0;
-        HRESULT hr2 = oCreateCPSO(dev, &cp, riid, ppv);
-        if (n <= 16) Log("PSO FAIL #%d: retry without CachedPSO -> hr=0x%08X", n, (unsigned)hr2);
-        if (SUCCEEDED(hr2)) { g_psoRescued++; return hr2; }
-    }
-    if (g_log) fflush(g_log);
-    return hr;
+    Log("engine scan: %s (%u ms)", best == 5 ? "Unreal Engine 5" : best == 4 ? "Unreal Engine 4" : "no Unreal version string found", (unsigned)(GetTickCount() - t0));
+    return best;
 }
 
-// ---- v26: ID3D12Device2::CreatePipelineState (pipeline state STREAM) - same cache, stream flavour
-using PFN_CreatePSS = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const SnStreamDesc*, REFIID, void**);
-static PFN_CreatePSS oCreatePSS;
-static HRESULT STDMETHODCALLTYPE hkCreatePSS(ID3D12Device* dev, const SnStreamDesc* desc, REFIID riid, void** ppv) {
-    if (!desc || !g_cfg.psoCache || !PsoCacheable(riid, ppv)) return oCreatePSS(dev, desc, riid, ppv);
-    const uint8_t* base = (const uint8_t*)desc->pPipelineStateSubobjectStream; size_t total = (size_t)desc->SizeInBytes;
-    std::vector<SubInfo> subs;
-    long nc = ++g_psoStreamCalls; if (nc == 1) Log("pso-cache: this game creates pipelines with CreatePipelineState (state stream) - cached as well");
-    if (!ParseStream(base, total, subs) || StreamHasBlob(base, subs)) { long u = ++g_psoStreamUnknown; if (u <= 3) Log("pso-cache: a pipeline stream was not cacheable (unknown sub-object type, or it already carries the game's own blob) - passed through unchanged"); return oCreatePSS(dev, desc, riid, ppv); }
-    PsoWaitReady(); g_psoSeen++;
-    uint64_t key = HashStream(base, subs); PsoBlobPtr blob = PsoFind(key);
-    if (blob) {
-        std::vector<uint64_t> buf; size_t nb = 0;
-        if (StreamWithBlob(base, total, subs, blob, buf, nb)) {
-            SnStreamDesc d2 = { nb, buf.data() };
-            HRESULT h2 = oCreatePSS(dev, &d2, riid, ppv);
-            if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached stream pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+// ---- anti-cheat guard
+static std::atomic<bool> g_acTripped{ false };
+static std::string AcNarrow(const wchar_t* w) { char b[1024]; int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, nullptr, nullptr); return n > 0 ? std::string(b, (size_t)n - 1) : std::string(); }
+static std::string AcLowerNarrow(const wchar_t* w) { char b[512]; int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, nullptr, nullptr); return n > 0 ? SnLower(std::string(b, (size_t)n - 1)) : std::string(); }
+// exe folder + 3 folders up (UE layout: <Root>\<Game>\Binaries\Win64\game.exe, the anti-cheat lives next to <Game> or in Binaries\Win64)
+static bool AcScanFiles(std::string& label, std::string& where) {
+    std::wstring d = g_dir;
+    for (int lvl = 0; lvl < 4 && !d.empty(); lvl++) {
+        WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            int n = 0;
+            do { if (++n > 4000) break; if (fd.cFileName[0] == L'.' ) continue; std::string nm = AcLowerNarrow(fd.cFileName); const char* p = SnAcName(nm);
+                 if (p) { label = p; where = "file/folder '" + nm + "' in " + AcNarrow(d.c_str()); FindClose(h); return true; } } while (FindNextFileW(h, &fd));
+            FindClose(h);
         }
+        size_t cut = d.find_last_of(L'\\'); if (cut == std::wstring::npos) break; d = d.substr(0, cut);
     }
-    HRESULT hr = oCreatePSS(dev, desc, riid, ppv);
-    if (SUCCEEDED(hr) && ppv && *ppv) PsoStore(key, (ID3D12PipelineState*)*ppv);
-    return hr;
+    return false;
 }
-
+static bool AcScanModules(std::string& label, std::string& where) {
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId()); if (s == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32W me = {}; me.dwSize = sizeof me; bool hit = false;
+    if (Module32FirstW(s, &me)) do { std::string nm = AcLowerNarrow(me.szModule); const char* p = SnAcName(nm); if (p) { label = p; where = "loaded module '" + nm + "'"; hit = true; break; } } while (Module32NextW(s, &me));
+    CloseHandle(s); return hit;
+}
+static DWORD WINAPI AcNoticeThread(LPVOID p) {
+    std::string* s = (std::string*)p; wchar_t w[1400]; MultiByteToWideChar(CP_UTF8, 0, s->c_str(), -1, w, 1400); delete s;
+    MessageBoxW(nullptr, w, L"SN_DLSSG - switched off (anti-cheat)", MB_OK | MB_ICONINFORMATION | MB_TOPMOST); return 0;
+}
+static void AcNotice(const std::string& label, const std::string& where) {
+    Log("ANTI-CHEAT GUARD: %s detected (%s) -> frame generation injector switched OFF (nothing hooked). Set anticheat=0 in SN_DLSSG_cfg.txt only for an offline / anti-cheat-free launch and at your own risk.", label.c_str(), where.c_str());
+    if (!g_cfg.msgBox) return;
+    auto* m = new std::string("SN_DLSSG found the anti-cheat \"" + label + "\" (" + where + ").\n\nTo protect your account the injector has switched itself OFF: nothing is hooked and the game runs unmodified.\n\n"
+        "Playing without the anti-cheat (offline mode / launched without it)? Then set  anticheat=0  in SN_DLSSG_cfg.txt - at your own risk. Never use this in online matches.\n\n(Remove winmm.dll to get rid of this message. msgbox=0 hides it.)");
+    HANDLE h = CreateThread(nullptr, 0, AcNoticeThread, m, 0, nullptr); if (h) CloseHandle(h); else delete m;
+}
+// later check from the Present hook (anti-cheat modules often load after start-up): switch frame generation off again
+static void AcLateCheck(int fr) {
+    if (!g_cfg.antiCheat || g_acTripped.load() || !(fr == 120 || fr == 1800 || fr == 7200)) return;
+    std::string l, w; if (AcScanModules(l, w)) { g_acTripped = true; g_cfg.fg = 0; AcNotice(l, w); }   // fg=0 -> the normal 'DLSS-G off' path runs; wantOn is also blocked by g_acTripped
+}
