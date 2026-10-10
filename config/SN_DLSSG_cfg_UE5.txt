@@ -1,4 +1,4 @@
-# UE5 template (v18) - DLSS Frame Generation (Streamline) config  [copy next to the game exe as SN_DLSSG_cfg.txt]
+# Scarlet Nexus - DLSS Frame Generation (Streamline) config
 # fg        : 1 = on, 0 = off
 # mult      : 2 = 2x (1 generated frame). 3/4 need an RTX 50 series card (clamped automatically)
 # stage     : 0 = pass-through, 1 = only init Streamline + log feature support, 2 = full frame generation
@@ -38,8 +38,8 @@ stage=2
 log=0
 hudless=0
 hudlessdraw=2
-renderw=0
-renderh=0
+renderw=2000
+renderh=1124
 tol=100
 mvoff=492
 projoff=116
@@ -79,7 +79,7 @@ fgminbackoff=1
 # autosave      : 1 = menu changes are written back to this file
 # autoreport    : 1 = if FG cannot work, write SN_DLSSG_DEBUG_REPORT.txt and tell the user to attach it to a GitHub Issue    msgbox : 1 = one-time message box when the overlay cannot show that notice
 overlay=1
-overlaykey=INSERT
+overlaykey=F1
 showfps=0
 showfgfps=0
 showframetime=0
@@ -98,3 +98,18 @@ msgbox=1
 # psocachemb   : size limit of that cache in MB (it is also held in RAM while the game runs)
 psocache=1
 psocachemb=384
+# ---- v27
+# preset      : custom (default: nothing applied) | quality | balanced | performance - sets fgminfps, fgdelay, camstale and mult in one go; single keys written BELOW this line still win
+# fpscap      : OUTPUT fps cap: 0 = off, auto = display refresh - 3 (keeps VRR / G-Sync inside its window), or a number. Needs reflexsleep=1. Applies while frame generation runs
+# fgkey/hudkey: hotkeys (this session only): frame generation on/off, HUD on/off. NONE = off. They need overlay=1
+# hudless     : 0 = off, 1 = on (hudlessdraw=N), 2 = AUTO: measures the right N in the first minute of 3D gameplay, then saves hudless=1 + hudlessdraw=N here
+# anticheat   : 1 = (default) the injector switches itself OFF when an anti-cheat is found. 0 = skip that check (offline / anti-cheat-free launch only, at your own risk)
+# crashdump   : 1 = mini-dump + summary (SN_DLSSG_crash_*.dmp/.txt) when a crash happens inside this injector / Streamline / the driver
+# autolearn   : 1 = camera offsets found by the scan (projoff/noaaoff/mvoff) are written back here so the next start skips the scan
+preset=custom
+fpscap=0
+fgkey=F9
+hudkey=F8
+anticheat=1
+crashdump=1
+autolearn=1
