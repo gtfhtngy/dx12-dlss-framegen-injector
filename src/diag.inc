@@ -325,6 +325,7 @@ static void DiagWriteReport(const char* trigger) {
         o += "\nCONFIG (as loaded / changed in the menu)\n----------------------------------------\n";
         o += Fmt("  fg=%d mult=%d stage=%d warmup=%d fgminfps=%d baseFpsLimit=%d reflexsleep=%d reflexplace=%d renderw=%d renderh=%d tol=%d\n", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.warmup, g_cfg.fgMinFps, g_cfg.baseFpsLimit, g_cfg.reflexSleep, g_cfg.reflexPlace, g_cfg.renderW, g_cfg.renderH, g_cfg.tol);
         o += Fmt("  camauto=%d camhold=%d velfallback=%d viewrect=%d c2pauto=%d cutdetect=%d hudless=%d shadercache=%d psoretry=%d sldir=%s\n", g_cfg.camAuto, g_cfg.camHold, g_cfg.velFallback, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect, g_cfg.hudless, g_cfg.shaderCache, g_cfg.psoRetry, Narrow(g_cfg.slDir.c_str()).c_str());
+        o += Fmt("  menudetect=%d dynres=%d reflexmode=%s showvram=%d\n", g_cfg.menuDetect, g_cfg.dynRes, SnReflexModeName(g_cfg.reflexMode), g_cfg.showVram);
         o += Fmt("  overlay=%d key=%s hook=%d\n", g_cfg.overlay, KeyNameOf(g_cfg.overlayKey), g_cfg.overlayHook);
         o += "\nLOG TAIL (last lines of the injector's own log, kept in memory even when log=0)\n----------------------------------------------------------------------------\n";
         for (auto& l : LogRingSnapshot()) o += l + "\n";
