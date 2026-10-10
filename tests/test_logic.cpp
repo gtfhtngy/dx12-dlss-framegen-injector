@@ -6,6 +6,8 @@ static int g_fail = 0, g_n = 0;
 #define CHECK(c) do { g_n++; if (!(c)) { g_fail++; printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 int main(int argc, char** argv) {
     // ---- presets
+    CHECK(SnReflexModeParse("off") == 0); CHECK(SnReflexModeParse("OFF\r\n") == 0); CHECK(SnReflexModeParse("0") == 0); CHECK(SnReflexModeParse("lowlatency") == 1); CHECK(SnReflexModeParse("Boost") == 2); CHECK(SnReflexModeParse("2") == 2);
+    CHECK(SnReflexModeParse("") == 1); CHECK(SnReflexModeParse("nonsense") == 1); for (int i = 0; i < 3; i++) CHECK(SnReflexModeParse(SnReflexModeName(i)) == i);
     CHECK(SnPresetParse("Quality") == SN_PRESET_QUALITY); CHECK(SnPresetParse("balanced\r\n") == SN_PRESET_BALANCED); CHECK(SnPresetParse("PERFORMANCE") == SN_PRESET_PERFORMANCE); CHECK(SnPresetParse("custom") == SN_PRESET_CUSTOM); CHECK(SnPresetParse("nonsense") == SN_PRESET_CUSTOM); CHECK(SnPresetParse("") == SN_PRESET_CUSTOM);
     { SnPreset p; CHECK(SnPresetGet(SN_PRESET_BALANCED, &p) && p.fgMinFps == 24 && p.fgDelay == 30 && p.camStale == 30 && p.mult == 2);
       CHECK(SnPresetGet(SN_PRESET_QUALITY, &p) && p.fgMinFps == 30 && p.mult == 2); CHECK(SnPresetGet(SN_PRESET_PERFORMANCE, &p) && p.fgMinFps == 0 && p.mult == 4); CHECK(!SnPresetGet(SN_PRESET_CUSTOM, &p)); }
