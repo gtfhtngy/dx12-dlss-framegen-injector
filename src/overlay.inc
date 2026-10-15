@@ -18,7 +18,7 @@ static inline double OvNowMs() { if (!g_ovQf.QuadPart) QueryPerformanceFrequency
 static bool OvForegroundIsUs() { HWND h = GetForegroundWindow(); if (!h) return false; DWORD pid = 0; GetWindowThreadProcessId(h, &pid); return pid == GetCurrentProcessId(); }
 
 enum { C_TEXT, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_TITLE };
-enum OvItem { I_FG, I_PRESET, I_MULT, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWVRAM, I_MINFPS, I_CAP, I_OUTCAP, I_REFLEX, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
+enum OvItem { I_FG, I_PRESET, I_MULT, I_TARGET, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWGRAPH, I_SHOWVRAM, I_MINFPS, I_CAP, I_OUTCAP, I_REFLEX, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
 struct OvGlobals {
     std::atomic<bool> menuOpen{ false }; int sel = 0;
     std::atomic<unsigned> qHead{ 0 }, qTail{ 0 }; unsigned char q[64] = {};
@@ -127,6 +127,7 @@ static void Diag_OnVerdictChanged() {
 
 // ------------------------------------------------------------------ menu model
 static const int kMinFpsSteps[] = { 0, 20, 24, 30, 40, 45, 60 };
+static const int kTargetSteps[] = { 0, 60, 72, 90, 100, 120, 144, 165, 180, 240 };   // 1.0.0: target-fps mode
 static const int kCapSteps[] = { 0, 30, 40, 45, 60, 72, 90, 120, 144, 165 };
 static const int kScaleSteps[] = { 75, 100, 125, 150, 175, 200 };
 static const int kOpacitySteps[] = { 40, 60, 80, 100 };
@@ -153,9 +154,9 @@ static void OvToggleFg() {
     OvToast(g_cfg.fg ? "Frame Generation: ON" : "Frame Generation: OFF", g_cfg.fg ? C_GREEN : C_YELLOW);
 }
 static void OvToggleHud() {
-    static int sv = 0, sg = 0, sf = 0, sm = 0; bool any = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram;
-    if (any) { sv = g_cfg.showFps; sg = g_cfg.showFgFps; sf = g_cfg.showFrameTime; sm = g_cfg.showVram; g_cfg.showFps = g_cfg.showFgFps = g_cfg.showFrameTime = g_cfg.showVram = 0; OvToast("HUD: OFF", C_GRAY); }
-    else { if (sv || sg || sf || sm) { g_cfg.showFps = sv; g_cfg.showFgFps = sg; g_cfg.showFrameTime = sf; g_cfg.showVram = sm; } else { g_cfg.showFps = 1; g_cfg.showFgFps = 1; } OvToast("HUD: ON", C_GREEN); }
+    static int sv = 0, sg = 0, sf = 0, sm = 0, sgr = 0; bool any = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram || g_cfg.showGraph;
+    if (any) { sv = g_cfg.showFps; sg = g_cfg.showFgFps; sf = g_cfg.showFrameTime; sm = g_cfg.showVram; sgr = g_cfg.showGraph; g_cfg.showFps = g_cfg.showFgFps = g_cfg.showFrameTime = g_cfg.showVram = g_cfg.showGraph = 0; OvToast("HUD: OFF", C_GRAY); }
+    else { if (sv || sg || sf || sm || sgr) { g_cfg.showFps = sv; g_cfg.showFgFps = sg; g_cfg.showFrameTime = sf; g_cfg.showVram = sm; g_cfg.showGraph = sgr; } else { g_cfg.showFps = 1; g_cfg.showFgFps = 1; } OvToast("HUD: ON", C_GREEN); }
 }
 static void OvAdjust(int item, int dir, bool enter) {
     auto tog = [&](int& v, const char* key, const char* name) { v = v ? 0 : 1; CfgSetInt(key, v); Log("menu: %s = %d", name, v); };
@@ -163,6 +164,8 @@ static void OvAdjust(int item, int dir, bool enter) {
     case I_FG: if (g_acTripped.load()) { OvSay("Frame generation is blocked: an anti-cheat was found.", true); break; } tog(g_cfg.fg, "fg", "frame generation"); if (g_cfg.fg) g_forceReset = true; break;
     case I_PRESET: OvApplyPreset((g_cfg.preset + (dir >= 0 ? 1 : SN_PRESET_COUNT - 1)) % SN_PRESET_COUNT); break;
     case I_MULT: { int mx = g_maxGen ? (int)g_maxGen + 1 : 2; int m = g_cfg.mult + dir; if (m > mx) m = 2; if (m < 2) m = mx; g_cfg.mult = m; CfgSetInt("mult", m); OvPresetCustom(); Log("menu: multiplier = %d", m); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break; }
+    case I_TARGET: g_cfg.targetFps = StepCycle(kTargetSteps, g_cfg.targetFps, dir >= 0 ? 1 : -1); CfgSetInt("targetfps", g_cfg.targetFps); OvPresetCustom(); Log("menu: target fps = %d", g_cfg.targetFps); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break;
+    case I_SHOWGRAPH: tog(g_cfg.showGraph, "showgraph", "show frame-time graph"); break;
     case I_SHOWFPS: tog(g_cfg.showFps, "showfps", "show real fps"); break;
     case I_SHOWFG: tog(g_cfg.showFgFps, "showfgfps", "show DLSS-FG fps"); break;
     case I_SHOWFT: tog(g_cfg.showFrameTime, "showframetime", "show frame time"); break;
@@ -205,7 +208,9 @@ static void OvProcessKeys() {
 }
 
 // ------------------------------------------------------------------ panel content
-struct OvLine { std::string t; int col = C_TEXT; bool sel = false; };
+struct OvLine { std::string t; int col = C_TEXT; bool sel = false; int graph = 0; };   // graph > 0: first line of a frame-time graph spanning that many lines; graph < 0: a line covered by the graph
+static const int kGraphLines = 4;
+static void OvPushGraph(std::vector<OvLine>& L) { L.push_back({ "", C_GRAY, false, kGraphLines }); for (int i = 1; i < kGraphLines; i++) L.push_back({ "", C_TEXT, false, -1 }); }
 static void OvWrap(std::vector<OvLine>& out, const std::string& s, int col, size_t width, const char* indent = "") {
     size_t p = 0; bool first = true;
     while (p < s.size()) { size_t e = std::min(s.size(), p + width); if (e < s.size()) { size_t sp = s.rfind(' ', e); if (sp != std::string::npos && sp > p + width / 2) e = sp; }
@@ -225,10 +230,11 @@ static void OvBuild(std::vector<OvLine>& L) {
         OvWrap(L, std::string("(If you are still in a menu / loading screen, wait until gameplay.)  Press ") + KeyNameOf(g_cfg.overlayKey) + " to open the menu and dismiss this notice.", C_GRAY, 58);
     }
     // ---- HUD lines
-    bool anyHud = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram;
+    bool anyHud = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram || g_cfg.showGraph;
     if (anyHud) {
         if (g_cfg.showFps) { char b[96]; snprintf(b, sizeof b, "Real FPS : %6.1f", g_st.fps); L.push_back({ b, C_TEXT, false }); }
         if (g_cfg.showFrameTime) { char b[96]; snprintf(b, sizeof b, "Frame    : %5.2f ms   1%% low %5.1f", g_st.ft, g_st.low1); L.push_back({ b, C_TEXT, false }); }
+        if (g_cfg.showGraph) OvPushGraph(L);
         if (g_cfg.showVram) { char b[96]; if (g_wasOn && g_stVramMB > 0) snprintf(b, sizeof b, "FG VRAM  : ~%llu MB (DLSS-G)", g_stVramMB); else snprintf(b, sizeof b, "FG VRAM  : %s", g_wasOn ? "measuring ..." : "- (FG off)"); L.push_back({ b, C_TEXT, false }); }
         if (g_cfg.showFgFps) {
             char b[128];
@@ -258,10 +264,12 @@ static void OvBuild(std::vector<OvLine>& L) {
         static const char* posN[] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
         row(I_FG, "Frame Generation", OnOff(g_cfg.fg));
         { static const char* pn[] = { "Custom", "Quality", "Balanced", "Performance" }; row(I_PRESET, "Preset", pn[g_cfg.preset & 3]); }
-        row(I_MULT, "Multiplier", Fmt("%dx%s", g_cfg.mult, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : ""));
+        row(I_MULT, "Multiplier", g_cfg.targetFps > 0 ? Fmt("AUTO  (now %dx, see target fps)", CurMult()) : Fmt("%dx%s", g_cfg.mult, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : ""));
+        row(I_TARGET, "Target output fps (auto x)", g_cfg.targetFps ? Fmt("%d fps%s", g_cfg.targetFps, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : "") : std::string("OFF"));
         row(I_SHOWFPS, "Show REAL fps", OnOff(g_cfg.showFps));
         row(I_SHOWFG, "Show DLSS-FG fps", OnOff(g_cfg.showFgFps));
         row(I_SHOWFT, "Show frame time / 1% low", OnOff(g_cfg.showFrameTime));
+        row(I_SHOWGRAPH, "Show frame-time graph", OnOff(g_cfg.showGraph));
         row(I_SHOWVRAM, "Show DLSS-G VRAM estimate", OnOff(g_cfg.showVram));
         row(I_MINFPS, "Pause FG below base fps", g_cfg.fgMinFps ? Fmt("%d fps", g_cfg.fgMinFps) : std::string("OFF"));
         row(I_CAP, "Base fps cap (Reflex)", g_cfg.baseFpsLimit ? Fmt("%d fps", g_cfg.baseFpsLimit) : std::string("OFF"));
@@ -308,11 +316,30 @@ static bool OvPanelEnsure(int px) {
     g_pn.capW = cw; g_pn.capH = ch; g_pn.px = px; SetBkMode(dc, TRANSPARENT); return true;
 }
 static COLORREF OvColor(int c) { switch (c) { case C_GREEN: return RGB(110, 235, 130); case C_YELLOW: return RGB(255, 213, 90); case C_RED: return RGB(255, 100, 90); case C_GRAY: return RGB(165, 170, 180); case C_TITLE: return RGB(120, 200, 255); default: return RGB(240, 242, 246); } }
+// 1.0.0: frame-time graph of the last ~120 real frames (newest on the right). Bars: green = normal, yellow = 25 % above the average, red = 70 % above (a visible spike = stutter / "ticking").
+static void OvDrawGraph(HDC dc, int x0, int y0, int x1, int y1) {
+    const int N = 120; int n = std::min(N, g_st.n); int w = x1 - x0, h = y1 - y0; if (w < 20 || h < 8) return;
+    RECT r = { x0, y0, x1, y1 }; HBRUSH bg = CreateSolidBrush(RGB(22, 26, 36)); FillRect(dc, &r, bg); DeleteObject(bg);
+    if (n < 2) return;
+    float v[N]; double sum = 0, mx = 0;
+    for (int i = 0; i < n; i++) { int idx = ((g_st.pos - n + i) % 600 + 600) % 600; v[i] = g_st.ring[idx]; sum += v[i]; mx = std::max<double>(mx, v[i]); }
+    double avg = sum / n; static const double ladder[] = { 8.4, 16.8, 25.0, 33.4, 50.0, 66.8, 100.0 }; double top = ladder[6]; for (double c : ladder) if (mx * 1.05 <= c) { top = c; break; }
+    HBRUSH bgr = CreateSolidBrush(RGB(110, 235, 130)), byl = CreateSolidBrush(RGB(255, 213, 90)), brd = CreateSolidBrush(RGB(255, 100, 90)), bln = CreateSolidBrush(RGB(120, 130, 150));
+    int bw = std::max(1, w / N);
+    for (int i = 0; i < n; i++) {
+        int bh = std::max(1, std::min(h, (int)(std::min<double>(v[i], top) / top * h + 0.5))); int xr = x1 - (n - 1 - i) * bw, xl = xr - std::max(1, bw - (bw > 2 ? 1 : 0));
+        RECT b = { xl, y1 - bh, xr, y1 }; FillRect(dc, &b, v[i] <= avg * 1.25 ? bgr : v[i] <= avg * 1.7 ? byl : brd);
+    }
+    int ya = y1 - (int)(avg / top * h + 0.5); if (ya >= y0 && ya < y1) { RECT a = { x0, ya, x1, ya + 1 }; FillRect(dc, &a, bln); }
+    DeleteObject(bgr); DeleteObject(byl); DeleteObject(brd); DeleteObject(bln);
+    char t[48]; snprintf(t, sizeof t, "%.0f ms", top); SetTextColor(dc, OvColor(C_GRAY)); TextOutA(dc, x0 + 2, y0, t, (int)strlen(t));
+}
 // renders the lines; returns false if nothing to draw
 static bool OvPanelRender(const std::vector<OvLine>& L, int px) {
     if (!OvPanelEnsure(px)) return false;
     HDC dc = g_pn.dc; TEXTMETRICA tm = {}; GetTextMetricsA(dc, &tm); int lh = tm.tmHeight + std::max(2, px / 7), pad = std::max(6, px / 3);
-    int maxW = 0; for (auto& l : L) { SIZE sz = {}; GetTextExtentPoint32A(dc, l.t.c_str(), (int)l.t.size(), &sz); maxW = std::max(maxW, (int)sz.cx); }
+    int maxW = 0; bool hasGraph = false; for (auto& l : L) { SIZE sz = {}; GetTextExtentPoint32A(dc, l.t.c_str(), (int)l.t.size(), &sz); maxW = std::max(maxW, (int)sz.cx); if (l.graph > 0) hasGraph = true; }
+    if (hasGraph) maxW = std::max(maxW, px * 14);   // the graph needs a minimum width
     int nl = (int)std::min<size_t>(L.size(), (size_t)((g_pn.capH - 2 * pad) / lh));
     int w = std::min(g_pn.capW, maxW + 2 * pad), h = std::min(g_pn.capH, nl * lh + 2 * pad); if (w < 8 || h < 8) return false;
     RECT rc = { 0, 0, w, h }; HBRUSH bg = CreateSolidBrush(RGB(12, 14, 20)); FillRect(dc, &rc, bg); DeleteObject(bg);
@@ -320,6 +347,8 @@ static bool OvPanelRender(const std::vector<OvLine>& L, int px) {
     for (int i = 0; i < nl; i++) {
         int y = pad + i * lh;
         if (L[i].sel) { RECT sr = { 2, y - 1, w - 2, y + lh - 1 }; HBRUSH sb = CreateSolidBrush(RGB(34, 66, 112)); FillRect(dc, &sr, sb); DeleteObject(sb); }
+        if (L[i].graph > 0) { int gh = std::min(L[i].graph, nl - i) * lh - 3; if (gh > 8) OvDrawGraph(dc, pad, y, w - pad, y + gh); continue; }
+        if (L[i].graph < 0) continue;
         SetTextColor(dc, OvColor(L[i].col)); TextOutA(dc, pad, y, L[i].t.c_str(), (int)L[i].t.size());
     }
     GdiFlush(); g_pn.w = w; g_pn.h = h; g_pn.valid = true; return true;
@@ -516,7 +545,7 @@ static void OvDraw(IDXGISwapChain* sc) {
     if (L.empty()) return;
     // font size from the back-buffer height
     double fh = g_dispH ? (double)g_dispH / 1080.0 : 1.0; int px = (int)(18.0 * fh * (double)g_cfg.overlayScale / 100.0 + 0.5); px = std::min(64, std::max(12, px));
-    std::string key; for (auto& l : L) { key += l.t; key += (char)('0' + l.col); key += l.sel ? '*' : '.'; key += '\n'; }
+    std::string key; for (auto& l : L) { key += l.t; key += (char)('0' + l.col); key += l.sel ? '*' : '.'; if (l.graph > 0) key += std::to_string((long long)(OvNowMs() / 100.0)); key += '\n'; }   // 1.0.0: a graph is redrawn 10x per second
     size_t h = std::hash<std::string>()(key) ^ ((size_t)px << 40);
     if (h != g_pn.hash || !g_pn.valid || g_pn.px != px) {
         if (!OvPanelRender(L, px)) return; g_pn.hash = h; g_ovNeedUpload = true;
