@@ -30,6 +30,13 @@ int main(int argc, char** argv) {
     { uint16_t one = 0x3C00, two = 0x4000, h[4] = { one, one, one, one }, k[4] = { one, two, one, one }, m[4] = { one, one, one, 0 }; CHECK(SnHalf(one) == 1.0f && SnHalf(two) == 2.0f && SnHalf(0xC000) == -2.0f && SnHalf(0x3800) == 0.5f);
       CHECK(SnPixDiffer(SN_PIX_F16x4, (uint8_t*)h, (uint8_t*)k)); CHECK(!SnPixDiffer(SN_PIX_F16x4, (uint8_t*)h, (uint8_t*)m)); }
     { uint8_t A[16] = { 0, 0, 0, 0, 10, 10, 10, 0, 20, 20, 20, 0, 30, 30, 30, 0 }, B[16] = { 0, 0, 0, 0, 10, 10, 10, 0, 90, 90, 90, 0, 90, 90, 90, 0 }; CHECK(SnChangedFraction(SN_PIX_U8x4, A, B, 4, 4) == 0.5); CHECK(SnChangedFraction(SN_PIX_U8x4, A, B, 0, 4) == 0.0); }
+    // ---- target-fps mode (v31)
+    CHECK(SnPickMult(100, 144, 4, 2) == 2); CHECK(SnPickMult(60, 144, 4, 2) == 3); CHECK(SnPickMult(40, 144, 4, 2) == 4); CHECK(SnPickMult(30, 144, 4, 2) == 4);   // 4x is the most the GPU gives
+    CHECK(SnPickMult(60, 144, 2, 2) == 2); CHECK(SnPickMult(60, 144, 1, 3) == 2);                                                                                    // 40-series: max 2x
+    CHECK(SnPickMult(80, 144, 4, 3) == 2); CHECK(SnPickMult(71, 144, 4, 3) == 3); CHECK(SnPickMult(73, 144, 4, 2) == 2);                                              // dead band: 71 fps -> 71*2=142 (>=97 %) stays 2x
+    CHECK(SnPickMult(70, 144, 4, 2) == 2); CHECK(SnPickMult(69, 144, 4, 2) == 3); CHECK(SnPickMult(50, 144, 4, 3) == 3); CHECK(SnPickMult(49, 144, 4, 3) == 3);
+    CHECK(SnPickMult(0, 144, 4, 3) == 3); CHECK(SnPickMult(100, 0, 4, 3) == 3); CHECK(SnPickMult(-5, 144, 4, 2) == 2); CHECK(SnPickMult(100, 144, 4, 9) == 2); CHECK(SnPickMult(10, 144, 4, 0) == 4);
+    { int m = 2; for (int i = 0; i < 20; i++) { double fps = 69.0 + (i % 2) * 2.0; m = SnPickMult(fps, 144, 4, m); } CHECK(m == 2 || m == 3); int m2 = m; for (int i = 0; i < 20; i++) { double fps = 70.0 + (i % 2) * 1.0; int n = SnPickMult(fps, 144, 4, m2); CHECK(n == m2 || n == 2); m2 = n; } }
     // ---- anti-cheat names
     CHECK(SnAcName("easyanticheat") && !strcmp(SnAcName("easyanticheat"), "Easy Anti-Cheat")); CHECK(SnAcName("easyanticheat_eos_setup.exe")); CHECK(SnAcName("start_protected_game.exe")); CHECK(SnAcName("easyanticheat_x64.dll"));
     CHECK(SnAcName("battleye") && SnAcName("beservice_x64.exe") && SnAcName("beclient_x64.dll") && !strcmp(SnAcName("bedaisy.sys"), "BattlEye"));
@@ -53,5 +60,16 @@ int main(int argc, char** argv) {
       std::string in = "# comment fg=1\r\nfg=1\r\nmult=2\r\n  mult2 = 5\r\n"; std::string out = SnCfgApplyChanges(in, ch);
       CHECK(out.find("# comment fg=1\r\n") == 0); CHECK(out.find("\r\nfg=0\r\n") != std::string::npos); CHECK(out.find("mult=2\r\n") != std::string::npos); CHECK(out.find("newkey=7\r\n") != std::string::npos); CHECK(out.find("fg=1\r\nmult") == std::string::npos);
       std::string in2 = "a=1\nb=2"; std::string o2 = SnCfgApplyChanges(in2, { { "b", "9" } }); CHECK(o2 == "a=1\nb=9\n"); CHECK(SnCfgApplyChanges("", { { "x", "1" } }).find("x=1\n") != std::string::npos); }
+    // ---- 1.1.0 pointer filter (lock-free pre-filter used by the hooks)
+    { SnPtrFilter f; std::vector<const void*> all; for (int i = 0; i < 300; i++) all.push_back((const void*)(uintptr_t)(0x000002bb00000000ull + (uint64_t)i * 0x1230ull + 0x40ull));
+      for (auto p : all) CHECK(!f.Maybe(p) || true);                                    // empty filter: anything may be a (rare) collision only after Add
+      CHECK(!f.Maybe((const void*)0x1000));
+      for (auto p : all) f.Add(p);
+      int miss = 0; for (auto p : all) if (!f.Maybe(p)) miss++; CHECK(miss == 0);       // no false negatives
+      int fp = 0, tot = 0; for (int i = 0; i < 20000; i++) { const void* q = (const void*)(uintptr_t)(0x00007ff600000000ull + (uint64_t)i * 0x2a0ull + 8ull); tot++; if (f.Maybe(q)) fp++; } CHECK(fp * 100 < tot * 3);   // < 3 % false positives with 300 entries
+      std::vector<const void*> keep(all.begin(), all.begin() + 40); f.Rebuild(keep);
+      miss = 0; for (auto p : keep) if (!f.Maybe(p)) miss++; CHECK(miss == 0);          // kept entries survive a rebuild
+      int still = 0; for (size_t i = 40; i < all.size(); i++) if (f.Maybe(all[i])) still++; CHECK(still < 40);   // most dropped entries are gone again
+      f.Rebuild({}); int any = 0; for (auto p : all) if (f.Maybe(p)) any++; CHECK(any == 0); }
     printf("%d checks, %d failed\n", g_n, g_fail); return g_fail ? 1 : 0;
 }
