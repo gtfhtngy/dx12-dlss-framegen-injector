@@ -74,6 +74,12 @@ struct Cfg {
     int dynRes = 0;          // 1 = DLSS-G flag eDynamicResolutionEnabled (+ dynamicResWidth/Height = current view rect): for games whose render resolution changes while playing
     int reflexMode = 1;      // 0 = off | 1 = low latency (before v29 the only mode) | 2 = low latency + boost.  FG needs Reflex markers; "off" is not recommended while FG runs
     int showVram = 0;        // HUD line: VRAM that DLSS-G itself reports (estimatedVRAMUsageInBytes). Turning it on also sets eRequestVRAMEstimate
+    // ---- 1.0.0
+    int targetFps = 0;       // target-fps mode: 0 = off (mult is used), N = the DLL picks the smallest multiplier (2x..GPU max) whose output reaches N fps with the measured base fps
+    int showGraph = 0;       // HUD: frame-time graph of the last ~2 seconds of REAL frames (spikes = stutter / "ticking")
+    int hookFast = 1;        // 1.1.0: 1 = lock-free pre-filters in the D3D12 hooks (barrier / render-target bind / descriptor copy) + census off after frame 3000; 0 = exact 1.0.0 behaviour
+    int hookProf = 0;        // 1.1.0: 1 = measure the CPU time of the injector's own hook code and log it every 600 frames (diagnostic, costs a little itself)
+    int camFast = 1;         // 1 = once the camera of this frame is known (offsets locked) the per-draw camera search skips unknown buffers (less CPU work per draw call)
     std::wstring slDir;      // folder with sl.interposer.dll etc. (default: next to the game exe)
 } g_cfg;
 
@@ -150,7 +156,7 @@ static void LoadCfg() {
                 "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
                 "# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)\n"
                 "# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)\n"
-                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=0\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n"
+                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=2\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n"
                 "# ---- v25 overlay / menu (press the overlay key in game; arrows + Enter, changes are saved here automatically)\n"
                 "# overlay      : 1 = overlay + menu available, 0 = completely off\n# overlaykey   : key that opens/closes the menu: INSERT (default), F1..F12, HOME, END, PAGEUP, ... or a virtual-key number like 0x2D\n"
                 "# showfps      : 1 = show the REAL fps (how fast the game itself renders)\n# showfgfps    : 1 = show the DLSS Frame Generation output fps\n# showframetime: 1 = show frame time + 1%% low\n"
@@ -169,7 +175,16 @@ static void LoadCfg() {
                  "# anticheat   : 1 = (default) the injector switches itself OFF when an anti-cheat is found. 0 = skip that check (offline / anti-cheat-free launch only, at your own risk)\n"
                  "# crashdump   : 1 = mini-dump + summary (SN_DLSSG_crash_*.dmp/.txt) when a crash happens inside this injector / Streamline / the driver\n"
                  "# autolearn   : 1 = camera offsets found by the scan (projoff/noaaoff/mvoff) are written back here so the next start skips the scan\n"
-                 "preset=custom\nfpscap=0\nfgkey=F9\nhudkey=F8\nanticheat=1\ncrashdump=1\nautolearn=1\n";
+                 "preset=custom\nfpscap=0\nfgkey=F9\nhudkey=F8\nanticheat=1\ncrashdump=1\nautolearn=1\n"
+                 "# ---- 1.0.0\n"
+                 "# targetfps  : 0 = off (mult is used). N = target mode: the DLL picks the smallest multiplier (2x .. GPU max) that reaches N output fps with the measured base fps (e.g. 144). Needs frame generation on\n"
+                 "# showgraph  : 1 = HUD frame-time graph of the last ~2 seconds of real frames (spikes = stutter)\n"
+                 "# camfast    : 1 = (default) less CPU work per draw call once the camera of the frame is known; 0 = old behaviour\n"
+                 "# hudless=2 is now the default for new configs (auto-detects the HUD-less capture point in the first minute of gameplay and saves the result)\n"
+                 "# ---- 1.1.0\n"
+                 "# hookfast   : 1 = (default) less CPU/lock work in the injector's D3D12 hooks (resource barriers, render-target binds, descriptor copies); 0 = exact 1.0.0 behaviour (use it to compare)\n"
+                 "# hookprof   : 1 = log how much CPU time the injector's own hook code uses per frame (hook-prof lines, every 600 frames); 0 = off\n"
+                 "targetfps=0\nshowgraph=0\ncamfast=1\nhookfast=1\nhookprof=0\n";
             f = _wfopen(p.c_str(), L"w"); if (f) { fwrite(t.data(), 1, t.size(), f);
             fclose(f); }
         }
@@ -204,6 +219,7 @@ static void LoadCfg() {
             else if (!strcmp(k, "anticheat")) g_cfg.antiCheat = iv ? 1 : 0; else if (!strcmp(k, "crashdump")) g_cfg.crashDump = iv ? 1 : 0; else if (!strcmp(k, "autolearn")) g_cfg.autoLearn = iv ? 1 : 0;
             else if (!strcmp(k, "menudetect")) g_cfg.menuDetect = iv ? 1 : 0; else if (!strcmp(k, "dynres")) g_cfg.dynRes = iv ? 1 : 0;
             else if (!strcmp(k, "reflexmode")) g_cfg.reflexMode = SnReflexModeParse(v); else if (!strcmp(k, "showvram")) g_cfg.showVram = iv ? 1 : 0;
+            else if (!strcmp(k, "targetfps")) g_cfg.targetFps = iv; else if (!strcmp(k, "showgraph")) g_cfg.showGraph = iv ? 1 : 0; else if (!strcmp(k, "camfast")) g_cfg.camFast = iv ? 1 : 0; else if (!strcmp(k, "hookfast")) g_cfg.hookFast = iv ? 1 : 0; else if (!strcmp(k, "hookprof")) g_cfg.hookProf = iv ? 1 : 0;
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
             else if (!strcmp(k, "overlay")) g_cfg.overlay = iv ? 1 : 0; else if (!strcmp(k, "overlaykey")) g_cfg.overlayKey = ParseKeyName(v);
             else if (!strcmp(k, "showfps")) g_cfg.showFps = iv ? 1 : 0; else if (!strcmp(k, "showfgfps")) g_cfg.showFgFps = iv ? 1 : 0; else if (!strcmp(k, "showframetime")) g_cfg.showFrameTime = iv ? 1 : 0;
@@ -221,10 +237,14 @@ static void LoadCfg() {
     if (g_cfg.overlayPos < 0 || g_cfg.overlayPos > 3) g_cfg.overlayPos = 0;
     g_cfg.overlayScale = std::min(250, std::max(50, g_cfg.overlayScale)); g_cfg.overlayOpacity = std::min(100, std::max(20, g_cfg.overlayOpacity));
     g_cfg.psoCacheMB = std::min(4096, std::max(32, g_cfg.psoCacheMB));
+    if (g_cfg.targetFps < 0) g_cfg.targetFps = 0; if (g_cfg.targetFps > 1000) g_cfg.targetFps = 1000;
     if (g_cfg.fgMinFps < 0) g_cfg.fgMinFps = 0; if (g_cfg.baseFpsLimit < 0) g_cfg.baseFpsLimit = 0;
     if (g_cfg.hudless < 0 || g_cfg.hudless > 2) g_cfg.hudless = 0; if (g_cfg.fpsCap < -1) g_cfg.fpsCap = 0; if (g_cfg.fpsCap > 1000) g_cfg.fpsCap = 1000;
     if (g_cfg.fgKey == g_cfg.overlayKey) g_cfg.fgKey = 0; if (g_cfg.hudKey == g_cfg.overlayKey || g_cfg.hudKey == g_cfg.fgKey) g_cfg.hudKey = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG " SN_VERSION " = 1.0.0 + lighter D3D12 hooks (hookfast: lock-free pre-filters for resource barriers / render-target binds / descriptor copies, census off after frame 3000), optional hook CPU profile (hookprof)");
+    Log("SN_DLSSG 1.0.0 = v30 + target-fps mode (targetfps), frame-time graph (showgraph), less camera-search work per draw (camfast), hudless=2 default for new configs");
+    Log("CFG " SN_VERSION " targetfps=%d showgraph=%d camfast=%d hookfast=%d hookprof=%d", g_cfg.targetFps, g_cfg.showGraph, g_cfg.camFast, g_cfg.hookFast, g_cfg.hookProf);
     Log("SN_DLSSG v30 = v29 with performance fixes: VRAM estimate only on demand (was per frame), dynamic-resolution flag only when the view rect really changes");
     Log("SN_DLSSG v29 = v28 + DLSS-G options: full-screen menu detection, dynamic resolution flag, Reflex mode (off / low latency / boost), DLSS-G VRAM estimate in the HUD");
     Log("CFG v29 menudetect=%d dynres=%d reflexmode=%s showvram=%d", g_cfg.menuDetect, g_cfg.dynRes, SnReflexModeName(g_cfg.reflexMode), g_cfg.showVram);
