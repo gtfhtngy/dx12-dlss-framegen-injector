@@ -2,6 +2,7 @@
 //   presets, output-fps cap maths, HUD-less auto-detection decision, anti-cheat name lists, UE version string scan, ZIP (store) writer, user-name redaction.
 #pragma once
 #include <cstdint>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <cmath>
@@ -48,6 +49,18 @@ static inline int SnBaseLimit(int outCap, int baseCfg, int mult, bool fgActive) 
     if (outCap > 0) { int m = fgActive ? std::max(1, mult) : 1; base = std::max(10, outCap / m); }
     if (baseCfg > 0 && (base == 0 || baseCfg < base)) base = baseCfg;
     return base;
+}
+
+// v31: target-fps mode. Picks the SMALLEST multiplier (2..maxMult) whose output reaches 'targetFps' with the measured base fps.
+// The current multiplier is kept inside a +-3 % dead band so it never flaps: it goes up only when the output is below 97 % of the target,
+// and down only when one step lower still reaches 103 % of the target. targetFps <= 0 or an unknown base fps keep the current multiplier.
+static inline int SnPickMult(double baseFps, int targetFps, int maxMult, int curMult) {
+    if (maxMult < 2) maxMult = 2; if (curMult < 2) curMult = 2; if (curMult > maxMult) curMult = maxMult;
+    if (targetFps <= 0 || !(baseFps > 1.0)) return curMult;
+    int m = curMult;
+    if (baseFps * m < targetFps * 0.97) { while (m < maxMult && baseFps * m < targetFps * 0.97) m++; return m; }
+    while (m > 2 && baseFps * (m - 1) >= targetFps * 1.03) m--;
+    return m;
 }
 
 // ------------------------------------------------------------------ HUD-less auto detection
@@ -187,3 +200,22 @@ static inline std::string SnCfgApplyChanges(const std::string& in, const std::ma
     return out;
 }
 
+// ------------------------------------------------------------------ 1.1.0: lock-free "is this pointer possibly in the table?" pre-filter
+// A 65536-bit bitmap (one hash bit per pointer). Maybe() never gives a false NEGATIVE for a pointer that was Add()ed (and not dropped by Rebuild()),
+// it may give a false positive - the caller then simply takes the normal (locked) path. Used by the D3D12 hooks so that the thousands of
+// barriers / render-target binds per frame that do not involve a tracked depth/velocity buffer need no lock and no hash-table lookup.
+struct SnPtrFilter {
+    static const unsigned kWords = 1024;
+    std::atomic<uint64_t> w[kWords];
+    SnPtrFilter() { for (unsigned i = 0; i < kWords; i++) w[i].store(0, std::memory_order_relaxed); }
+    static inline unsigned Idx(const void* p) { return (unsigned)(((uint64_t)(uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull >> 48); }   // 16 bits
+    inline bool Maybe(const void* p) const { unsigned i = Idx(p); return ((w[i >> 6].load(std::memory_order_acquire) >> (i & 63)) & 1ull) != 0; }
+    inline void Add(const void* p) { unsigned i = Idx(p); w[i >> 6].fetch_or(1ull << (i & 63), std::memory_order_release); }
+    // replace the content by exactly these pointers (the caller must keep Add() calls out while this runs, e.g. by holding the table's exclusive lock).
+    // Every kept pointer's bit is present in the stored words, so concurrent Maybe() calls never miss a kept pointer.
+    void Rebuild(const std::vector<const void*>& keep) {
+        std::vector<uint64_t> tmp(kWords, 0ull);
+        for (const void* p : keep) { unsigned i = Idx(p); tmp[i >> 6] |= 1ull << (i & 63); }
+        for (unsigned i = 0; i < kWords; i++) w[i].store(tmp[i], std::memory_order_release);
+    }
+};
