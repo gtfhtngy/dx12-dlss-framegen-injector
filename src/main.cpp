@@ -14,7 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
-#define SN_VERSION "v30"
+#define SN_VERSION "1.1.0"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -236,6 +236,17 @@ struct ResMeta { ID3D12Resource* res = nullptr; UINT w = 0, h = 0; DXGI_FORMAT f
 static std::unordered_map<void*, ResMeta> g_res;
 static std::unordered_map<SIZE_T, void*> g_rtvToRes, g_dsvToRes;
 static std::shared_mutex g_resMx; static std::mutex g_stateMx;
+// 1.1.0 (hookfast): lock-free pre-filter for g_res. g_res holds only the few depth/velocity candidates, but the hooks below (resource barriers, render-target binds,
+// clears, copies) run thousands of times per frame on every worker thread and used to take g_resMx + do a hash lookup for EACH of them. Add() is called under the
+// exclusive lock when an entry is inserted, Rebuild() when entries are dropped (PruneRes): a pointer that is in g_res is never reported as "not maybe".
+static SnPtrFilter g_resFilter;
+static inline bool ResMaybe(const void* p) { return g_resFilter.Maybe(p); }
+// 1.1.0 (hookprof): optional CPU-time meter for the injector's own hook code (measured AFTER the game's original function returned, so it is only our cost)
+static inline long long NowNs();
+struct HookProf { std::atomic<long long> ns{ 0 }, calls{ 0 }; };
+static HookProf g_hp[6]; static const char* const kHpName[6] = { "barrier", "omsetrt", "clear", "copydesc", "createview", "copytex" };
+struct HpScope { int id; long long t0; explicit HpScope(int i) : id(i), t0(g_cfg.hookProf ? NowNs() : 0) {} ~HpScope() { if (t0) { g_hp[id].ns.fetch_add(NowNs() - t0, std::memory_order_relaxed); g_hp[id].calls.fetch_add(1, std::memory_order_relaxed); } } };
+static std::atomic<bool> g_censusOn{ true };   // 1.1.0: the resource census (diagnostic, global mutex) is switched off after frame 3000 when hookfast=1
 static UINT g_rtvInc = 0, g_dsvInc = 0;
 static ID3D12Device* g_device = nullptr;
 static ID3D12CommandQueue* g_queue = nullptr;          // the game's direct queue (the one the swap chain was created with)
@@ -264,20 +275,40 @@ static void RegisterRes(ID3D12Resource* res) {
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
     bool depth = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
     bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || IsVelFmt(d.Format));
-    if (!cand && !depth && (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && IsInternal((UINT)d.Width, d.Height)) CensusNote(d);
-    if (!cand) { std::shared_lock<std::shared_mutex> sl(g_resMx); if (!g_res.count((void*)res)) return; }   // loading creates thousands of RTV/DSV/SRVs: no exclusive lock for those
+    if (g_censusOn.load(std::memory_order_relaxed) && !cand && !depth && (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && IsInternal((UINT)d.Width, d.Height)) CensusNote(d);
+    if (!cand) { if (g_cfg.hookFast && !ResMaybe(res)) return; std::shared_lock<std::shared_mutex> sl(g_resMx); if (!g_res.count((void*)res)) return; }   // loading creates thousands of RTV/DSV/SRVs: no exclusive lock for those
     std::lock_guard<std::shared_mutex> lk(g_resMx);
-    auto& m = g_res[(void*)res];
+    auto& m = g_res[(void*)res]; g_resFilter.Add((void*)res);
     m.res = res; m.w = (UINT)d.Width; m.h = d.Height; m.fmt = d.Format; m.flags = d.Flags; m.cand = cand;
     if (cand && !m.held) { res->AddRef(); m.held = true; }   // keep alive: we keep raw pointers across frames
 }
-static void NoteUse(void* p, int kind) {   // hot path (every render-target bind / clear / copy on every worker thread): shared lock + atomic counters
-    if (!p) return;
-    std::shared_lock<std::shared_mutex> lk(g_resMx);
+static inline void NoteUseLocked(void* p, int kind) {   // caller holds g_resMx (shared is enough: atomic counters)
+    if (!p || (g_cfg.hookFast && !ResMaybe(p))) return;
     auto it = g_res.find(p); if (it == g_res.end()) return;
     if (kind == 0) it->second.useClear++; else if (kind == 1) it->second.useSetRT++; else if (kind == 2) it->second.useCopySrc++; else if (kind == 3) it->second.useCopyDst++; else it->second.useSRV++;
 }
+static void NoteUse(void* p, int kind) {   // hot path (every render-target bind / clear / copy on every worker thread): 1.1.0: no lock at all unless the pointer may be a tracked candidate
+    if (!p) return;
+    if (g_cfg.hookFast && !ResMaybe(p)) return;
+    std::shared_lock<std::shared_mutex> lk(g_resMx);
+    NoteUseLocked(p, kind);
+}
 static void* LookupRTV(D3D12_CPU_DESCRIPTOR_HANDLE h) { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_rtvToRes.find(h.ptr); return it != g_rtvToRes.end() ? it->second : nullptr; }
+// 1.1.0 (hookfast) helpers: ONE shared lock instead of one per lookup, and exclusive locks only when a descriptor mapping really changes
+static void NoteRtvUse(D3D12_CPU_DESCRIPTOR_HANDLE h, int kind) { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_rtvToRes.find(h.ptr); if (it != g_rtvToRes.end()) NoteUseLocked(it->second, kind); }
+static void NoteDsvUse(D3D12_CPU_DESCRIPTOR_HANDLE h, int kind) { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_dsvToRes.find(h.ptr); if (it != g_dsvToRes.end()) NoteUseLocked(it->second, kind); }
+static void SetDescMap(std::unordered_map<SIZE_T, void*>& m, SIZE_T key, void* val) {
+    { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = m.find(key); if (it != m.end() && it->second == val) return; }   // same view re-created in the same slot: nothing to write
+    std::lock_guard<std::shared_mutex> lk(g_resMx); m[key] = val;
+}
+static void CopyDescMap(std::unordered_map<SIZE_T, void*>& m, UINT num, SIZE_T dst, SIZE_T src, UINT inc) {   // CopyDescriptorsSimple: look up under the shared lock, write (rarely) under the exclusive one
+    for (UINT base = 0; base < num; base += 32) {
+        UINT n = std::min<UINT>(32u, num - base); SIZE_T dk[32]; void* dv[32]; UINT k = 0;
+        { std::shared_lock<std::shared_mutex> lk(g_resMx);
+          for (UINT i = 0; i < n; i++) { SIZE_T off = (SIZE_T)(base + i) * inc; auto it = m.find(src + off); if (it == m.end()) continue; auto dt = m.find(dst + off); if (dt != m.end() && dt->second == it->second) continue; dk[k] = dst + off; dv[k] = it->second; k++; } }
+        if (k) { std::lock_guard<std::shared_mutex> lk(g_resMx); for (UINT j = 0; j < k; j++) m[dk[j]] = dv[j]; }
+    }
+}
 
 // ---- barrier state tracking (last StateAfter for candidate resources)
 using PFN_ResBarrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
@@ -286,6 +317,8 @@ struct SubSt { UINT st[2] = { 0, 0 }; bool known[2] = { false, false }; };
 static std::unordered_map<void*, SubSt> g_state;
 static void STDMETHODCALLTYPE hkResBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     oResBarrier(cl, n, b);
+    HpScope hp(0);
+    if (g_cfg.hookFast) { bool any = false; for (UINT i = 0; i < n; i++) if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && ResMaybe(b[i].Transition.pResource)) { any = true; break; } if (!any) return; }   // 1.1.0: no tracked resource involved -> no lock, no lookup
     std::shared_lock<std::shared_mutex> lk(g_resMx);     // thousands of barriers per frame on many threads: shared lock, exclusive only for the (rare) candidate
     for (UINT i = 0; i < n; i++) {
         if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
@@ -620,7 +653,7 @@ static __attribute__((noinline)) void ProbeView(UINT64 va, bool known, int fr) {
 static std::atomic<long> g_probeN{0}, g_probeNs{0}, g_cbvPerFrame{0};
 static inline long long NowNs() { static LARGE_INTEGER f = {}; if (!f.QuadPart) QueryPerformanceFrequency(&f); LARGE_INTEGER n; QueryPerformanceCounter(&n); return (long long)((double)n.QuadPart * 1e9 / (double)f.QuadPart); }
 static void TrackCamera(UINT64 va) {
-    g_cbvCalls++;
+    { static thread_local unsigned t_cbvN = 0; if ((++t_cbvN & 15u) == 0) g_cbvCalls.fetch_add(16, std::memory_order_relaxed); }   // 1.0.0: counted in batches of 16 per thread (a shared atomic hit by every worker thread on every call = cache-line ping-pong)
     int fr = g_frame.load(std::memory_order_relaxed);
     TcTls& t = t_tls;
     bool known = IsKnownVA(va);
@@ -631,6 +664,9 @@ static void TrackCamera(UINT64 va) {
         // v23: ... and at most 12 re-reads of known view buffers per frame over ALL threads (each one copies up to ~5 KB from write-combined memory = 30-70 us; the log showed ~38 probes/frame = ~1.1 ms/frame)
         { static std::atomic<int> s_kFrame{-1}, s_kCnt{0}; if (s_kFrame.load(std::memory_order_relaxed) != fr) { s_kFrame.store(fr); s_kCnt.store(0); } if (s_kCnt.fetch_add(1) >= 12) return; }
     } else {
+        // 1.0.0 camfast: the camera of THIS frame was already read from a view buffer that matches the offsets (g_camFrame is only set by the strict parse) -> unknown addresses cannot teach us anything new this frame:
+        // skip the thread-local table, the negative cache and the probe counters (thousands of draw calls per frame go through here)
+        if (g_cfg.camFast && g_camFrame.load(std::memory_order_relaxed) == fr && !g_camRescan.load(std::memory_order_relaxed)) return;
         unsigned h = HashVA(va);
         TcEntry& e = t.e[h];
         if (e.va != va || e.frame != fr) { e.va = va; e.frame = fr; e.cnt = 0; }
@@ -681,14 +717,14 @@ static std::mutex g_hudMx;
 
 static void STDMETHODCALLTYPE hkCreateRTV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     if (!g_device) g_device = dev;
-    RegisterRes(res);
-    if (res) { std::lock_guard<std::shared_mutex> lk(g_resMx); g_rtvToRes[dest.ptr] = (void*)res; }
+    { HpScope hp(4); RegisterRes(res);
+      if (res) { if (g_cfg.hookFast) SetDescMap(g_rtvToRes, dest.ptr, (void*)res); else { std::lock_guard<std::shared_mutex> lk(g_resMx); g_rtvToRes[dest.ptr] = (void*)res; } } }
     oCreateRTV(dev, res, desc, dest);
 }
 static void STDMETHODCALLTYPE hkCreateDSV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     if (!g_device) g_device = dev;
-    RegisterRes(res);
-    if (res) { std::lock_guard<std::shared_mutex> lk(g_resMx); g_dsvToRes[dest.ptr] = (void*)res; }
+    { HpScope hp(4); RegisterRes(res);
+      if (res) { if (g_cfg.hookFast) SetDescMap(g_dsvToRes, dest.ptr, (void*)res); else { std::lock_guard<std::shared_mutex> lk(g_resMx); g_dsvToRes[dest.ptr] = (void*)res; } } }
     oCreateDSV(dev, res, desc, dest);
 }
 static void STDMETHODCALLTYPE hkCreateSRV(ID3D12Device* dev, ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
@@ -700,6 +736,12 @@ static void STDMETHODCALLTYPE hkCreateSRV(ID3D12Device* dev, ID3D12Resource* res
 }
 static void STDMETHODCALLTYPE hkCopyDescSimple(ID3D12Device* dev, UINT num, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     oCopyDescSimple(dev, num, dest, src, type);
+    if (g_cfg.hookFast) {   // 1.1.0: shared lock for the lookups, exclusive lock only when a mapping really changes (v1.0.0 held the EXCLUSIVE lock for every RTV/DSV copy and stalled all render threads)
+        HpScope hp(3);
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && g_rtvInc) CopyDescMap(g_rtvToRes, num, dest.ptr, src.ptr, g_rtvInc);
+        else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && g_dsvInc) CopyDescMap(g_dsvToRes, num, dest.ptr, src.ptr, g_dsvInc);
+        return;
+    }
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && g_rtvInc) {
         std::lock_guard<std::shared_mutex> lk(g_resMx);
         for (UINT i = 0; i < num; i++) { auto it = g_rtvToRes.find(src.ptr + i * g_rtvInc); if (it != g_rtvToRes.end()) g_rtvToRes[dest.ptr + i * g_rtvInc] = it->second; }
@@ -772,6 +814,19 @@ static void UpdateViewRect(int fr) {
 static void STDMETHODCALLTYPE hkOMSetRT(ID3D12GraphicsCommandList* cl, UINT num, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     oOMSetRT(cl, num, rts, single, dsv);
     t_rt.cl = cl; t_rt.rt0 = nullptr;
+    if (g_cfg.hookFast) {   // 1.1.0: ONE shared lock for all render-target + depth lookups (1.0.0 took up to 2 per render target and 2 for the depth buffer)
+        HpScope hp(1); void* dr = nullptr;
+        { std::shared_lock<std::shared_mutex> lk(g_resMx);
+          if (rts) for (UINT i = 0; i < num && i < 8; i++) {
+              D3D12_CPU_DESCRIPTOR_HANDLE h = single ? rts[0] : rts[i]; if (single && i > 0) h.ptr += i * g_rtvInc;
+              auto it = g_rtvToRes.find(h.ptr); void* r = it != g_rtvToRes.end() ? it->second : nullptr;
+              if (i == 0) t_rt.rt0 = r; NoteUseLocked(r, 1);
+          }
+          if (dsv) { auto it = g_dsvToRes.find(dsv->ptr); if (it != g_dsvToRes.end()) dr = it->second; NoteUseLocked(dr, 1); } }
+        t_dsvCl = cl; t_dsvRes = dsv ? dr : nullptr;
+        if (dsv && g_cfg.viewRect && dr && t_vpCl == cl && t_vpW) NoteViewport(dr, t_vpW, t_vpH);   // v20: viewport set BEFORE the depth buffer was bound (outside the lock: NoteViewport takes it itself)
+        return;
+    }
     if (rts) for (UINT i = 0; i < num && i < 8; i++) {
         D3D12_CPU_DESCRIPTOR_HANDLE h = single ? rts[0] : rts[i]; if (single && i > 0) h.ptr += i * g_rtvInc;
         void* r = LookupRTV(h); if (i == 0) t_rt.rt0 = r; NoteUse(r, 1);
@@ -780,14 +835,16 @@ static void STDMETHODCALLTYPE hkOMSetRT(ID3D12GraphicsCommandList* cl, UINT num,
         t_dsvCl = cl; t_dsvRes = r; if (g_cfg.viewRect && r && t_vpCl == cl && t_vpW) NoteViewport(r, t_vpW, t_vpH); }   // v20: viewport set BEFORE the depth buffer was bound
     else { t_dsvCl = cl; t_dsvRes = nullptr; }
 }
-static void STDMETHODCALLTYPE hkClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT* c, UINT nr, const D3D12_RECT* r) { oClearRTV(cl, rtv, c, nr, r); NoteUse(LookupRTV(rtv), 0); }
+static void STDMETHODCALLTYPE hkClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT* c, UINT nr, const D3D12_RECT* r) { oClearRTV(cl, rtv, c, nr, r); HpScope hp(2); if (g_cfg.hookFast) NoteRtvUse(rtv, 0); else NoteUse(LookupRTV(rtv), 0); }
 static void STDMETHODCALLTYPE hkClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT nr, const D3D12_RECT* r) {
     oClearDSV(cl, dsv, f, d, s, nr, r);
+    if (g_cfg.hookFast) { HpScope hp(2); NoteDsvUse(dsv, 0); return; }
     void* rr = nullptr; { std::shared_lock<std::shared_mutex> lk(g_resMx); auto it = g_dsvToRes.find(dsv.ptr); if (it != g_dsvToRes.end()) rr = it->second; } NoteUse(rr, 0);
 }
 static void STDMETHODCALLTYPE hkCopyTex(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
-    if (src && src->pResource) { RegisterRes(src->pResource); NoteUse((void*)src->pResource, 2); }
-    if (dst && dst->pResource) { RegisterRes(dst->pResource); NoteUse((void*)dst->pResource, 3); }
+    { HpScope hp(5);
+      if (src && src->pResource) { RegisterRes(src->pResource); NoteUse((void*)src->pResource, 2); }
+      if (dst && dst->pResource) { RegisterRes(dst->pResource); NoteUse((void*)dst->pResource, 3); } }
     oCopyTex(cl, dst, x, y, z, src, box);
 }
 
@@ -1048,7 +1105,7 @@ static ID3D12Resource* EnsureDummyVel(UINT w, UINT h) {
 // Drops candidate resources the game has already destroyed (only our own reference is left). v13 kept them forever (VRAM leak) and,
 // because the use-counters only ever grew, an old dead depth/velocity buffer could stay "the best" forever after a level load / settings change -> stale MVs = ghosting.
 static void PruneRes() {
-    std::unique_lock<std::shared_mutex> lk(g_resMx);
+    std::unique_lock<std::shared_mutex> lk(g_resMx); bool erased = false;
     for (auto it = g_res.begin(); it != g_res.end();) {
         auto& m = it->second;
         if (m.held && m.res) {
@@ -1061,11 +1118,12 @@ static void PruneRes() {
                 for (auto r = g_dsvToRes.begin(); r != g_dsvToRes.end();) { if (r->second == key) r = g_dsvToRes.erase(r); else ++r; }
                 { std::lock_guard<std::mutex> sl(g_stateMx); g_state.erase(key); }
                 m.res->Release();
-                it = g_res.erase(it); continue;
+                it = g_res.erase(it); erased = true; continue;
             }
         }
         ++it;
     }
+    if (erased) { std::vector<const void*> keep; keep.reserve(g_res.size()); for (auto& kv : g_res) keep.push_back(kv.first); g_resFilter.Rebuild(keep); }   // 1.1.0
 }
 static void UpdatePins() {
     int fr = g_frame.load();
@@ -1167,6 +1225,7 @@ static UINT g_scW = 0, g_scH = 0;
 // ---- v25: state shared with the overlay / diagnostics (written by OnPresentBeginCore on the render thread, read for display / reports only)
 static bool g_everOn = false;                         // frame generation has been switched on at least once
 static std::atomic<double> g_fgRatio{ 1.0 };         // measured: frames presented per game frame (2.0 = 2x frame generation)
+static std::atomic<int> g_effMult{ 2 };               // 1.0.0: multiplier in use (= mult, or the one picked by target-fps mode)
 static unsigned g_maxGen = 0;                         // numFramesToGenerateMax reported by DLSS-G (0 = not known yet)
 static unsigned g_lastStatus = 0, g_stMinWH = 0; static unsigned long long g_stVramMB = 0; static bool g_haveState = false; static std::atomic<bool> g_vramReq{ true };   // v30: VRAM estimate is requested only on demand
 static int g_lastTagRes = -1, g_lastConstRes = -1, g_lastOptRes = -1;
@@ -1175,6 +1234,7 @@ static const char* g_whyNot = "starting";            // why frame generation is 
 static bool g_slDevSet = false; static int g_slDevTries = 0;
 static bool g_swapD3D12 = true; static UINT g_scBufs = 0; static int g_scEffect = 0;
 static void ApplyReflexOptions(const char* why);
+static int CurMult();   // 1.0.0
 static int EffectiveBaseLimit();                                   // v27: Reflex base-fps limit incl. the output fps cap
 static void EnsureDrawHooks(); static void HudCalReset(); static int HudCalVotes();
 static void BundleStart(); static bool BundlePoll(std::string& msg, bool& bad);   // crash.inc
@@ -1248,10 +1308,25 @@ static void EnsureSlDeviceFromQueue(IUnknown* queueUnk) {
     }
     cq->Release();
 }
+// 1.0.0: multiplier actually requested from DLSS-G (target-fps mode picks it, otherwise the config value), always clamped to what the GPU supports
+static int CurMult() {
+    int m = g_cfg.targetFps > 0 ? g_effMult.load() : g_cfg.mult; if (m < 2) m = 2;
+    if (g_maxGen && m > (int)g_maxGen + 1) m = (int)g_maxGen + 1;
+    return m;
+}
+static void UpdateAutoMult(int fr) {
+    if (g_cfg.targetFps <= 0) { if (g_effMult.load() != g_cfg.mult) g_effMult = std::max(2, g_cfg.mult); return; }
+    static int s_last = -100000; static bool s_init = false;
+    if (!s_init) { s_init = true; g_effMult = std::max(2, g_cfg.mult); }
+    if (!g_maxGen || !g_wasOn || g_fgSusp || fr - s_last < 120) return;   // needs the GPU limit, a running FG and at least ~2 s between changes (every change = a short hitch in DLSS-G)
+    double base = g_st.fps; if (!(base > 1.0)) return;
+    int cur = g_effMult.load(), nm = SnPickMult(base, g_cfg.targetFps, (int)g_maxGen + 1, cur);
+    if (nm != cur) { g_effMult = nm; s_last = fr; Log("target-fps: base %.1f fps, target %d -> multiplier %dx (was %dx)", base, g_cfg.targetFps, nm, cur); if (g_slRuntimeOk) ApplyReflexOptions("target-fps multiplier"); }
+}
 static int g_appliedLimit = -1;
 // v27: base-fps limit for Reflex = user's basefpslimit and/or (output fps cap / frames per game frame)
 static int EffectiveBaseLimit() {
-    int mult = g_cfg.mult; if (g_maxGen && mult > (int)g_maxGen + 1) mult = (int)g_maxGen + 1;
+    int mult = CurMult();
     return SnBaseLimit(SnResolveOutCap(g_cfg.fpsCap, g_refreshHz.load()), g_cfg.baseFpsLimit, mult, g_wasOn && !g_fgSusp);
 }
 static void UpdateRefreshRate(IDXGISwapChain* sc) {
@@ -1317,6 +1392,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     if ((fr % 20) == 0) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(24); } g_tPrune = NowMs() - tp0; }   // v23: small slices (was: everything every 120 frames)
     if (g_cfg.renderW <= 0 && (fr % 60) == 0) { DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d)) && d.BufferDesc.Width && (d.BufferDesc.Width != g_autoW.load() || d.BufferDesc.Height != g_autoH.load())) { g_autoW = d.BufferDesc.Width; g_autoH = d.BufferDesc.Height; Log("auto render size: swap chain is now %ux%u", g_autoW.load(), g_autoH.load()); } }   // v18: follow resolution changes (renderw=0)
     if (fr == 600 || fr == 3000) CensusLog("periodic");
+    if (fr == 3000 && g_cfg.hookFast) g_censusOn = false;   // 1.1.0: the census is only a diagnostic; it took a global mutex on every CreateRTV / CopyTextureRegion of an internal-size texture
     if (fr == 1 || (fr % 600) == 0) {
         DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; if (g_dispW) { g_autoW = g_dispW; g_autoH = g_dispH; } }
         size_t nb_; { std::shared_lock<std::shared_mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
@@ -1324,6 +1400,8 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         static long s_pn = 0, s_pns = 0; long pn = g_probeN.load(), pns = g_probeNs.load();
         Log("cam-diag: probes +%ld (%.2f ms total, %.1f us each) cbv/frame=%ld", pn - s_pn, (pns - s_pns) / 1e6, pn > s_pn ? (pns - s_pns) / 1e3 / (double)(pn - s_pn) : 0.0, g_cbvPerFrame.load()); s_pn = pn; s_pns = pns;
         Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_projSeen.load(), g_scanRuns.load(), g_camLocked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
+        if (g_cfg.hookProf) { char hb[640]; int hl = 0; hb[0] = 0; for (int q = 0; q < 6; q++) { long long hn = g_hp[q].ns.exchange(0), hc = g_hp[q].calls.exchange(0); hl += snprintf(hb + hl, sizeof(hb) - (size_t)hl, " %s=%.3fms/frame(%.2fus x%lld)", kHpName[q], (double)hn / 1e6 / 600.0, hc ? (double)hn / 1e3 / (double)hc : 0.0, hc); if (hl >= (int)sizeof(hb) - 80) break; }
+            Log("hook-prof (injector CPU per frame, last ~600 frames, hookfast=%d):%s", g_cfg.hookFast, hb); }
         Log("cam-diag: registry %llu MB / cap %d MB (%zu buffers) evicted=%ld skipped=%ld rescan=%d camAge=%d", (unsigned long long)(g_bufBytes >> 20), g_cfg.bufMaxMB, nb_, g_evicted.load(), g_regSkipped.load(), g_camRescan.load(), fr - g_camFrame.load());
     }
     { double tp0 = NowMs(); UpdatePins(); g_tPins = NowMs() - tp0; }
@@ -1424,7 +1502,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         sl::Result r2 = p_slSetConstants(consts, *ctx.tok, vp);
         g_lastTagRes = (r1 == sl::Result::eOk) ? 0 : (int)r1; g_lastConstRes = (r2 == sl::Result::eOk) ? 0 : (int)r2;
         static int s_r = 0; if (s_r < 4 || r1 != sl::Result::eOk || r2 != sl::Result::eOk) { if (s_r < 40) Log("frame=%d tags(%u)=%d %s constants=%d %s hud=%d", fr, nt, (int)r1, SlStr(r1), (int)r2, SlStr(r2), (int)(nt == 3)); s_r++; }
-        opt.mode = sl::DLSSGMode::eOn; opt.numFramesToGenerate = (uint32_t)(g_cfg.mult - 1);
+        UpdateAutoMult(fr); opt.mode = sl::DLSSGMode::eOn; opt.numFramesToGenerate = (uint32_t)(CurMult() - 1);
         opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         if (g_cfg.menuDetect) opt.flags = opt.flags | sl::DLSSGFlags::eEnableFullscreenMenuDetection;                       // v29
         // v30: dynres=1 is automatic - the flag is only sent after the view rect has really changed 3+ times (a fixed-resolution game never gets it: Streamline documents a performance / quality loss then)
