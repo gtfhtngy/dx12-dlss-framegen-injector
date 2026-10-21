@@ -38,6 +38,7 @@ Results may vary, so please attach `SN_DLSSG_log.txt` and `sl.log` when reportin
 |------|--------|-----|--------|--------|-------|-------|
 | Silent Hill Townfall | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Working | v0.4 | - |
 | Dragon Ball: Sparking Zero | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Working | v0.5 | Do **NOT** test it in online mode , Set (Or add) cutdetect=0 into the config file or it will be laggy |
+| Demon Slayer The Hinokami Chronicles 2 | UE5 | DX12 | `SN_DLSSG_cfg_UE5.txt` | Working | v1.0 | Set mvoff to 452 and c2pauto to 0 for this game (this game has a frame cap on 120FPS if you get 120 already you don't need this mod for this game) |
 
 ## Installation
 
