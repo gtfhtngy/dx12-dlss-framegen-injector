@@ -260,6 +260,17 @@ static ID3D12Resource* g_dummyVel = nullptr; static UINT g_dummyW = 0, g_dummyH 
 static std::atomic<bool> g_forceReset{false};   // next DLSS-G frame is sent with reset=true (pins changed, hitch, MV buffers re-created)
 
 static inline bool IsVelFmt(DXGI_FORMAT f) { return f == DXGI_FORMAT_R16G16_UNORM || f == DXGI_FORMAT_R16G16_TYPELESS || (g_cfg.velFmt && (int)f == g_cfg.velFmt); }   // v18: some UE5 RHI paths create the velocity target typeless (we always view it as R16G16_UNORM)
+// v29: a pin (velocity / depth) is later viewed through CreateShaderResourceView (MV pass) as a single-sample, single-slice Texture2D mip 0..0.
+// A resource that cannot be viewed that way (DENY_SHADER_RESOURCE, MSAA, array / cube, mip chain) would give a garbage descriptor -> GPU page fault in the MV compute shader.
+static bool PinDescOk(const D3D12_RESOURCE_DESC& d, const char** why) {
+    const char* w = nullptr;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) w = "not a Texture2D";
+    else if (d.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) w = "DENY_SHADER_RESOURCE";
+    else if (d.SampleDesc.Count != 1) w = "multisampled";
+    else if (d.DepthOrArraySize != 1) w = "array / cube (DepthOrArraySize != 1)";
+    else if (d.MipLevels != 1) w = "MipLevels != 1";
+    if (why) *why = w; return w == nullptr;
+}
 // v19: census of render-target / UAV textures at the internal resolution that are NOT depth and NOT accepted as velocity: tells us what format the game's velocity target really has
 struct CensusKey { int fmt; UINT w, h; int flags; bool operator<(const CensusKey& o) const { if (fmt != o.fmt) return fmt < o.fmt; if (w != o.w) return w < o.w; if (h != o.h) return h < o.h; return flags < o.flags; } };
 static std::map<CensusKey, int> g_census; static std::mutex g_censusMx;
@@ -274,7 +285,7 @@ static void RegisterRes(ID3D12Resource* res) {
     D3D12_RESOURCE_DESC d = ResDesc(res);
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
     bool depth = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
-    bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || IsVelFmt(d.Format));
+    bool cand = IsInternal((UINT)d.Width, d.Height) && (depth || IsVelFmt(d.Format)) && PinDescOk(d, nullptr);   // v29: unviewable resources are never pin candidates
     if (g_censusOn.load(std::memory_order_relaxed) && !cand && !depth && (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && IsInternal((UINT)d.Width, d.Height)) CensusNote(d);
     if (!cand) { if (g_cfg.hookFast && !ResMaybe(res)) return; std::shared_lock<std::shared_mutex> sl(g_resMx); if (!g_res.count((void*)res)) return; }   // loading creates thousands of RTV/DSV/SRVs: no exclusive lock for those
     std::lock_guard<std::shared_mutex> lk(g_resMx);
@@ -1022,6 +1033,12 @@ static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
 // Builds a private command list, runs the MV pass on the game's queue. Returns true if g_mvOut/g_depthOut were refreshed.
 static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3D12Resource* depth) {   // W/H = size of the game's buffers (allocation), VW/VH = real view rect inside them (v20)
     if (!g_device || !g_queue || !vel || !depth) return false;
+    { const char* w1 = nullptr; const char* w2 = nullptr; D3D12_RESOURCE_DESC vd0 = ResDesc(vel), dd0 = ResDesc(depth);
+      if (!PinDescOk(vd0, &w1) || !PinDescOk(dd0, &w2)) {   // v29: never create SRVs on resources that cannot be viewed -> skip the MV pass (frame generation stays off this frame)
+          static int s_bad = 0; if (s_bad++ < 20) Log("MV pass SKIPPED: pinned %s %p is not usable as a shader resource (%s) flags=0x%X samples=%u mips=%u array=%u fmt=%d",
+              w1 ? "velocity" : "depth", w1 ? (void*)vel : (void*)depth, w1 ? w1 : w2, (unsigned)(w1 ? vd0.Flags : dd0.Flags), (unsigned)(w1 ? vd0.SampleDesc.Count : dd0.SampleDesc.Count),
+              (unsigned)(w1 ? vd0.MipLevels : dd0.MipLevels), (unsigned)(w1 ? vd0.DepthOrArraySize : dd0.DepthOrArraySize), (int)(w1 ? vd0.Format : dd0.Format));
+          return false; } }
     if (!InitMvPass(W, H)) return false;
     ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr; int ringSlot = -1;
     if (!g_ringFence) g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_ringFence);
@@ -1143,6 +1160,10 @@ static void UpdatePins() {
     // hysteresis: keep the current pin unless another resource is clearly (1.5x) busier
     ID3D12Resource* nv = (g_pinVel && curV >= 0 && curV * 3 >= bv * 2) ? g_pinVel : bestVel;
     ID3D12Resource* nd = (g_pinDepth && curD >= 0 && curD * 3 >= bd * 2) ? g_pinDepth : bestDep;
+    // v29: last line of defence (hysteresis may keep an old pin): a pin that cannot be viewed as a shader resource is dropped
+    { auto bad = [&](ID3D12Resource*& r, const char* n) { if (!r) return; const char* why = nullptr; D3D12_RESOURCE_DESC d = ResDesc(r); if (PinDescOk(d, &why)) return;
+          static int s_rj = 0; if (s_rj++ < 20) Log("pins: %s %p rejected (%s) flags=0x%X samples=%u mips=%u array=%u fmt=%d", n, (void*)r, why, (unsigned)d.Flags, (unsigned)d.SampleDesc.Count, (unsigned)d.MipLevels, (unsigned)d.DepthOrArraySize, (int)d.Format); r = nullptr; };
+      bad(nv, "velocity"); bad(nd, "depth"); }
     static int s_velSince = -1; static bool s_velCensus = false;
     // v19: a velocity buffer that cannot be paired with the depth buffer (size) counts as 'not found'
     if (nv && nd) { D3D12_RESOURCE_DESC a0 = ResDesc(nv), b0 = ResDesc(nd);
@@ -1163,8 +1184,9 @@ static void UpdatePins() {
         for (auto& kv : g_res) { auto& m = kv.second; if (!m.cand || !IsVelFmt(m.fmt) || m.w != (UINT)b.Width || m.h != b.Height) continue; if (m.score > as) { as = m.score; alt = m.res; } }
         static int s_mm = 0; if (s_mm++ < 10) Log("pins: velocity %llux%u differs from depth %llux%u -> %s", (unsigned long long)a.Width, a.Height, (unsigned long long)b.Width, b.Height, alt ? "using a velocity buffer of the depth size" : "no velocity buffer of that size (yet)");
         if (alt) nv = alt; } }
-    if (nv != g_pinVel || nd != g_pinDepth) { static int s_pl = 0; if (s_pl++ < 60) { D3D12_RESOURCE_DESC vv = nv ? ResDesc(nv) : D3D12_RESOURCE_DESC{}, dd2 = nd ? ResDesc(nd) : D3D12_RESOURCE_DESC{};
-        Log("pins (frame %d): velocity %p %llux%u fmt=%d | depth %p %llux%u fmt=%d", fr, (void*)nv, (unsigned long long)vv.Width, vv.Height, (int)vv.Format, (void*)nd, (unsigned long long)dd2.Width, dd2.Height, (int)dd2.Format); }
+    if (nv != g_pinVel || nd != g_pinDepth) { static int s_pl = 0; if (s_pl++ < 200) { D3D12_RESOURCE_DESC vv = nv ? ResDesc(nv) : D3D12_RESOURCE_DESC{}, dd2 = nd ? ResDesc(nd) : D3D12_RESOURCE_DESC{};
+        Log("pins (frame %d): velocity %p %llux%u fmt=%d flags=0x%X samples=%u mips=%u array=%u | depth %p %llux%u fmt=%d flags=0x%X samples=%u mips=%u array=%u", fr, (void*)nv, (unsigned long long)vv.Width, vv.Height, (int)vv.Format, (unsigned)vv.Flags, (unsigned)vv.SampleDesc.Count, (unsigned)vv.MipLevels, (unsigned)vv.DepthOrArraySize,
+            (void*)nd, (unsigned long long)dd2.Width, dd2.Height, (int)dd2.Format, (unsigned)dd2.Flags, (unsigned)dd2.SampleDesc.Count, (unsigned)dd2.MipLevels, (unsigned)dd2.DepthOrArraySize); }
       // v28: swapping the depth buffer for another one of the SAME size does not need a DLSS-G history reset (DLSS-G only ever sees our own copy g_depthOut). v27 reset on every swap:\n      // 44 resets in one session (UE5 rotates its pooled depth targets) = a visible hitch each time. Velocity change / size change / first pin still reset.
       bool needReset = (nv != g_pinVel) || !g_pinDepth || !nd;
       if (!needReset && g_pinDepth && nd) { D3D12_RESOURCE_DESC o = ResDesc(g_pinDepth), n2 = ResDesc(nd); if (o.Width != n2.Width || o.Height != n2.Height) needReset = true; }
