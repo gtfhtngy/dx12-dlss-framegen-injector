@@ -14,16 +14,16 @@
 //   type 3 = D3D12 pipeline library (driver-native, valid only for the adapter/driver recorded in the entry).
 #pragma once
 
-// mingw-w64's d3d12.h declares ID3D12Device1::CreatePipelineLibrary but not the ID3D12PipelineLibrary interface itself -> declare it here (official vtable order, IID c64226a8-9201-46af-b4cc-53fb9ff7414f)
-#ifndef SN_HAVE_PIPELINELIB
-struct ID3D12PipelineLibrary : public ID3D12DeviceChild {
+// Older mingw-w64 (e.g. 11.0.1 in Ubuntu 24.04) declares ID3D12Device1::CreatePipelineLibrary but not the ID3D12PipelineLibrary interface itself; newer mingw-w64 does
+// declare it (redefining it = "error: redefinition of 'struct ID3D12PipelineLibrary'"). Because of that this file uses its OWN, differently named interface: it compiles with
+// both header generations. Official vtable order, IID c64226a8-9201-46af-b4cc-53fb9ff7414f; objects are only ever created by CreatePipelineLibrary(IID_SN_PipelineLibrary).
+struct SN_PipelineLibrary : public ID3D12DeviceChild {
     virtual HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pso) = 0;
     virtual HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) = 0;
     virtual HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) = 0;
     virtual SIZE_T STDMETHODCALLTYPE GetSerializedSize() = 0;
     virtual HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) = 0;
 };
-#endif
 static const GUID IID_SN_PipelineLibrary = { 0xc64226a8, 0x9201, 0x46af, { 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f } };
 
 // ------------------------------------------------------------------ hashing
@@ -252,7 +252,7 @@ static ID3D12PipelineState* MakeMvPso(ID3D12Device* dev, ID3D12RootSignature* rs
         if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1), (void**)&d1)) && d1) {
             for (auto& lb : g_cache.libs) {
                 if (lb.data.empty()) continue;
-                ID3D12PipelineLibrary* lib = nullptr;
+                SN_PipelineLibrary* lib = nullptr;
                 if (SUCCEEDED(d1->CreatePipelineLibrary(lb.data.data(), lb.data.size(), IID_SN_PipelineLibrary, (void**)&lib)) && lib) {
                     HRESULT hr = lib->LoadComputePipeline(kPsoName, &pd, __uuidof(ID3D12PipelineState), (void**)&pso);
                     lib->Release();
@@ -268,7 +268,7 @@ static ID3D12PipelineState* MakeMvPso(ID3D12Device* dev, ID3D12RootSignature* rs
 }
 static bool BuildLibraryBlob(ID3D12Device* dev, ID3D12PipelineState* pso, std::vector<uint8_t>& out) {
     ID3D12Device1* d1 = nullptr; if (FAILED(dev->QueryInterface(__uuidof(ID3D12Device1), (void**)&d1)) || !d1) return false;
-    ID3D12PipelineLibrary* lib = nullptr; bool ok = false;
+    SN_PipelineLibrary* lib = nullptr; bool ok = false;
     if (SUCCEEDED(d1->CreatePipelineLibrary(nullptr, 0, IID_SN_PipelineLibrary, (void**)&lib)) && lib) {
         if (SUCCEEDED(lib->StorePipeline(kPsoName, pso))) { SIZE_T n = lib->GetSerializedSize(); if (n) { out.resize(n); ok = SUCCEEDED(lib->Serialize(out.data(), n)); } }
         lib->Release();
