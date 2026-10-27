@@ -32,9 +32,26 @@ static bool CrashModuleIsOurs(const void* a) {
     if (m == g_hSelf) return true; std::string l = SnLower(b);
     return l.compare(0, 3, "sl.") == 0 || l.compare(0, 5, "nvngx") == 0 || l.compare(0, 8, "nvwgf2um") == 0 || l.compare(0, 5, "nvapi") == 0 || l.compare(0, 6, "nvcuda") == 0;
 }
+// Walks the stack of the FAULTING code (from ep->ContextRecord), not the handler's own stack: inside the VEH / unhandled filter, CaptureStackBackTrace
+// would only show CrashVEH -> RtlDispatchException -> KiUserExceptionDispatcher and never the frames that actually crashed.
+// x64 unwind via RtlLookupFunctionEntry/RtlVirtualUnwind on a COPY of the context; no allocation, stack pointer kept inside the thread's stack bounds.
+static USHORT CrashCaptureStack(const CONTEXT* src, void** out, USHORT max) {
+    if (!src || !out || !max) return 0;
+    CONTEXT c = *src; USHORT n = 0;
+    const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb(); const DWORD64 lo = (DWORD64)tib->StackLimit, hi = (DWORD64)tib->StackBase;
+    while (n < max) {
+        DWORD64 ip = c.Rip; if (!ip) break;
+        out[n++] = (void*)ip;
+        if (c.Rsp < lo || c.Rsp >= hi || (c.Rsp & 7)) break;
+        DWORD64 base = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ip, &base, nullptr);
+        if (rf) { PVOID hd = nullptr; DWORD64 ef = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ip, rf, &c, &hd, &ef, nullptr); }
+        else { if (c.Rsp + 8 > hi) break; c.Rip = *(const DWORD64*)c.Rsp; c.Rsp += 8; }   // leaf function without unwind info: return address is at [rsp]
+    }
+    return n;
+}
 static bool CrashFaultIsOurs(PEXCEPTION_POINTERS ep) {
     if (CrashModuleIsOurs(ep->ExceptionRecord->ExceptionAddress)) return true;
-    void* st[14]; USHORT n = CaptureStackBackTrace(0, 14, st, nullptr); for (USHORT i = 0; i < n; i++) if (CrashModuleIsOurs(st[i])) return true;
+    void* st[14]; USHORT n = CrashCaptureStack(ep->ContextRecord, st, 14); for (USHORT i = 0; i < n; i++) if (CrashModuleIsOurs(st[i])) return true;
     return false;
 }
 static void CrashWriteSummary(const std::wstring& txtName, PEXCEPTION_POINTERS ep, const char* why, const std::wstring& dumpPath, bool dumpOk) {
@@ -43,7 +60,7 @@ static void CrashWriteSummary(const std::wstring& txtName, PEXCEPTION_POINTERS e
     fprintf(f, "SN_DLSSG " SN_VERSION " crash summary\nreason   : %s\n", why);
     if (ep && ep->ExceptionRecord) { char mn[MAX_PATH]; ULONG_PTR off = 0; void* a = ep->ExceptionRecord->ExceptionAddress; ModuleOfAddr(a, mn, sizeof mn, &off, nullptr);
         fprintf(f, "exception: 0x%08X at %p  (%s + 0x%llX)  thread %u\n", (unsigned)ep->ExceptionRecord->ExceptionCode, a, mn[0] ? mn : "?", (unsigned long long)off, (unsigned)GetCurrentThreadId());
-        void* st[24]; USHORT n = CaptureStackBackTrace(0, 24, st, nullptr); fprintf(f, "stack    :\n");
+        void* st[24]; USHORT n = CrashCaptureStack(ep->ContextRecord, st, 24); fprintf(f, "stack    :\n");
         for (USHORT i = 0; i < n; i++) { char sm[MAX_PATH]; ULONG_PTR so = 0; ModuleOfAddr(st[i], sm, sizeof sm, &so, nullptr); fprintf(f, "  #%02u %p %s+0x%llX\n", (unsigned)i, st[i], sm[0] ? sm : "?", (unsigned long long)so); } }
     fprintf(f, "dump     : %s\nframe    : %d   fg=%d mult=%d stage=%d preset=%s hudless=%d(N=%d) fpscap=%d\n", dumpOk ? Narrow(dumpPath.c_str()).c_str() : "(could not be written)", g_frame.load(), g_cfg.fg, g_cfg.mult, g_cfg.stage, SnPresetName(g_cfg.preset), g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.fpsCap);
     fprintf(f, "\n---- last log lines ----\n");
