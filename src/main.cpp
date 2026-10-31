@@ -14,7 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
-#define SN_VERSION "1.1.0"
+#define SN_VERSION "1.1.1"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -328,6 +328,7 @@ struct SubSt { UINT st[2] = { 0, 0 }; bool known[2] = { false, false }; };
 static std::unordered_map<void*, SubSt> g_state;
 static void STDMETHODCALLTYPE hkResBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     oResBarrier(cl, n, b);
+    if (!b || !n) return;   // 1.1.1
     HpScope hp(0);
     if (g_cfg.hookFast) { bool any = false; for (UINT i = 0; i < n; i++) if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && ResMaybe(b[i].Transition.pResource)) { any = true; break; } if (!any) return; }   // 1.1.0: no tracked resource involved -> no lock, no lookup
     std::shared_lock<std::shared_mutex> lk(g_resMx);     // thousands of barriers per frame on many threads: shared lock, exclusive only for the (rare) candidate
@@ -1030,6 +1031,20 @@ static DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT f) {
     case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
     default: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; }
 }
+// 1.1.1: a view format that does not belong to the resource's format family leaves an UNDEFINED descriptor in the heap -> "SM Error accessing address 0x00..." (non-canonical VA) in the MV compute shader.
+// Only formats the HLSL can really read as the intended data are accepted; anything else skips the MV pass (frame generation stays off for that frame) instead of crashing the GPU.
+static bool VelViewOk(DXGI_FORMAT res, DXGI_FORMAT view) {
+    if (res == view) return true;
+    if (res == DXGI_FORMAT_R16G16_TYPELESS) return view == DXGI_FORMAT_R16G16_UNORM || view == DXGI_FORMAT_R16G16_FLOAT || view == DXGI_FORMAT_R16G16_SNORM;
+    if (res == DXGI_FORMAT_R32G32_TYPELESS) return view == DXGI_FORMAT_R32G32_FLOAT;
+    return false;
+}
+static bool DepthViewOk(DXGI_FORMAT res) {
+    switch (res) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return true;
+    default: return false; }
+}
 // Builds a private command list, runs the MV pass on the game's queue. Returns true if g_mvOut/g_depthOut were refreshed.
 static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3D12Resource* depth) {   // W/H = size of the game's buffers (allocation), VW/VH = real view rect inside them (v20)
     if (!g_device || !g_queue || !vel || !depth) return false;
@@ -1038,6 +1053,9 @@ static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3
           static int s_bad = 0; if (s_bad++ < 20) Log("MV pass SKIPPED: pinned %s %p is not usable as a shader resource (%s) flags=0x%X samples=%u mips=%u array=%u fmt=%d",
               w1 ? "velocity" : "depth", w1 ? (void*)vel : (void*)depth, w1 ? w1 : w2, (unsigned)(w1 ? vd0.Flags : dd0.Flags), (unsigned)(w1 ? vd0.SampleDesc.Count : dd0.SampleDesc.Count),
               (unsigned)(w1 ? vd0.MipLevels : dd0.MipLevels), (unsigned)(w1 ? vd0.DepthOrArraySize : dd0.DepthOrArraySize), (int)(w1 ? vd0.Format : dd0.Format));
+          return false; }
+      if (!VelViewOk(vd0.Format, VelSrvFormat(vd0.Format)) || !DepthViewOk(dd0.Format)) {   // 1.1.1
+          static int s_fb = 0; if (s_fb++ < 20) Log("MV pass SKIPPED: no valid shader-resource view format for velocity fmt=%d / depth fmt=%d (view would be undefined)", (int)vd0.Format, (int)dd0.Format);
           return false; } }
     if (!InitMvPass(W, H)) return false;
     ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr; int ringSlot = -1;
