@@ -43,6 +43,9 @@ static void NoteRootSig(void* rs, const void* blob, SIZE_T len) {
     uint64_t h = Fnv64(blob, (size_t)len);
     std::unique_lock<std::shared_mutex> lk(g_rsMx); g_rsHash[rs] = h;
 }
+static bool RsKnown(void* rs) {   // 1.1.1: nullptr = root signature comes from the shader itself (fine); a non-null object we never saw created is NOT cacheable
+    if (!rs) return true; std::shared_lock<std::shared_mutex> lk(g_rsMx); return g_rsHash.find(rs) != g_rsHash.end();
+}
 static uint64_t RsHashOf(void* rs) {
     if (!rs) return 0; std::shared_lock<std::shared_mutex> lk(g_rsMx);
     auto it = g_rsHash.find(rs); return it != g_rsHash.end() ? it->second : 0x9E3779B97F4A7C15ull;   // unknown object: still deterministic per run, but never matches a known one by accident
@@ -220,7 +223,7 @@ static bool StreamSubInfo(int type, size_t& size, size_t& align) {
     case SUB_BLEND: size = 328; return true;
     case SUB_SAMPLEMASK: size = 4; return true;
     case SUB_RASTER: case SUB_RASTER1: size = 44; return true;
-    case SUB_RASTER2: size = 32; return true;
+    case SUB_RASTER2: size = 40; return true;   // 1.1.1: D3D12_RASTERIZER_DESC2 = 10 x 4 bytes (was 32 -> the following sub-objects were mis-parsed)
     case SUB_DEPTH: size = 52; return true;
     case SUB_DEPTH1: size = 56; return true;
     case SUB_DEPTH2: size = 60; return true;
