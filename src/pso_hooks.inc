@@ -34,7 +34,7 @@ static inline bool PsoCacheable(REFIID riid, void** ppv) { return ppv && IsEqual
 static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
     if (!desc) return oCreateGPSO(dev, desc, riid, ppv);
     // v26 persistent pipeline cache: known pipeline -> give the driver its cached blob (no shader compile); unknown -> compile as usual, then remember it
-    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;   // pipelines that already carry the game's own blob are left alone
+    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes && RsKnown((void*)desc->pRootSignature);   // pipelines that already carry the game's own blob (or use a root signature we never saw created) are left alone
     uint64_t key = 0; bool hit = false;
     if (cache) {
         PsoWaitReady(); g_psoSeen++; key = HashGfxDesc(desc); PsoBlobPtr blob = PsoFind(key);
@@ -61,7 +61,7 @@ static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRA
 }
 static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
     if (!desc) return oCreateCPSO(dev, desc, riid, ppv);
-    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes;
+    const bool cache = g_cfg.psoCache && PsoCacheable(riid, ppv) && !desc->CachedPSO.CachedBlobSizeInBytes && RsKnown((void*)desc->pRootSignature);
     uint64_t key = 0;
     if (cache) {
         PsoWaitReady(); g_psoSeen++; key = HashCompDesc(desc); PsoBlobPtr blob = PsoFind(key);
@@ -96,6 +96,7 @@ static HRESULT STDMETHODCALLTYPE hkCreatePSS(ID3D12Device* dev, const SnStreamDe
     std::vector<SubInfo> subs;
     long nc = ++g_psoStreamCalls; if (nc == 1) Log("pso-cache: this game creates pipelines with CreatePipelineState (state stream) - cached as well");
     if (!ParseStream(base, total, subs) || StreamHasBlob(base, subs)) { long u = ++g_psoStreamUnknown; if (u <= 3) Log("pso-cache: a pipeline stream was not cacheable (unknown sub-object type, or it already carries the game's own blob) - passed through unchanged"); return oCreatePSS(dev, desc, riid, ppv); }
+    for (auto& s : subs) if (s.type == SUB_RS && !RsKnown(RdAt<void*>(base + s.off))) return oCreatePSS(dev, desc, riid, ppv);   // 1.1.1: unknown root signature object -> never cached
     PsoWaitReady(); g_psoSeen++;
     uint64_t key = HashStream(base, subs); PsoBlobPtr blob = PsoFind(key);
     if (blob) {
