@@ -14,7 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
-#define SN_VERSION "1.1.1"
+#define SN_VERSION "1.1.2"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -258,6 +258,17 @@ static inline int EffH() { int vv = g_viewH.load(); if (vv && g_cfg.viewRect) re
 static ID3D12Resource* g_pinVel = nullptr; static ID3D12Resource* g_pinDepth = nullptr;
 static ID3D12Resource* g_dummyVel = nullptr; static UINT g_dummyW = 0, g_dummyH = 0;   // v19: all-zero R16G16_UNORM 'no velocity anywhere' texture (owned by us, never in g_res)
 static std::atomic<bool> g_forceReset{false};   // next DLSS-G frame is sent with reset=true (pins changed, hitch, MV buffers re-created)
+// 1.1.2: is a pinned game resource still alive FOR THE GAME? We hold one reference of our own (RegisterRes); when that is the only one left, the game has destroyed the
+// buffer (level change / loading screen / resolution change) and its memory may already be re-used by other resources (UE5 pools + aliases render targets).
+// Reading it from the MV compute pass then reads foreign memory in a foreign layout = GPU page fault / hang = driver reset or a blue screen.
+// Up to 1.1.1 this was only noticed every 30 frames (PruneRes); during a loading screen (200-500 ms per frame) that is SECONDS of GPU work on dead memory.
+// Checked every frame now (two atomic operations). Our own dummy velocity buffer has exactly one reference (ours) by design -> always 'alive'.
+static inline bool PinAlive(ID3D12Resource* r) {
+    if (!r) return false;
+    if (r == g_dummyVel) return true;
+    r->AddRef(); ULONG c = r->Release();
+    return c > 1;
+}
 
 static inline bool IsVelFmt(DXGI_FORMAT f) { return f == DXGI_FORMAT_R16G16_UNORM || f == DXGI_FORMAT_R16G16_TYPELESS || (g_cfg.velFmt && (int)f == g_cfg.velFmt); }   // v18: some UE5 RHI paths create the velocity target typeless (we always view it as R16G16_UNORM)
 // v29: a pin (velocity / depth) is later viewed through CreateShaderResourceView (MV pass) as a single-sample, single-slice Texture2D mip 0..0.
@@ -1048,6 +1059,9 @@ static bool DepthViewOk(DXGI_FORMAT res) {
 // Builds a private command list, runs the MV pass on the game's queue. Returns true if g_mvOut/g_depthOut were refreshed.
 static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3D12Resource* depth) {   // W/H = size of the game's buffers (allocation), VW/VH = real view rect inside them (v20)
     if (!g_device || !g_queue || !vel || !depth) return false;
+    if (!PinAlive(vel) || !PinAlive(depth)) {   // 1.1.2: the game already destroyed a pinned buffer -> never dispatch on it (see PinAlive)
+        static int s_dead = 0; if (s_dead++ < 20) Log("MV pass SKIPPED: pinned %s %p was released by the game (stale pin) - waiting for new pins", PinAlive(vel) ? "depth" : "velocity", PinAlive(vel) ? (void*)depth : (void*)vel);
+        return false; }
     { const char* w1 = nullptr; const char* w2 = nullptr; D3D12_RESOURCE_DESC vd0 = ResDesc(vel), dd0 = ResDesc(depth);
       if (!PinDescOk(vd0, &w1) || !PinDescOk(dd0, &w2)) {   // v29: never create SRVs on resources that cannot be viewed -> skip the MV pass (frame generation stays off this frame)
           static int s_bad = 0; if (s_bad++ < 20) Log("MV pass SKIPPED: pinned %s %p is not usable as a shader resource (%s) flags=0x%X samples=%u mips=%u array=%u fmt=%d",
@@ -1147,12 +1161,13 @@ static void PruneRes() {
             m.res->AddRef(); ULONG c = m.res->Release();
             if (c <= 1) {
                 void* key = it->first;
+                bool wasPin = (g_pinVel == m.res) || (g_pinDepth == m.res);   // 1.1.2: our MV pass of the last frames may still be queued on the GPU with this buffer -> release it a few frames later
                 if (g_pinVel == m.res) g_pinVel = nullptr;
                 if (g_pinDepth == m.res) g_pinDepth = nullptr;
                 for (auto r = g_rtvToRes.begin(); r != g_rtvToRes.end();) { if (r->second == key) r = g_rtvToRes.erase(r); else ++r; }
                 for (auto r = g_dsvToRes.begin(); r != g_dsvToRes.end();) { if (r->second == key) r = g_dsvToRes.erase(r); else ++r; }
                 { std::lock_guard<std::mutex> sl(g_stateMx); g_state.erase(key); }
-                m.res->Release();
+                if (wasPin) DeferResRelease(m.res); else m.res->Release();
                 it = g_res.erase(it); erased = true; continue;
             }
         }
@@ -1163,6 +1178,11 @@ static void PruneRes() {
 static void UpdatePins() {
     int fr = g_frame.load();
     if ((fr % 30) == 0) PruneRes();
+    else if ((g_pinVel && !PinAlive(g_pinVel)) || (g_pinDepth && !PinAlive(g_pinDepth))) {   // 1.1.2: a pinned buffer was destroyed by the game: drop it NOW, not up to 29 frames later
+        static int s_early = 0; if (s_early++ < 20) Log("pins: velocity %p / depth %p released by the game at frame %d -> pruned immediately", (void*)g_pinVel, (void*)g_pinDepth, fr);
+        PruneRes();
+        if (g_pinVel && !PinAlive(g_pinVel)) g_pinVel = nullptr; if (g_pinDepth && !PinAlive(g_pinDepth)) g_pinDepth = nullptr;   // (not tracked by PruneRes: never keep a dead pin)
+        g_forceReset = true; }
     if (g_pinVel && g_pinDepth && (fr % 8) != 0) return;      // pins are stable: re-evaluate every 8 frames only
     ID3D12Resource* bestVel = nullptr, * bestDep = nullptr, * bestVelT = nullptr; int bv = -1, bd = -1, curV = -1, curD = -1, bvT = -1;
     { std::unique_lock<std::shared_mutex> lk(g_resMx);
@@ -1421,9 +1441,11 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     if (g_cbvPerFrame.load() > 500) g_busyFrames++; if (g_pinDepth) g_scene3dFrames++;   // v25: diagnostics (is a 3D scene rendering?)
     // frame time (base fps) + maintenance
     static LARGE_INTEGER s_qf = {}, s_last = {}; static double s_ema = 16.7;
+    static int s_stallHold = 0;   // 1.1.2: frames during which frame generation / the MV pass stay off after a long stall (loading screen, level change, device hiccup)
     if (!s_qf.QuadPart) QueryPerformanceFrequency(&s_qf);
     { LARGE_INTEGER n; QueryPerformanceCounter(&n); double dtMs = s_last.QuadPart ? (double)(n.QuadPart - s_last.QuadPart) * 1000.0 / (double)s_qf.QuadPart : 0.0; s_last = n;
       if (dtMs > 0.0 && dtMs < 1000.0) s_ema += (dtMs - s_ema) * 0.05;
+      if (dtMs > 200.0) s_stallHold = 10;   // 1.1.2: the game is re-creating its render targets right now: do not touch its (possibly just destroyed / re-used) depth buffer, do not feed DLSS-G a half-built frame
       if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
     FlushDeferredRes();
     HudCalOnPresent(fr); AcLateCheck(fr); if (fr == 300 || fr == 1800) CrashChain();   // v27
@@ -1488,7 +1510,8 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
             if (fps >= (double)(g_cfg.fgMinFps + 8)) { if (++s_highN >= need) { s_susp = false; s_lowN = 0; g_forceReset = true; Log("FG resumed: base fps %.1f (frame %d, waited %d good frames)", fps, fr, need); } } else s_highN = 0;
         }
     }
-    bool wantOn = g_cfg.fg && !g_acTripped.load() && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp && !g_compatBlocked.load();
+    bool wantOn = g_cfg.fg && !g_acTripped.load() && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp && !g_compatBlocked.load() && s_stallHold <= 0;
+    if (s_stallHold > 0) s_stallHold--;
     int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
     // v24: camera tracker lost the view buffer (loading screen, level streaming, tracker blind spot): re-scan with relaxed checks, and - if FG was running - keep it running.
     static bool s_held = false; static int s_rescanStart = -1, s_rescanCool = 0, s_heldSince = 0;
@@ -1582,7 +1605,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     if (!g_wasOn) g_fgRatio.store(1.0);
     if (g_slRuntimeOk && (fr % 30) == 0 && EffectiveBaseLimit() != g_appliedLimit) ApplyReflexOptions("fps cap / state change");   // v27
     // v25: why is frame generation not on right now (menu status line)
-    g_whyNot = g_wasOn ? "" : !g_cfg.fg ? "off (switched off)" : g_cfg.stage < 2 ? "stage<2" : fr < g_cfg.warmup ? "warming up" : s_susp ? "paused (base fps below the limit)" : !camOk ? "waiting for the camera (3D scene)" : !delayOk ? "camera stabilising" : !g_pinDepth ? "waiting for the depth buffer" : !g_pinVel ? "waiting for the velocity buffer" : g_mvPreIniting.load() ? "building the motion-vector pass" : g_mvFailed ? "motion-vector pass failed" : "starting";
+    g_whyNot = g_wasOn ? "" : !g_cfg.fg ? "off (switched off)" : g_cfg.stage < 2 ? "stage<2" : fr < g_cfg.warmup ? "warming up" : s_susp ? "paused (base fps below the limit)" : s_stallHold > 0 ? "long frame (loading) - waiting" : !camOk ? "waiting for the camera (3D scene)" : !delayOk ? "camera stabilising" : !g_pinDepth ? "waiting for the depth buffer" : !g_pinVel ? "waiting for the velocity buffer" : g_mvPreIniting.load() ? "building the motion-vector pass" : g_mvFailed ? "motion-vector pass failed" : "starting";
     // Best-effort proof that frames are really being generated: compare the game's Present() rate with the swap chain's own
     // present counter (generated frames are presented by Streamline on the same swap chain). ratio ~2.0 => frame generation works.
     {
