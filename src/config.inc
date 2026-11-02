@@ -242,6 +242,7 @@ static void LoadCfg() {
     if (g_cfg.hudless < 0 || g_cfg.hudless > 2) g_cfg.hudless = 0; if (g_cfg.fpsCap < -1) g_cfg.fpsCap = 0; if (g_cfg.fpsCap > 1000) g_cfg.fpsCap = 1000;
     if (g_cfg.fgKey == g_cfg.overlayKey) g_cfg.fgKey = 0; if (g_cfg.hudKey == g_cfg.overlayKey || g_cfg.hudKey == g_cfg.fgKey) g_cfg.hudKey = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG 1.1.2 = 1.1.1 + crash fix: pinned depth/velocity buffers destroyed by the game (loading screen / level change) are dropped immediately and never read by the MV pass; frame generation pauses for 10 frames after a >200 ms frame");
     Log("SN_DLSSG " SN_VERSION " = 1.0.0 + lighter D3D12 hooks (hookfast: lock-free pre-filters for resource barriers / render-target binds / descriptor copies, census off after frame 3000), optional hook CPU profile (hookprof)");
     Log("SN_DLSSG 1.0.0 = v30 + target-fps mode (targetfps), frame-time graph (showgraph), less camera-search work per draw (camfast), hudless=2 default for new configs");
     Log("CFG " SN_VERSION " targetfps=%d showgraph=%d camfast=%d hookfast=%d hookprof=%d", g_cfg.targetFps, g_cfg.showGraph, g_cfg.camFast, g_cfg.hookFast, g_cfg.hookProf);
