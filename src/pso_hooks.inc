@@ -42,7 +42,7 @@ static HRESULT STDMETHODCALLTYPE hkCreateGPSO(ID3D12Device* dev, const D3D12_GRA
             D3D12_GRAPHICS_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
             HRESULT h2 = oCreateGPSO(dev, &cp, riid, ppv);
             if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached graphics pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+            long nr = ++g_psoRejected; if (!SnPsoRejectIsForeignAdapter((uint32_t)h2)) PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached graphics pipeline (hr=0x%08X) -> %s, compiling normally", (unsigned)h2, SnPsoRejectIsForeignAdapter((uint32_t)h2) ? "entry kept (other adapter / driver)" : "entry dropped");
         }
     }
     HRESULT hr = oCreateGPSO(dev, desc, riid, ppv);
@@ -69,7 +69,7 @@ static HRESULT STDMETHODCALLTYPE hkCreateCPSO(ID3D12Device* dev, const D3D12_COM
             D3D12_COMPUTE_PIPELINE_STATE_DESC cp = *desc; cp.CachedPSO.pCachedBlob = blob->data(); cp.CachedPSO.CachedBlobSizeInBytes = blob->size();
             HRESULT h2 = oCreateCPSO(dev, &cp, riid, ppv);
             if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached compute pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+            long nr = ++g_psoRejected; if (!SnPsoRejectIsForeignAdapter((uint32_t)h2)) PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached compute pipeline (hr=0x%08X) -> %s, compiling normally", (unsigned)h2, SnPsoRejectIsForeignAdapter((uint32_t)h2) ? "entry kept (other adapter / driver)" : "entry dropped");
         }
     }
     HRESULT hr = oCreateCPSO(dev, desc, riid, ppv);
@@ -105,7 +105,7 @@ static HRESULT STDMETHODCALLTYPE hkCreatePSS(ID3D12Device* dev, const SnStreamDe
             SnStreamDesc d2 = { nb, buf.data() };
             HRESULT h2 = oCreatePSS(dev, &d2, riid, ppv);
             if (SUCCEEDED(h2)) { g_psoHit++; return h2; }
-            long nr = ++g_psoRejected; PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached stream pipeline (hr=0x%08X) -> entry dropped, compiling normally", (unsigned)h2);
+            long nr = ++g_psoRejected; if (!SnPsoRejectIsForeignAdapter((uint32_t)h2)) PsoErase(key); if (nr <= 8) Log("pso-cache: driver rejected a cached stream pipeline (hr=0x%08X) -> %s, compiling normally", (unsigned)h2, SnPsoRejectIsForeignAdapter((uint32_t)h2) ? "entry kept (other adapter / driver)" : "entry dropped");
         }
     }
     HRESULT hr = oCreatePSS(dev, desc, riid, ppv);
