@@ -28,15 +28,13 @@ struct Cfg {
     int camStale = 30;       // frames without a fresh view uniform buffer before FG is turned off (menus, loading, cutscenes without view). v16: 6 -> 30 (short hitches no longer toggle FG)
     int farPlane = 1000000;
     int camAuto = 1;         // 1 = if the view buffer is not found at projoff/noaaoff/mvoff, scan the buffer and lock onto the real offsets (other UE4 games)
-    int reflexSleep = 1;     // 1 = call slReflexSleep every frame (needed for DLSS-G pacing)
-    int baseFpsLimit = 0;    // Reflex frame limiter for the BASE frame rate (needs reflexsleep=1)
+    int baseFpsLimit = 0;    // 1.1.3: ignored (the Reflex limiter needs slReflexSleep, which was removed)
     int showConsole = 0;     // only works with the 'development' Streamline DLLs
     int fgMinFps = 0;        // >0: switch frame generation OFF while the BASE fps stays below this value (busy scenes), back ON when it recovers
     int fgDelay = 30;        // frames the camera must be valid IN A ROW before frame generation is (re)enabled (stops on/off flapping during loading/fades)
     int camHold = 1;         // v24: 1 = if the camera view buffer is lost while frame generation is running, KEEP frame generation on (last projection, identity ClipToPrevClip = optical flow only) instead of switching it off for the rest of the session
     int camHoldMax = 7200;   // v24: max frames to hold without a camera (then FG is switched off like before)
     int camRescan = 90;      // v24: frames without camera before the tracker re-scans the view buffer with relaxed checks (0 = never)
-    int reflexAlways = 0;    // v24: 1 = call slReflexSleep even while frame generation is off/paused (v23 did, and slept ~20 ms per frame at the 9 fps start of the game for nothing)
     int fgMinBackoff = 1;    // v24: 1 = every FG pause by fgminfps doubles the time the base fps must stay good before FG resumes (stops the on/off flapping = 100+ ms hitch per switch)
     int bufMaxMB = 192;      // upper bound for upload buffers kept alive by the camera tracker (texture-streaming staging buffers are huge during loads)
     int reflexPlace = 0;     // 1 = call slReflexSleep + SimulationStart at the START of the game frame (end of the previous Present) instead of inside Present
@@ -45,7 +43,8 @@ struct Cfg {
     int splash = 1;          // 1 = show the progress window while the cache is being built (only when something has to be built)
     // ---- v26: game pipeline cache
     int psoCache = 1;        // 1 = persistent cache for the GAME's own pipeline states (graphics + compute): every shader is compiled by the driver only once (SN_DLSSG_psocache.bin)
-    int psoCacheMB = 384;    // upper bound for the pipeline cache (kept in RAM while the game runs)
+    int psoCacheMB = 384;    // upper bound for the pipeline cache (kept in RAM while the game runs) - counts the STORED (packed) bytes when cachecompress=1
+    int cacheCompress = 1;   // 1.1.7: 1 = pack the shader / pipeline caches with SNLZ (snpack.h): ~2x smaller files and RAM use (= ~2x more pipelines in the same psocachemb), 0 = store raw
     // ---- v25: in-game overlay / menu, compatibility diagnostics
     int overlay = 1;         // 1 = overlay + menu available (hotkey), 0 = never draw anything, never hook the keyboard
     int overlayKey = 0x2D;   // virtual-key code that opens/closes the menu (cfg: overlaykey=INSERT / F10 / HOME / 0x2D ...)
@@ -152,11 +151,11 @@ static void LoadCfg() {
                 "# renderw/renderh/tol : internal render resolution of the game (depth/velocity buffers) +- tolerance. renderw=0 renderh=0 = AUTO (recommended for UE5 / TSR / dynamic screen percentage)\n# c2pidx    : v18 (UE5) which identity-like matrix after ViewToClipNoAA is ClipToPrevClip (0 = first). Only used by the automatic camera scan\n"
                 "# camauto   : 1 = (default) automatically find the camera matrices in the UE4 view buffer when projoff/noaaoff/mvoff do not match this game (log: cam-scan LOCKED ...)\n# projoff/noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 in Scarlet Nexus)\n# mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)\n"
                 "# warmup    : frames before frame generation is switched on\n"
-                "# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)\n"
+                "# reflexsleep : REMOVED in 1.1.3 (slReflexSleep is never called; old value is ignored). Reflex mode (reflexmode=) still works. baseFpsLimit / fpscap are ignored too (they only worked through the sleep)\n"
                 "# shadercache : 1 = pre-build shaders before the game starts and store them in SN_DLSSG_shaders.snsc (delete the file to force a rebuild)\n"
                 "# splash    : 1 = show a progress window while shaders are being built (only appears when the cache has to be built)\n"
                 "# sldir     : folder containing sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, nvngx_dlssg.dll (empty = exe folder)\n"
-                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=2\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n"
+                "# fgminfps : >0 = turn frame generation off while the BASE fps is below this value (busy scenes), on again when it recovers (0 = never)\n# reflexplace : 1 = Reflex markers at the start of the game frame (experimental, try it if pacing is uneven)\n# log       : 1 = normal log, 2 = also verbose Streamline log (slow, big files - only for debugging)\n# fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads\n# bufmaxmb : max MB of upload buffers the camera tracker may keep alive (default 192)\nfgminfps=0\nreflexplace=0\nfgdelay=30\nbufmaxmb=192\nfg=1\nmult=2\nstage=2\nlog=1\nhudless=2\nhudlessdraw=2\nrenderw=2000\nrenderh=1124\ntol=100\nmvoff=492\nwarmup=150\nreflexsleep=1\nbaseFpsLimit=0\nshowconsole=0\nshadercache=1\nsplash=1\nsldir=\n"
                 "# ---- v25 overlay / menu (press the overlay key in game; arrows + Enter, changes are saved here automatically)\n"
                 "# overlay      : 1 = overlay + menu available, 0 = completely off\n# overlaykey   : key that opens/closes the menu: INSERT (default), F1..F12, HOME, END, PAGEUP, ... or a virtual-key number like 0x2D\n"
                 "# showfps      : 1 = show the REAL fps (how fast the game itself renders)\n# showfgfps    : 1 = show the DLSS Frame Generation output fps\n# showframetime: 1 = show frame time + 1%% low\n"
@@ -165,11 +164,13 @@ static void LoadCfg() {
                 "# autosave     : 1 = changes made in the menu are written back to this file ; autoreport=1 = write SN_DLSSG_DEBUG_REPORT.txt when FG cannot work\n"
                 "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n"
                 "# ---- v26: psocache = persistent cache of the GAME's pipelines (SN_DLSSG_psocache.bin)\n"
-                "psocache=1\npsocachemb=384\n");
+                "psocache=1\npsocachemb=384\n"
+                "# ---- 1.1.7: cachecompress = 1 packs SN_DLSSG_psocache.bin / SN_DLSSG_shaders.snsc (about half the size, also in RAM: the psocachemb budget holds ~2x more pipelines). 0 = store raw. Old files are converted automatically.\n"
+                "cachecompress=1\n");
             std::string t = tpl; int ue = DetectUeVersion(); g_cfg.engine = ue;
             if (ue == 5) { size_t q = t.find("renderw=2000\nrenderh=1124"); if (q != std::string::npos) t.replace(q, 25, "renderw=0\nrenderh=0"); }
             t += "# ---- v27\n# preset      : custom (default: nothing applied) | quality | balanced | performance - sets fgminfps, fgdelay, camstale and mult in one go; single keys written BELOW this line still win\n"
-                 "# fpscap      : OUTPUT fps cap: 0 = off, auto = display refresh - 3 (keeps VRR / G-Sync inside its window), or a number. Needs reflexsleep=1. Applies while frame generation runs\n"
+                 "# fpscap      : OUTPUT fps cap: 0 = off, auto = display refresh - 3 (keeps VRR / G-Sync inside its window), or a number. IGNORED since 1.1.3 (needed slReflexSleep)\n"
                  "# fgkey/hudkey: hotkeys (this session only): frame generation on/off, HUD on/off. NONE = off. They need overlay=1\n"
                  "# hudless     : 0 = off, 1 = on (hudlessdraw=N), 2 = AUTO: measures the right N in the first minute of 3D gameplay, then saves hudless=1 + hudlessdraw=N here\n"
                  "# anticheat   : 1 = (default) the injector switches itself OFF when an anti-cheat is found. 0 = skip that check (offline / anti-cheat-free launch only, at your own risk)\n"
@@ -206,13 +207,13 @@ static void LoadCfg() {
             else if (!strcmp(k, "mvoff")) g_cfg.mvOff = iv; else if (!strcmp(k, "noaaoff")) g_cfg.noAAOff = iv; else if (!strcmp(k, "projoff")) g_cfg.projOff = iv;
             else if (!strcmp(k, "velfallback")) g_cfg.velFallback = iv; else if (!strcmp(k, "velwait")) g_cfg.velWait = iv; else if (!strcmp(k, "velfmt")) g_cfg.velFmt = iv; else if (!strcmp(k, "c2pidx")) g_cfg.c2pIdx = iv; else if (!strcmp(k, "viewrect")) g_cfg.viewRect = iv ? 1 : 0; else if (!strcmp(k, "c2pauto")) g_cfg.c2pAuto = iv ? 1 : 0; else if (!strcmp(k, "jitsx")) g_cfg.jitSX = iv; else if (!strcmp(k, "jitsy")) g_cfg.jitSY = iv; else if (!strcmp(k, "mvsx")) g_cfg.mvSX = iv; else if (!strcmp(k, "mvsy")) g_cfg.mvSY = iv;
             else if (!strcmp(k, "warmup")) g_cfg.warmup = iv; else if (!strcmp(k, "camstale")) g_cfg.camStale = iv; else if (!strcmp(k, "psoretry")) g_cfg.psoRetry = iv; else if (!strcmp(k, "farplane")) g_cfg.farPlane = iv; else if (!strcmp(k, "camauto")) g_cfg.camAuto = iv;
-            else if (!strcmp(k, "reflexsleep")) g_cfg.reflexSleep = iv; else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
+            else if (!strcmp(k, "reflexsleep") || !strcmp(k, "reflexalways")) { /* 1.1.3: removed, key ignored */ } else if (!strcmp(k, "baseFpsLimit")) g_cfg.baseFpsLimit = iv;
             else if (!strcmp(k, "showconsole")) g_cfg.showConsole = iv;
             else if (!strcmp(k, "fgminfps")) g_cfg.fgMinFps = iv; else if (!strcmp(k, "reflexplace")) g_cfg.reflexPlace = iv;
-            else if (!strcmp(k, "camhold")) g_cfg.camHold = iv ? 1 : 0; else if (!strcmp(k, "camholdmax")) g_cfg.camHoldMax = iv; else if (!strcmp(k, "camrescan")) g_cfg.camRescan = iv; else if (!strcmp(k, "reflexalways")) g_cfg.reflexAlways = iv ? 1 : 0; else if (!strcmp(k, "fgminbackoff")) g_cfg.fgMinBackoff = iv ? 1 : 0;
+            else if (!strcmp(k, "camhold")) g_cfg.camHold = iv ? 1 : 0; else if (!strcmp(k, "camholdmax")) g_cfg.camHoldMax = iv; else if (!strcmp(k, "camrescan")) g_cfg.camRescan = iv; else if (!strcmp(k, "fgminbackoff")) g_cfg.fgMinBackoff = iv ? 1 : 0;
             else if (!strcmp(k, "fgdelay")) g_cfg.fgDelay = iv; else if (!strcmp(k, "bufmaxmb")) g_cfg.bufMaxMB = iv;
             else if (!strcmp(k, "cutdetect")) g_cfg.cutDetect = iv ? 1 : 0; else if (!strcmp(k, "cutthresh")) g_cfg.cutThresh100 = iv; else if (!strcmp(k, "cutfov")) g_cfg.cutFov = iv; else if (!strcmp(k, "shadercache")) g_cfg.shaderCache = iv; else if (!strcmp(k, "splash")) g_cfg.splash = iv;
-            else if (!strcmp(k, "psocache")) g_cfg.psoCache = iv ? 1 : 0; else if (!strcmp(k, "psocachemb")) g_cfg.psoCacheMB = iv;
+            else if (!strcmp(k, "psocache")) g_cfg.psoCache = iv ? 1 : 0; else if (!strcmp(k, "psocachemb")) g_cfg.psoCacheMB = iv; else if (!strcmp(k, "cachecompress")) g_cfg.cacheCompress = iv ? 1 : 0;
             else if (!strcmp(k, "preset")) g_cfg.preset = SnPresetParse(v);
             else if (!strcmp(k, "fpscap")) { std::string lv = SnLower(v); g_cfg.fpsCap = (lv.compare(0, 4, "auto") == 0) ? -1 : (lv.compare(0, 3, "off") == 0 ? 0 : std::max(0, iv)); }
             else if (!strcmp(k, "fgkey")) g_cfg.fgKey = ParseKeyName(v); else if (!strcmp(k, "hudkey")) g_cfg.hudKey = ParseKeyName(v);
@@ -242,8 +243,10 @@ static void LoadCfg() {
     if (g_cfg.hudless < 0 || g_cfg.hudless > 2) g_cfg.hudless = 0; if (g_cfg.fpsCap < -1) g_cfg.fpsCap = 0; if (g_cfg.fpsCap > 1000) g_cfg.fpsCap = 1000;
     if (g_cfg.fgKey == g_cfg.overlayKey) g_cfg.fgKey = 0; if (g_cfg.hudKey == g_cfg.overlayKey || g_cfg.hudKey == g_cfg.fgKey) g_cfg.hudKey = 0;
     if (g_cfg.log && !g_log) g_log = _wfopen((g_dir + L"\\SN_DLSSG_log.txt").c_str(), L"w");
+    Log("SN_DLSSG " SN_VERSION " = 1.1.6 + no false camera cuts from alternating views, the camera scan can no longer overwrite working view-buffer offsets, pso-cache keeps entries rejected only because of another adapter, RATE line shows the real multiplier and retries, log line when DLSS-G presents fewer frames than requested");
+    Log("SN_DLSSG 1.1.6 = 1.1.5 + ClipToPrevClip is judged by its EFFECT (reprojection of a screen-point grid, like the MV shader) instead of the size of its entries: real matrices of narrow-FOV / telephoto cutscenes are no longer thrown away, hard cuts are detected by failed reprojection, the INVALID ban expires after 1800 frames");
     Log("SN_DLSSG 1.1.2 = 1.1.1 + crash fix: pinned depth/velocity buffers destroyed by the game (loading screen / level change) are dropped immediately and never read by the MV pass; frame generation pauses for 10 frames after a >200 ms frame");
-    Log("SN_DLSSG " SN_VERSION " = 1.0.0 + lighter D3D12 hooks (hookfast: lock-free pre-filters for resource barriers / render-target binds / descriptor copies, census off after frame 3000), optional hook CPU profile (hookprof)");
+    Log("SN_DLSSG 1.1.0 = 1.0.0 + lighter D3D12 hooks (hookfast: lock-free pre-filters for resource barriers / render-target binds / descriptor copies, census off after frame 3000), optional hook CPU profile (hookprof)");
     Log("SN_DLSSG 1.0.0 = v30 + target-fps mode (targetfps), frame-time graph (showgraph), less camera-search work per draw (camfast), hudless=2 default for new configs");
     Log("CFG " SN_VERSION " targetfps=%d showgraph=%d camfast=%d hookfast=%d hookprof=%d", g_cfg.targetFps, g_cfg.showGraph, g_cfg.camFast, g_cfg.hookFast, g_cfg.hookProf);
     Log("SN_DLSSG v30 = v29 with performance fixes: VRAM estimate only on demand (was per frame), dynamic-resolution flag only when the view rect really changes");
@@ -253,11 +256,11 @@ static void LoadCfg() {
     Log("SN_DLSSG v27 = v26 + presets, output fps cap (VRR), hotkeys, hudless=2 auto detection, anti-cheat guard, crash mini-dumps + support zip, auto-saved scan results");
     Log("CFG v27 preset=%s fpscap=%d fgkey=%s hudkey=%s hudless=%d anticheat=%d crashdump=%d autolearn=%d", SnPresetName(g_cfg.preset), g_cfg.fpsCap, KeyNameOf(g_cfg.fgKey), KeyNameOf(g_cfg.hudKey), g_cfg.hudless, g_cfg.antiCheat, g_cfg.crashDump, g_cfg.autoLearn);
     Log("SN_DLSSG v26 = v25 + persistent game pipeline (PSO) cache");
-    Log("CFG v26 psocache=%d psocachemb=%d", g_cfg.psoCache, g_cfg.psoCacheMB);
+    Log("CFG v26 psocache=%d psocachemb=%d cachecompress=%d", g_cfg.psoCache, g_cfg.psoCacheMB, g_cfg.cacheCompress);
     Log("SN_DLSSG v25 = v24 + in-game overlay/menu (key %s), FPS / DLSS-FG FPS HUD, auto config save, compatibility check + debug report, safe start-up optimisations", KeyNameOf(g_cfg.overlayKey));
     Log("SN_DLSSG v24 (v23 + camera-registry LRU eviction (fixes FG lost after a level load), camera re-scan + hold, async buffer release, no useless Reflex sleep, FG-pause backoff) build " __DATE__ " " __TIME__ "  (Streamline SDK headers %d.%d.%d)", SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     Log("CFG velfallback=%d velwait=%d velfmt=%d viewrect=%d c2pauto=%d cutdetect=%d", g_cfg.velFallback, g_cfg.velWait, g_cfg.velFmt, g_cfg.viewRect, g_cfg.c2pAuto, g_cfg.cutDetect);
-    Log("CFG v24 camhold=%d camholdmax=%d camrescan=%d reflexalways=%d fgminbackoff=%d fgminfps=%d bufmaxmb=%d", g_cfg.camHold, g_cfg.camHoldMax, g_cfg.camRescan, g_cfg.reflexAlways, g_cfg.fgMinBackoff, g_cfg.fgMinFps, g_cfg.bufMaxMB);
+    Log("CFG v24 camhold=%d camholdmax=%d camrescan=%d fgminbackoff=%d fgminfps=%d bufmaxmb=%d", g_cfg.camHold, g_cfg.camHoldMax, g_cfg.camRescan, g_cfg.fgMinBackoff, g_cfg.fgMinFps, g_cfg.bufMaxMB);
     Log("CFG fg=%d mult=%d stage=%d hudless=%d(N=%d) render=%dx%d+-%d%s mvoff=%d c2pidx=%d warmup=%d", g_cfg.fg, g_cfg.mult, g_cfg.stage, g_cfg.hudless, g_cfg.hudlessDraw, g_cfg.renderW, g_cfg.renderH, g_cfg.tol, g_cfg.renderW <= 0 ? " (AUTO)" : "", g_cfg.mvOff, g_cfg.c2pIdx, g_cfg.warmup);
 }
 
