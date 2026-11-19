@@ -17,8 +17,8 @@
 #pragma once
 #include "snpack.h"
 
-// mingw-w64's d3d12.h declares ID3D12Device1::CreatePipelineLibrary but not the ID3D12PipelineLibrary interface itself -> declare it here (official vtable order, IID c64226a8-9201-46af-b4cc-53fb9ff7414f)
-#ifndef SN_HAVE_PIPELINELIB
+// mingw-w64's d3d12.h declares ID3D12Device1::CreatePipelineLibrary but not the ID3D12PipelineLibrary interface itself -> declare it here when the header lacks it (official vtable order, IID c64226a8-9201-46af-b4cc-53fb9ff7414f)
+#if !defined(SN_HAVE_PIPELINELIB) && !defined(__ID3D12PipelineLibrary_INTERFACE_DEFINED__)   // newer mingw-w64 headers (e.g. ubuntu-latest CI) already declare it
 struct ID3D12PipelineLibrary : public ID3D12DeviceChild {
     virtual HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pso) = 0;
     virtual HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) = 0;
