@@ -219,3 +219,28 @@ struct SnPtrFilter {
         for (unsigned i = 0; i < kWords; i++) w[i].store(tmp[i], std::memory_order_release);
     }
 };
+
+// ------------------------------------------------------------------ 1.1.7 helpers (pure, unit-tested in tests/test_logic.cpp)
+// (1) Alternating views. The log of 1.1.6 shows m0 flipping 1.0 <-> 1.6406 on consecutive frames (frames 14311..14313, 16340..16343): two different views (main camera / second
+//     view) are read by the camera tracker in turn. Every flip looked like a "projection (FOV) jump" = a camera cut and reset the DLSS-G history until the guard switched itself off.
+//     A projection that was already seen a few frames ago is a view that alternates, NOT a cut.
+struct SnProjHist {
+    static const int N = 4; float m0[N], m5[N]; int fr[N]; int n = 0;
+    SnProjHist() { for (int i = 0; i < N; i++) { m0[i] = m5[i] = 0.f; fr[i] = -100000; } }
+    static bool Same(float a, float b) { return fabsf(a - b) <= 0.002f * std::max(fabsf(a), fabsf(b)) + 1e-6f; }
+    // true = this projection (or one equal to it) was seen within the last `window` frames (before frame `now`)
+    bool SeenRecently(float a0, float a5, int now, int window) const { for (int i = 0; i < N; i++) if (fr[i] > -100000 && now - fr[i] <= window && now > fr[i] && Same(m0[i], a0) && Same(m5[i], a5)) return true; return false; }
+    void Add(float a0, float a5, int now) {
+        for (int i = 0; i < N; i++) if (fr[i] > -100000 && Same(m0[i], a0) && Same(m5[i], a5)) { fr[i] = now; return; }   // refresh a known one
+        int o = 0; for (int i = 1; i < N; i++) if (fr[i] < fr[o]) o = i;                                                // replace the oldest
+        m0[o] = a0; m5[o] = a5; fr[o] = now; if (n < N) n++; }
+};
+// (2) Camera scan may only (re)lock the view-buffer offsets when the current offsets do not deliver a camera any more. 1.1.6 locked onto the first buffer that repeated 5 times,
+//     even while the working offsets (112/128/544) were still delivering the camera every frame (log: "LOCKED projoff=2800" at frame 12752 -> camera lost -> camhold 65 frames,
+//     the wrong offsets were saved to the cfg file, then the ClipToPrevClip had to be re-learned: 3 more history resets).
+static inline bool SnScanMayLock(int camFrame, int frame, bool rescanMode, int staleFrames) { return camFrame < 0 || rescanMode || (frame - camFrame) > staleFrames; }
+// (3) A cached pipeline that the driver refuses with ADAPTER_NOT_FOUND / DRIVER_VERSION_MISMATCH is not damaged: it belongs to another adapter / driver (the game creates probe
+//     devices on the other adapters at start-up: the log shows 4 "rejected" entries, all on those probe devices). Such an entry must NOT be erased from the cache.
+static inline bool SnPsoRejectIsForeignAdapter(uint32_t hr) { return hr == 0x887E0001u || hr == 0x887E0002u; }
+// (4) Expected swap-chain / game present ratio for the RATE line (the text used to say "about 2.0" even with mult=3)
+static inline double SnExpectedRatio(int mult) { return mult < 1 ? 1.0 : (double)mult; }
