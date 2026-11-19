@@ -15,9 +15,9 @@
 # projoff / noaaoff : float index of ViewToClip / ViewToClipNoAA (116 / 132 for Scarlet Nexus)
 # mvoff     : float index of ClipToPrevClip inside the UE4 view uniform buffer (492 for Scarlet Nexus)
 # warmup    : frames before frame generation is switched on
-# reflexsleep : 1 = also call slReflexSleep every frame, baseFpsLimit = cap for the BASE fps (0 = none)
+# reflexsleep : REMOVED in 1.1.3 (slReflexSleep is never called; old value ignored). Reflex mode (reflexmode=) still works. baseFpsLimit / fpscap are ignored too
 # fgminfps : >0 = pause frame generation while the BASE fps is below this value (busy scenes), resume at value+8 (0 = never)
-# reflexplace : 1 = Reflex sleep/markers at the start of the game frame (experimental)
+# reflexplace : 1 = Reflex markers at the start of the game frame (experimental)
 # log       : 1 = normal log, 2 = + verbose Streamline log (debug only, slow)
 # fgdelay : frames the camera must be valid in a row before FG is switched on again (default 30) - avoids on/off flapping while a level loads
 # camstale : frames without a fresh camera before FG is switched off (default 30; v15 used 6 -> FG flapped on short hitches)
@@ -30,7 +30,6 @@
 # camhold   : v24 1 = if the camera view buffer is lost while FG is running (level load, streaming), KEEP FG on (last projection + identity ClipToPrevClip = optical flow only) instead of switching it off for the rest of the session
 # camholdmax: v24 max frames to hold without a camera before FG is switched off (default 7200)
 # camrescan : v24 frames without a camera before the tracker re-scans with relaxed checks (aspect check relaxed, scan even though offsets were locked). 0 = never
-# reflexalways: v24 1 = slReflexSleep also while FG is off/paused/warming up (v23 behaviour; cost ~20 ms per frame at the 9 fps start of the game). 0 = only when FG runs
 # fgminbackoff: v24 1 = every FG pause (fgminfps) doubles the number of good frames needed before FG resumes (stops on/off flapping, every switch = 100+ ms hitch)
 fg=1
 mult=2
@@ -46,7 +45,6 @@ projoff=116
 noaaoff=132
 camauto=1
 warmup=150
-reflexsleep=1
 baseFpsLimit=0
 showconsole=0
 sldir=
@@ -68,7 +66,6 @@ cutfov=8
 camhold=1
 camholdmax=7200
 camrescan=90
-reflexalways=0
 fgminbackoff=1
 # ---- v25 overlay / menu: press the overlay key IN GAME (default INSERT). Up/Down select, Left/Right change, Enter act. Changes are saved here automatically.
 # overlay       : 1 = overlay + menu available, 0 = completely off (no keyboard hook, nothing drawn)
@@ -95,12 +92,16 @@ msgbox=1
 # psocache     : 1 = persistent cache of the GAME's own pipeline states (graphics + compute): the driver compiles every shader only ONCE, ever (file SN_DLSSG_psocache.bin next to the exe;
 #                delete it to rebuild). The first launch after install / a GPU driver update still compiles normally (and fills the cache); every later launch loads the cache BEFORE the game
 #                creates its device. Pipelines that carry the game's own cached blob are not touched.
-# psocachemb   : size limit of that cache in MB (it is also held in RAM while the game runs)
+# psocachemb   : size limit of that cache in MB (it is also held in RAM while the game runs); with cachecompress=1 it limits the PACKED size
 psocache=1
 psocachemb=384
+# ---- v1.1.7 (packed shader caches)
+# cachecompress: 1 = pack SN_DLSSG_psocache.bin and SN_DLSSG_shaders.snsc (about half the size on disk AND in RAM, so psocachemb holds roughly twice as many pipelines;
+#                a cached pipeline is unpacked only when the game asks for it). 0 = store raw. Files from older versions are converted automatically in the background.
+cachecompress=1
 # ---- v27
 # preset      : custom (default: nothing applied) | quality | balanced | performance - sets fgminfps, fgdelay, camstale and mult in one go; single keys written BELOW this line still win
-# fpscap      : OUTPUT fps cap: 0 = off, auto = display refresh - 3 (keeps VRR / G-Sync inside its window), or a number. Needs reflexsleep=1. Applies while frame generation runs
+# fpscap      : OUTPUT fps cap: 0 = off, auto = display refresh - 3 (keeps VRR / G-Sync inside its window), or a number. IGNORED since 1.1.3 (needed slReflexSleep)
 # fgkey/hudkey: hotkeys (this session only): frame generation on/off, HUD on/off. NONE = off. They need overlay=1
 # hudless     : 0 = off, 1 = on (hudlessdraw=N), 2 = AUTO: measures the right N in the first minute of 3D gameplay, then saves hudless=1 + hudlessdraw=N here
 # anticheat   : 1 = (default) the injector switches itself OFF when an anti-cheat is found. 0 = skip that check (offline / anti-cheat-free launch only, at your own risk)
