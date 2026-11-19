@@ -71,5 +71,26 @@ int main(int argc, char** argv) {
       miss = 0; for (auto p : keep) if (!f.Maybe(p)) miss++; CHECK(miss == 0);          // kept entries survive a rebuild
       int still = 0; for (size_t i = 40; i < all.size(); i++) if (f.Maybe(all[i])) still++; CHECK(still < 40);   // most dropped entries are gone again
       f.Rebuild({}); int any = 0; for (auto p : all) if (f.Maybe(p)) any++; CHECK(any == 0); }
+    // ---- 1.1.7: alternating views are not camera cuts (log: m0 flips 1.0 <-> 1.6406 on consecutive frames)
+    { SnProjHist h; h.Add(1.0f, 1.7778f, 14310);                                            // view A
+      CHECK(!h.SeenRecently(1.6406f, 2.9167f, 14311, 8));                                  // first flip to B: unknown yet (counts as a cut candidate)
+      h.Add(1.6406f, 2.9167f, 14311);
+      CHECK(h.SeenRecently(1.0f, 1.7778f, 14312, 8));                                      // back to A: seen 2 frames ago -> alternating
+      h.Add(1.0f, 1.7778f, 14312);
+      CHECK(h.SeenRecently(1.6406f, 2.9167f, 14313, 8));                                   // B again -> alternating
+      CHECK(!h.SeenRecently(1.6406f, 2.9167f, 14400, 8));                                  // B was last seen 89 frames ago -> a jump to it is a real change
+      CHECK(!h.SeenRecently(2.1445f, 3.8125f, 14313, 8));                                  // a third, unknown projection is still a jump
+      CHECK(!h.SeenRecently(1.0f, 1.7778f, 14312, 8));                                     // same frame as the entry: never "seen before"
+      SnProjHist g; for (int i = 0; i < 6; i++) g.Add(1.0f + 0.5f * (float)i, 1.78f * (1.0f + 0.5f * (float)i), 100 + i);   // 6 distinct values, ring of 4 keeps the newest
+      CHECK(!g.SeenRecently(1.0f, 1.78f, 106, 50)); CHECK(g.SeenRecently(3.5f, 1.78f * 3.5f, 106, 50)); }
+    // ---- 1.1.7: the camera scan may not lock over offsets that still deliver the camera
+    CHECK(SnScanMayLock(-1, 5000, false, 90));          // no camera ever found: lock
+    CHECK(!SnScanMayLock(12751, 12752, false, 90));     // camera delivered last frame (the 1.1.6 log, frame 12752): do not lock
+    CHECK(!SnScanMayLock(12700, 12752, false, 90));     // 52 frames old: still the current offsets
+    CHECK(SnScanMayLock(12600, 12752, false, 90));      // 152 frames without a camera: lock the new offsets
+    CHECK(SnScanMayLock(12751, 12752, true, 90));       // re-scan mode (camera lost): lock
+    // ---- 1.1.7: pso-cache rejects caused by another adapter / driver keep the entry
+    CHECK(SnPsoRejectIsForeignAdapter(0x887E0001u)); CHECK(SnPsoRejectIsForeignAdapter(0x887E0002u)); CHECK(!SnPsoRejectIsForeignAdapter(0x80070057u)); CHECK(!SnPsoRejectIsForeignAdapter(0));
+    CHECK(SnExpectedRatio(3) == 3.0); CHECK(SnExpectedRatio(1) == 1.0); CHECK(SnExpectedRatio(0) == 1.0);
     printf("%d checks, %d failed\n", g_n, g_fail); return g_fail ? 1 : 0;
 }
