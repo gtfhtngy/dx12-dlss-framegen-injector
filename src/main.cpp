@@ -14,7 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
-#define SN_VERSION "1.1.2"
+#define SN_VERSION "1.1.7"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -135,7 +135,7 @@ static F_slSetConstants p_slSetConstants; static F_slSetTagForFrame p_slSetTagFo
 static F_slGetNativeInterface p_slGetNativeInterface;
 static F_D3D12CreateDevice pSL_D3D12CreateDevice; static F_CreateDXGIFactory pSL_CreateDXGIFactory, pSL_CreateDXGIFactory1; static F_CreateDXGIFactory2 pSL_CreateDXGIFactory2;
 static PFun_slDLSSGSetOptions* p_DLSSGSetOptions; static PFun_slDLSSGGetState* p_DLSSGGetState;
-static PFun_slPCLSetMarker* p_PCLSetMarker; static PFun_slReflexSetOptions* p_ReflexSetOptions; static PFun_slReflexSleep* p_ReflexSleep;
+static PFun_slPCLSetMarker* p_PCLSetMarker; static PFun_slReflexSetOptions* p_ReflexSetOptions; 
 static bool g_slInitOk = false, g_slRuntimeOk = false, g_useFrameTags = false;
 
 static const char* SlStr(sl::Result r) {
@@ -467,6 +467,9 @@ static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
     static int n = 0; static int li = -1, lj = -1, lk = -1, hits = 0;
     if (k < 0) { DumpViewBuf(p, avail, off, "pair found, no ClipToPrevClip"); if (n++ < 10) Log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)off, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
     if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (n++ < 20) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
+    if (hits >= 5 && !SnScanMayLock(g_camFrame.load(), fr, g_camRescan.load() != 0, 90)) {   // 1.1.7: the current offsets still deliver the camera -> this is some other buffer, do NOT lock / save it
+        static int s_nl = 0; if (s_nl++ < 5) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d ignored - the current offsets (proj=%d noaa=%d mv=%d) still deliver the camera (age %d)", ji, nj, k, g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, fr - g_camFrame.load());
+        hits = 0; return; }
     if (hits >= 5) {
         g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1; if (g_cfg.autoLearn) { CfgSetInt("projoff", ji); CfgSetInt("noaaoff", nj); CfgSetInt("mvoff", k); } if (g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at projoff=%d noaaoff=%d mvoff=%d", ji, nj, k);
         Log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> saved to SN_DLSSG_cfg.txt automatically (autolearn=1) so the next start skips the scan", ji, nj, k);
@@ -526,11 +529,25 @@ struct C2pStat { int active = 0; double maxDev = 0.0; double minDev = 1e9; doubl
 static C2pStat g_c2pSt[4]; static int g_c2pStFrames = 0, g_c2pLastFrame = -1, g_c2pWinStart = 0;
 // v23: a real ClipToPrevClip is ~identity (diagonal ~1) for any sane camera move. The Silent Hill Townfall (UE5) log showed the USED candidate (#0@256, an identity placeholder in the
 // menu) turn into a CONSTANT diag(0.136,0.136,0.136,1) matrix in the game -> every motion vector was a zoom towards the screen centre (warped picture around the middle, the rest zeroed by the v22 MV guard).
+static bool C2pInvertible(const float* c) {   // 1.1.4: |det| must be sane - a singular / degenerate matrix cannot be inverted for sl::Constants::prevClipToClip
+    for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) return false;
+    double m[16], out[16]; for (int i = 0; i < 16; i++) m[i] = (double)c[i];
+    if (!Inv4d(m, out)) return false;
+    for (int i = 0; i < 16; i++) if (!std::isfinite(out[i]) || fabs(out[i]) > 1e6) return false;
+    return true;
+}
+static double C2pDev(const float* m);   // 1.1.5: forward declaration
+static std::atomic<bool> g_c2pGarbage{false};   // 1.1.5: the USED ClipToPrevClip is mostly implausible (not a real matrix) -> no camera-cut resets, identity only
 static bool C2pPlausible(const float* c) {
     for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) return false;
-    return fabsf(c[0] - 1.f) <= 0.5f && fabsf(c[5] - 1.f) <= 0.5f && fabsf(c[10] - 1.f) <= 0.5f && fabsf(c[15] - 1.f) <= 0.5f;
+    // 1.1.6: the 1.1.5 rule "any entry deviates > 1.0 from identity = garbage" also threw away REAL matrices in narrow-FOV (telephoto) cutscenes (m0=11.4 m5=20.3: a small camera move gives translation entries of 1..300).
+    // Now the matrix is judged by its effect: reproject a grid of screen points at several depths (what the MV shader does) - a real matrix moves them by less than half a screen.
+    if (!(fabsf(c[0] - 1.f) <= 0.5f && fabsf(c[5] - 1.f) <= 0.5f && fabsf(c[10] - 1.f) <= 0.5f && fabsf(c[15] - 1.f) <= 0.5f)) return false;
+    if (!CamC2pReprojOk(c)) return false;
+    return C2pInvertible(c);   // 1.1.4
 }
-static int g_c2pSwitches = 0; static std::atomic<int> g_c2pBadTotal{0};
+static int g_c2pSwitches = 0; static std::atomic<int> g_c2pBadTotal{0}; static int g_c2pBanned[8] = { -1, -1, -1, -1, -1, -1, -1, -1 }; static int g_c2pBanFrame[8] = {}; static int g_c2pBannedN = 0;   // 1.1.4: offsets that were proven invalid; 1.1.6: the ban expires (a hard cut must not ruin the right offset for the whole game)
+static bool C2pIsBanned(int off) { int fr = g_frame.load(); for (int i = 0; i < g_c2pBannedN && i < 8; i++) if (g_c2pBanned[i] == off && fr - g_c2pBanFrame[i] < 1800) return true; return false; }   // 1.1.6: 1800 frames
 static double C2pDev(const float* m) { double d = 0.0; for (int i = 0; i < 16; i++) { double e = fabs((double)m[i] - ((i % 5) == 0 ? 1.0 : 0.0)); if (!(e == e)) return 1e9; if (e > d) d = e; } return d; }
 static void C2pMonitor(const float* p, int availF, int fr) {
     if (!g_camLocked.load(std::memory_order_relaxed) || g_c2pCandN <= 0 || fr == g_c2pLastFrame) return;
@@ -551,10 +568,14 @@ static void C2pMonitor(const float* p, int availF, int fr) {
         const int F = g_c2pStFrames; const C2pStat& u = g_c2pSt[used];
         auto isConst = [&](const C2pStat& c) { return c.active * 10 >= F * 9 && (c.maxDev - c.minDev) < 1e-3 && c.minDev > 0.02; };
         bool usedInvalid = u.bad * 2 >= F || isConst(u), usedDead = u.maxDev < 1e-7;
+        if (usedInvalid && !C2pIsBanned(g_cfg.mvOff)) {   // 1.1.6: temporary ban (1800 frames) instead of "never again"; the slot is reused / refreshed
+            int slot = -1; for (int i = 0; i < g_c2pBannedN && i < 8; i++) if (g_c2pBanned[i] == g_cfg.mvOff) slot = i;
+            if (slot < 0) slot = (g_c2pBannedN < 8) ? g_c2pBannedN++ : 0;
+            g_c2pBanned[slot] = g_cfg.mvOff; g_c2pBanFrame[slot] = fr; Log("c2p-monitor: float %d is INVALID - not selected for the next 1800 frames", g_cfg.mvOff); }
         if (usedInvalid || usedDead) {
             int best = -1;
             for (int i = 0; i < g_c2pCandN && i < 4; i++) { if (i == used) continue; const C2pStat& c = g_c2pSt[i];
-                bool ok = c.bad * 10 <= F && !isConst(c) && c.active >= 5 && c.maxDev > 4e-3 && c.maxDev <= 6.0;   // 4e-3 >> TAA jitter ~7e-4; > 6.0 = garbage
+                bool ok = !C2pIsBanned(g_c2pCand[i]) && c.bad * 10 <= F && !isConst(c) && c.active >= 5 && c.maxDev > 4e-3 ;   // 1.1.6: (1.1.4/1.1.5 also required maxdev <= 6 or avgdev <= 4 - that rejected real telephoto matrices; "bad" is now reprojection based) 1.1.4: fast camera / cut scenes give a few huge frames (max 14..48) but a small average - those windows were rejected for 15000 frames   // 4e-3 >> TAA jitter ~7e-4; > 6.0 = garbage
                 if (ok && (best < 0 || c.active > g_c2pSt[best].active)) best = i; }
             if (best >= 0) {
                 Log("c2p-monitor: SWITCH ClipToPrevClip from float %d (%s) to float %d (active %d/%d maxdev %.5f) - frame generation history is reset", g_cfg.mvOff, usedInvalid ? "INVALID: constant / implausible matrix" : "never moved", g_c2pCand[best], g_c2pSt[best].active, F, g_c2pSt[best].maxDev);
@@ -562,6 +583,7 @@ static void C2pMonitor(const float* p, int availF, int fr) {
             else if (usedInvalid) { static int w = 0; if (w++ < 6) Log("c2p-monitor: the USED ClipToPrevClip (float %d) is invalid and no other candidate looks usable - implausible frames are sent as identity (camera-only motion off, optical flow only)", g_cfg.mvOff); }
         }
     }
+    if (used >= 0) { bool gb = g_c2pSt[used].bad * 2 >= g_c2pStFrames; if (gb != g_c2pGarbage.load()) Log("c2p-monitor: used matrix is %s (bad %d of %d frames) -> camera-cut guard %s", gb ? "GARBAGE" : "plausible again", g_c2pSt[used].bad, g_c2pStFrames, gb ? "off, identity sent" : "on"); g_c2pGarbage = gb; }   // 1.1.5
     for (int i = 0; i < 4; i++) g_c2pSt[i] = C2pStat(); g_c2pStFrames = 0;
 }
 // ---- v22: camera-cut guard. Special Shots / cutscenes switch the camera (or its FOV) from one frame to the next. Frame generation then interpolates between two
@@ -570,23 +592,41 @@ static void C2pMonitor(const float* p, int availF, int fr) {
 static std::atomic<int> g_cutHold{0};
 static float g_prevM0 = 0.f, g_prevM5 = 0.f; static int g_prevCamFrame = -1;
 static int g_cutWinStart = 0, g_cutWinCount = 0, g_cutSuppressUntil = 0, g_cutTotal = 0;
+static SnProjHist g_projHist;   // 1.1.7: the last distinct projections (alternating views are not camera cuts)
 static void CamCutCheck(const float* b, const float* c, int fr) {   // called with g_camMx held, once per frame at most
     if (!g_cfg.cutDetect || fr == g_prevCamFrame) return;
     bool cut = false; const char* why = ""; double val = 0.0;
-    double dev = C2pDev(c);
-    if (!(dev < (double)g_cfg.cutThresh100 / 100.0)) { cut = true; why = "ClipToPrevClip far from identity"; val = dev; }   // also catches NaN; v23: threshold 0.25 -> 1.20 (a fast camera turn gives 0.3..0.65)
+    double dev = C2pDev(c); int rv = 0, rt = 0; float rfar = 0.f; CamC2pReproj(c, &rv, &rt, &rfar);
+    if (g_c2pGarbage.load()) { g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr; g_projHist.Add(b[0], b[5], fr); return; }   // 1.1.5: garbage matrix / UI projection: its jumps are not camera cuts (every one of them reset the DLSS-G history = flicker)
+    // 1.1.6: a cut = the matrix does NOT reproject sanely (a fast / telephoto camera move has large entries but reprojects fine: 1.1.5 reset the history on every frame of such a move). cutthresh is no longer used.
+    // 1.1.6b: only the FIRST frame of an implausible run is a cut. The log showed 4 consecutive frames with dev 150..167 / 19 of 45 samples ok (frames 2929-2932): one fast, smooth camera move
+    // (close geometry fails the 1.0 NDC test, but nothing jumps) that reset the DLSS-G history 4 times in a row. A real hard cut is a single-frame event.
+    static bool s_prevBad = false; bool badNow = !C2pPlausible(c);
+    bool wasBad = s_prevBad; s_prevBad = badNow;   // also catches NaN
+    if (badNow) { if (!wasBad) { cut = true; why = "ClipToPrevClip does not reproject sanely (hard camera cut)"; val = dev; } }
     else if (g_prevCamFrame >= 0 && g_prevM0 > 0.f && g_prevM5 > 0.f && fr - g_prevCamFrame <= 3) {
         double d0 = fabs((double)b[0] - g_prevM0) / g_prevM0, d5 = fabs((double)b[5] - g_prevM5) / g_prevM5;
-        if (d0 > g_cfg.cutFov / 100.0 || d5 > g_cfg.cutFov / 100.0) { cut = true; why = "projection (FOV) jump"; val = std::max(d0, d5); }
+        if (d0 > g_cfg.cutFov / 100.0 || d5 > g_cfg.cutFov / 100.0) {
+            // 1.1.6: a REAL zoom (telephoto cutscene: FOV changes by 0.4..1.0 per frame for many frames) is described by ClipToPrevClip itself: for a pure FOV change its x/y scale is prevM/curM.
+            // A true camera cut gives (nearly) identity there. So the jump counts as a cut only if the matrix does NOT move towards the value the FOV change predicts.
+            double e0 = g_prevM0 / (double)b[0], e5 = g_prevM5 / (double)b[5];
+            bool explained = fabs((double)c[0] - e0) <= 0.25 * fabs(e0 - 1.0) && fabs((double)c[5] - e5) <= 0.25 * fabs(e5 - 1.0);
+            // 1.1.7: the 1.1.6 log has 40+ "FOV jump" resets with 45/45 samples ok where m0 simply flips between two values (1.0 <-> 1.6406 on consecutive frames): two views alternate.
+            // A projection that was seen within the last 8 frames is an alternating view, not a cut.
+            bool alt = !explained && g_projHist.SeenRecently(b[0], b[5], fr, 8);   // (separate flag: the 1.1.7 build set explained=true here and then printed the misleading "explained by ClipToPrevClip (scale 1.0000, expected 1.4239)" line)
+            if (alt) { static int s_alt = 0; if (s_alt++ < 10) Log("camera: projection %.4f/%.4f was seen %s -> alternating views, not a camera cut (no history reset)", b[0], b[5], "within the last 8 frames"); }
+            static int s_nz = 0; if (explained && s_nz++ < 20) Log("camera: FOV change %.4f is explained by ClipToPrevClip (scale %.4f %.4f, expected %.4f %.4f) -> real zoom, no history reset", std::max(d0, d5), c[0], c[5], e0, e5);
+            if (!explained && !alt) { cut = true; why = "projection (FOV) jump"; val = std::max(d0, d5); }
+        }
     }
-    g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr;
+    g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr; g_projHist.Add(b[0], b[5], fr);
     if (!cut || fr < g_cutSuppressUntil) return;
     if (fr - g_cutWinStart > 120) { g_cutWinStart = fr; g_cutWinCount = 0; }
     if (++g_cutWinCount > 8) {   // the 'cut' keeps firing = this game changes its projection every frame (e.g. two alternating views): stop guarding, never leave FG off permanently
         g_cutSuppressUntil = fr + 900; g_cutWinCount = 0; Log("camera-cut guard: fires too often (%s) -> suspended for 900 frames", why); return; }
     int cur = g_cutHold.load(); if (cur < 2) g_cutHold = 2;   // v23: only the DLSS-G reset flag is raised for these frames; frame generation itself is NOT switched off (every on/off switch = SetMaximumFrameLatency 1<->2 + RSYNC flush = 100+ ms hitch in sl.log)
     g_forceReset = true; g_cutTotal++;
-    if (g_cutTotal <= 60) Log("camera cut at frame %d: %s (%.4f) -> DLSS-G history reset (FG stays on)", fr, why, val);
+    if (g_cutTotal <= 60) Log("camera cut at frame %d: %s (%.4f, %d/%d reprojection samples ok) -> DLSS-G history reset (FG stays on)", fr, why, val, rv, rt);
 }
 // Parses one view-buffer candidate (a COPY in normal memory). true = recognised as a camera view buffer.
 static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
@@ -1261,7 +1301,12 @@ static void ToSl(const float* m, sl::float4x4& o) { for (int r = 0; r < 4; r++) 
 static bool BuildConstants(sl::Constants& c, bool reset) {
     float vtc[16], c2p[16], j[2]; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(vtc, g_vtcNoAA, sizeof vtc); memcpy(c2p, g_c2p, sizeof c2p); j[0] = g_jitNX * (float)EffW(); j[1] = g_jitNY * (float)EffH(); }
     float inv1[16], inv2[16];
-    if (!Inv4(vtc, inv1) || !Inv4(c2p, inv2)) return false;
+    if (!Inv4(vtc, inv1)) return false;
+    if (!Inv4(c2p, inv2)) {   // 1.1.4: a non-invertible ClipToPrevClip used to make this return false EVERY frame -> frame generation never started (log: 'FG not ready' for 15000+ frames, ON immediately after the candidate switch)
+        static int s_sing = 0; if (s_sing++ < 5) Log("BuildConstants: ClipToPrevClip is singular -> identity used (camera-only motion off)");
+        for (int i = 0; i < 16; i++) c2p[i] = ((i % 5) == 0) ? 1.f : 0.f;
+        if (!Inv4(c2p, inv2)) return false;
+    }
     ToSl(vtc, c.cameraViewToClip); ToSl(inv1, c.clipToCameraView); ToSl(c2p, c.clipToPrevClip); ToSl(inv2, c.prevClipToClip);
     c.jitterOffset = sl::float2(j[0], j[1]);
     c.mvecScale = sl::float2(1.0f / (float)EffW(), 1.0f / (float)EffH());
@@ -1400,8 +1445,7 @@ static void UpdateRefreshRate(IDXGISwapChain* sc) {
 static void ApplyReflexOptions(const char* why) {
     if (!p_ReflexSetOptions) return;
     sl::ReflexOptions ro{}; ro.mode = g_cfg.reflexMode == 0 ? sl::ReflexMode::eOff : g_cfg.reflexMode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency; ro.useMarkersToOptimize = true;
-    int lim = EffectiveBaseLimit(); g_appliedLimit = lim;
-    if (lim > 0) ro.frameLimitUs = (uint32_t)(1000000 / lim);
+    int lim = 0; g_appliedLimit = EffectiveBaseLimit();   // 1.1.3: no frame limiter (it only works through slReflexSleep, which is not called any more)
     sl::Result r = p_ReflexSetOptions(ro); Log("slReflexSetOptions(%s, base cap=%d fps | basefpslimit=%d fpscap=%d refresh=%d) [%s] -> %d %s", SnReflexModeName(g_cfg.reflexMode), lim, g_cfg.baseFpsLimit, g_cfg.fpsCap, g_refreshHz.load(), why, (int)r, SlStr(r));
 }
 static bool InitSlRuntime() {
@@ -1413,7 +1457,6 @@ static bool InitSlRuntime() {
     get(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)p_DLSSGGetState);
     ok &= get(sl::kFeaturePCL, "slPCLSetMarker", (void*&)p_PCLSetMarker);
     ok &= get(sl::kFeatureReflex, "slReflexSetOptions", (void*&)p_ReflexSetOptions);
-    get(sl::kFeatureReflex, "slReflexSleep", (void*&)p_ReflexSleep);
     LogSupport();
     if (!ok) { Log("Streamline runtime init incomplete (try %d)", tries); DiagSet("sl_runtime", tries >= 5 ? DS_FAIL : DS_WARN, "Streamline plugins (DLSS-G / Reflex / PCL)", Fmt("slGetFeatureFunction failed (try %d of 6): DLSS-G options=%p state=%p PCL marker=%p Reflex options=%p", tries, (void*)p_DLSSGSetOptions, (void*)p_DLSSGGetState, (void*)p_PCLSetMarker, (void*)p_ReflexSetOptions), SlFixText(sl::Result::eErrorFeatureFailedToLoad)); return false; }
     ApplyReflexOptions("start-up");
@@ -1485,7 +1528,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     } else {
         if (p_slGetNewFrameToken(ctx.tok, nullptr) != sl::Result::eOk || !ctx.tok) { ctx.tok = nullptr; return ctx; }
         // v24: only while FG runs / is about to run. v23 slept ~20 ms per frame during the 9 fps start of the game (markers are issued back-to-back inside Present, so Reflex has nothing real to optimise against)
-        if (g_cfg.reflexSleep && p_ReflexSleep && (g_cfg.reflexAlways || (fr + 15 >= g_cfg.warmup && !g_fgSusp))) { double ts0 = NowMs(); p_ReflexSleep(*ctx.tok); g_tSleep = NowMs() - ts0; }
+        // 1.1.3: slReflexSleep is NOT called any more (Reflex mode + markers are still set; the sleep cost real fps and gave no latency gain with synthetic markers)
         Marker(sl::PCLMarker::eSimulationStart, ctx); Marker(sl::PCLMarker::eSimulationEnd, ctx);
         Marker(sl::PCLMarker::eRenderSubmitStart, ctx); Marker(sl::PCLMarker::eRenderSubmitEnd, ctx);
     }
@@ -1594,6 +1637,10 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         if (rs == sl::Result::eOk && !(g_stateLog < 6 || chg || (fr % 600) == 0)) { /* nothing new */ }
         else if (rs == sl::Result::eOk) { Log("DLSS-G state: frame=%d mode=%d status=0x%X (0=ok) maxGen=%u presented=%u minWH=%u vram=%lluMB", fr, (int)opt.mode, (unsigned)st.status, st.numFramesToGenerateMax, st.numFramesActuallyPresented, st.minWidthOrHeight, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20)); }
         else Log("slDLSSGGetState -> %d %s", (int)rs, SlStr(rs));
+        if (rs == sl::Result::eOk && opt.mode == sl::DLSSGMode::eOn && g_wasOn) {   // 1.1.7: the 1.1.6 log silently went from presented=3 to presented=2 at frame ~15500 (ratio 3.0 -> 2.0) with mult=3: say so
+            static unsigned s_lastPres = 0; static int s_lastPresFr = -100000; unsigned want = opt.numFramesToGenerate + 1;
+            if (st.numFramesActuallyPresented != s_lastPres && st.numFramesActuallyPresented > 0 && fr - s_lastPresFr >= 30) { if (s_lastPres) Log("DLSS-G presents %u frame(s) per game frame (requested %u, GPU max %u) at frame %d, base fps %.1f", st.numFramesActuallyPresented, want, st.numFramesToGenerateMax + 1, fr, g_st.fps); s_lastPres = st.numFramesActuallyPresented; s_lastPresFr = fr; }
+        }
         g_stateLog++;
     }
     // v30: the VRAM estimate is expensive (Streamline: "too expensive to do per frame") -> ask for it ONCE per FG start / size change / menu toggle, never every frame
@@ -1611,14 +1658,15 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     {
         static LARGE_INTEGER s_f = {}, s_t0 = {}; static int s_fr0 = 0; static UINT s_pc0 = 0; static bool s_have = false;
         if (!s_f.QuadPart) QueryPerformanceFrequency(&s_f);
-        if (fr > g_cfg.warmup && (fr % 300) == 0) {
+        static bool s_retry = false;   // 1.1.7: GetFrameStatistics fails with DXGI_ERROR_FRAME_STATISTICS_DISJOINT (0x887A000B) right after start-up / a mode change -> try again in 30 frames instead of 300
+        if (fr > g_cfg.warmup && ((fr % 300) == 0 || (s_retry && (fr % 30) == 0))) {
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
             DXGI_FRAME_STATISTICS fs = {}; HRESULT hs = sc->GetFrameStatistics(&fs);
             if (s_have && SUCCEEDED(hs)) {
                 double dt = (double)(now.QuadPart - s_t0.QuadPart) / (double)s_f.QuadPart; int dFr = fr - s_fr0; UINT dPc = fs.PresentCount - s_pc0;
-                Log("RATE: game present %.1f/s | swapchain PresentCount %.1f/s | ratio %.2f (about 2.0 = frame generation active, 1.0 = not generating)", dFr / dt, dPc / dt, dFr ? (double)dPc / dFr : 0.0);
-            } else if (FAILED(hs)) Log("RATE: GetFrameStatistics failed 0x%08X", (unsigned)hs);
-            s_t0 = now; s_fr0 = fr; s_pc0 = SUCCEEDED(hs) ? fs.PresentCount : 0; s_have = SUCCEEDED(hs);
+                Log("RATE: game present %.1f/s | swapchain PresentCount %.1f/s | ratio %.2f (expected about %.1f with the current multiplier, 1.0 = not generating)", dFr / dt, dPc / dt, dFr ? (double)dPc / dFr : 0.0, SnExpectedRatio(g_wasOn ? CurMult() : 1));
+            } else if (FAILED(hs)) { static int s_gf = 0; if (s_gf++ < 3) Log("RATE: GetFrameStatistics failed 0x%08X (will retry in 30 frames)", (unsigned)hs); }
+            s_retry = FAILED(hs); s_t0 = now; s_fr0 = fr; s_pc0 = SUCCEEDED(hs) ? fs.PresentCount : 0; s_have = SUCCEEDED(hs);
         }
     }
     Marker(sl::PCLMarker::ePresentStart, ctx);
@@ -1636,7 +1684,6 @@ static void OnPresentEnd(const FrameCtx& ctx) {
     if (g_cfg.reflexPlace && ctx.tok && p_slGetNewFrameToken) {   // the next game frame starts here: sleep BEFORE simulating, not before presenting
         sl::FrameToken* t = nullptr;
         if (p_slGetNewFrameToken(t, nullptr) == sl::Result::eOk && t) {
-            if (g_cfg.reflexSleep && p_ReflexSleep) p_ReflexSleep(*t);
             FrameCtx nc; nc.tok = t; Marker(sl::PCLMarker::eSimulationStart, nc);
             g_nextTok = t;
         }
@@ -1659,7 +1706,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* sc, UINT s, UINT f) {
     if (outer) { CheckDeviceRemoved(); ctx = OnPresentBegin(sc); }
     double tp = NowMs();
     HRESULT r = o(sc, s, f);
-    if (outer) { double dp = NowMs() - tp; if ((dp > 120.0 || (g_obMs - g_tSleep) > 8.0) && g_frame.load() > 60) { static int ns = 0; if (ns++ < 60) Log("slow frame %d: our work before Present %.1f ms [ReflexSleep %.1f (intentional wait) | UpdatePins %.1f | MV pass %.1f | buffer prune %.1f] | inside Present (DLSS-G/driver/GPU wait) %.1f ms | upload bufs held=%zu (%llu MB, pruned %ld) cbv/frame=%ld", g_frame.load(), g_obMs, g_tSleep, g_tPins, g_tMv, g_tPrune, dp, bufCount(), (unsigned long long)(g_bufBytes >> 20), g_prunedTotal, g_cbvPerFrame.load()); } }
+    if (outer) { double dp = NowMs() - tp; if ((dp > 120.0 || g_obMs > 8.0) && g_frame.load() > 60) { static int ns = 0; if (ns++ < 60) Log("slow frame %d: our work before Present %.1f ms [UpdatePins %.1f | MV pass %.1f | buffer prune %.1f] | inside Present (DLSS-G/driver/GPU wait) %.1f ms | upload bufs held=%zu (%llu MB, pruned %ld) cbv/frame=%ld", g_frame.load(), g_obMs, g_tPins, g_tMv, g_tPrune, dp, bufCount(), (unsigned long long)(g_bufBytes >> 20), g_prunedTotal, g_cbvPerFrame.load()); } }
     if (outer) OnPresentEnd(ctx);
     t_depth--; return r;
 }
