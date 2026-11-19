@@ -8,22 +8,25 @@
 //   * On the next launches the cache is validated (checksums + shader-source hash + GPU/driver key) and the game just loads it:
 //     no HLSL compile, no window, no delay.  If the GPU driver is updated only the GPU part is rebuilt.
 //
-// SNSC v1 file layout (little endian, our own container - NOT a DXBC/PSO dump you can feed to other tools):
+// SNSC file layout (little endian, our own container - NOT a DXBC/PSO dump you can feed to other tools):
 //   SnscHeader | SnscEntry[entryCount] | payloads... | u32 CRC32 of everything before it
 //   entry type 1 = DXBC bytecode of the MV compute shader, type 2 = serialized root signature,
 //   type 3 = D3D12 pipeline library (driver-native, valid only for the adapter/driver recorded in the entry).
+//   version 2 (1.1.7): an entry whose type has bit 0x80000000 set is packed with SNLZ (snpack.h): payload = u32 rawSize | packed bytes (crc/size describe the stored payload).
+//   Version 1 files (no packed entries) are still read.
 #pragma once
+#include "snpack.h"
 
-// Older mingw-w64 (e.g. 11.0.1 in Ubuntu 24.04) declares ID3D12Device1::CreatePipelineLibrary but not the ID3D12PipelineLibrary interface itself; newer mingw-w64 does
-// declare it (redefining it = "error: redefinition of 'struct ID3D12PipelineLibrary'"). Because of that this file uses its OWN, differently named interface: it compiles with
-// both header generations. Official vtable order, IID c64226a8-9201-46af-b4cc-53fb9ff7414f; objects are only ever created by CreatePipelineLibrary(IID_SN_PipelineLibrary).
-struct SN_PipelineLibrary : public ID3D12DeviceChild {
+// mingw-w64's d3d12.h declares ID3D12Device1::CreatePipelineLibrary but not the ID3D12PipelineLibrary interface itself -> declare it here (official vtable order, IID c64226a8-9201-46af-b4cc-53fb9ff7414f)
+#ifndef SN_HAVE_PIPELINELIB
+struct ID3D12PipelineLibrary : public ID3D12DeviceChild {
     virtual HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pso) = 0;
     virtual HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) = 0;
     virtual HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp) = 0;
     virtual SIZE_T STDMETHODCALLTYPE GetSerializedSize() = 0;
     virtual HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) = 0;
 };
+#endif
 static const GUID IID_SN_PipelineLibrary = { 0xc64226a8, 0x9201, 0x46af, { 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f } };
 
 // ------------------------------------------------------------------ hashing
@@ -43,6 +46,7 @@ struct SnscEntry { uint32_t type; uint32_t size; uint64_t offset; uint32_t crc; 
 static_assert(sizeof(SnscHeader) == 24, "SnscHeader size");
 static_assert(sizeof(SnscEntry) == 40, "SnscEntry size");
 enum { SNSC_DXBC = 1, SNSC_ROOTSIG = 2, SNSC_PSOLIB = 3 };
+static const uint32_t SNSC_PACKED = 0x80000000u;
 
 struct LibBlob { uint32_t vendor = 0, device = 0, revision = 0; uint64_t driver = 0; std::vector<uint8_t> data; };
 struct ShaderCache { std::vector<uint8_t> dxbc, rs; std::vector<LibBlob> libs; };
@@ -79,7 +83,7 @@ static bool ParseCache(const std::vector<uint8_t>& f, ShaderCache& out, const ch
     if (Crc32(f.data(), f.size() - 4) != stored) { *why = "checksum mismatch (corrupt file)"; return false; }
     SnscHeader h; memcpy(&h, f.data(), sizeof h);
     if (memcmp(h.magic, "SNSC", 4) != 0) { *why = "bad magic"; return false; }
-    if (h.version != 1 || h.headerSize != sizeof(SnscHeader)) { *why = "unsupported cache version"; return false; }
+    if (h.version < 1 || h.version > 2 || h.headerSize != sizeof(SnscHeader)) { *why = "unsupported cache version"; return false; }
     if (h.sourceKey != MvSourceKey()) { *why = "shader source changed"; return false; }
     if (h.entryCount == 0 || h.entryCount > 32) { *why = "bad entry count"; return false; }
     size_t tableEnd = sizeof h + (size_t)h.entryCount * sizeof(SnscEntry);
@@ -87,11 +91,19 @@ static bool ParseCache(const std::vector<uint8_t>& f, ShaderCache& out, const ch
     for (uint32_t i = 0; i < h.entryCount; i++) {
         SnscEntry e; memcpy(&e, &f[sizeof h + i * sizeof(SnscEntry)], sizeof e);
         if (e.offset < tableEnd || e.offset + e.size > f.size() - 4) { *why = "entry out of range"; return false; }
-        const uint8_t* p = &f[(size_t)e.offset];
+        const uint8_t* p = &f[(size_t)e.offset]; size_t psz = e.size; uint32_t type = e.type;
         if (Crc32(p, e.size) != e.crc) { *why = "entry checksum mismatch"; return false; }
-        if (e.type == SNSC_DXBC) out.dxbc.assign(p, p + e.size);
-        else if (e.type == SNSC_ROOTSIG) out.rs.assign(p, p + e.size);
-        else if (e.type == SNSC_PSOLIB) { LibBlob lb; lb.vendor = e.vendor; lb.device = e.device; lb.revision = e.revision; lb.driver = e.driver; lb.data.assign(p, p + e.size); out.libs.push_back(std::move(lb)); }
+        std::vector<uint8_t> unpacked;
+        if (type & SNSC_PACKED) {
+            type &= ~SNSC_PACKED; uint32_t rawSize = 0;
+            if (h.version < 2 || e.size < 5) { *why = "bad packed entry"; return false; }
+            memcpy(&rawSize, p, 4); if (!rawSize || rawSize > (32u << 20)) { *why = "bad packed entry size"; return false; }
+            unpacked.resize(rawSize); if (!snpack::Unpack(p + 4, e.size - 4, unpacked.data(), rawSize)) { *why = "entry does not unpack"; return false; }
+            p = unpacked.data(); psz = rawSize;
+        }
+        if (type == SNSC_DXBC) out.dxbc.assign(p, p + psz);
+        else if (type == SNSC_ROOTSIG) out.rs.assign(p, p + psz);
+        else if (type == SNSC_PSOLIB) { LibBlob lb; lb.vendor = e.vendor; lb.device = e.device; lb.revision = e.revision; lb.driver = e.driver; lb.data.assign(p, p + psz); out.libs.push_back(std::move(lb)); }
     }
     if (out.dxbc.empty() || out.rs.empty()) { *why = "missing shader data"; return false; }
     return true;
@@ -106,17 +118,27 @@ static bool LoadShaderCache() {
     return false;
 }
 static void BuildCacheFile(const ShaderCache& c, std::vector<uint8_t>& out) {
-    struct P { uint32_t type; const std::vector<uint8_t>* d; const LibBlob* lb; };
-    std::vector<P> parts; parts.push_back({ SNSC_DXBC, &c.dxbc, nullptr }); parts.push_back({ SNSC_ROOTSIG, &c.rs, nullptr });
-    for (auto& l : c.libs) if (!l.data.empty()) parts.push_back({ SNSC_PSOLIB, &l.data, &l });
-    SnscHeader h = {}; memcpy(h.magic, "SNSC", 4); h.version = 1; h.headerSize = sizeof h; h.sourceKey = MvSourceKey(); h.entryCount = (uint32_t)parts.size();
+    struct P { uint32_t type; const std::vector<uint8_t>* d; const LibBlob* lb; std::vector<uint8_t> packed; const std::vector<uint8_t>& Bytes() const { return packed.empty() ? *d : packed; } };
+    std::vector<P> parts; parts.push_back({ SNSC_DXBC, &c.dxbc, nullptr, {} }); parts.push_back({ SNSC_ROOTSIG, &c.rs, nullptr, {} });
+    for (auto& l : c.libs) if (!l.data.empty()) parts.push_back({ SNSC_PSOLIB, &l.data, &l, {} });
+    if (g_cfg.cacheCompress) {       // pack every entry that gets clearly smaller (the 4 byte raw size prefix is counted)
+        snpack::Packer pk; std::vector<uint8_t> tmp;
+        for (auto& x : parts) {
+            const size_t n = x.d->size(); if (n < 64) continue;
+            tmp.resize(snpack::Bound(n)); size_t pn = pk.Pack(x.d->data(), n, tmp.data(), tmp.size());
+            if (!pn || pn + 4 + n / 16 > n) continue;
+            x.packed.resize(4 + pn); uint32_t rs = (uint32_t)n; memcpy(x.packed.data(), &rs, 4); memcpy(x.packed.data() + 4, tmp.data(), pn); x.type |= SNSC_PACKED;
+        }
+    }
+    SnscHeader h = {}; memcpy(h.magic, "SNSC", 4); h.version = 2; h.headerSize = sizeof h; h.sourceKey = MvSourceKey(); h.entryCount = (uint32_t)parts.size();
     size_t off = sizeof h + parts.size() * sizeof(SnscEntry);
     out.assign(off, 0); memcpy(out.data(), &h, sizeof h);
     for (size_t i = 0; i < parts.size(); i++) {
-        SnscEntry e = {}; e.type = parts[i].type; e.size = (uint32_t)parts[i].d->size(); e.offset = out.size(); e.crc = Crc32(parts[i].d->data(), parts[i].d->size());
+        const std::vector<uint8_t>& b = parts[i].Bytes();
+        SnscEntry e = {}; e.type = parts[i].type; e.size = (uint32_t)b.size(); e.offset = out.size(); e.crc = Crc32(b.data(), b.size());
         if (parts[i].lb) { e.vendor = parts[i].lb->vendor; e.device = parts[i].lb->device; e.revision = parts[i].lb->revision; e.driver = parts[i].lb->driver; }
         memcpy(&out[sizeof h + i * sizeof e], &e, sizeof e);
-        out.insert(out.end(), parts[i].d->begin(), parts[i].d->end());
+        out.insert(out.end(), b.begin(), b.end());
     }
     uint32_t crc = Crc32(out.data(), out.size()); out.insert(out.end(), (uint8_t*)&crc, (uint8_t*)&crc + 4);
 }
@@ -130,7 +152,7 @@ static bool SaveShaderCache() {
         HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) continue;
         DWORD w = 0; bool ok = WriteFile(h, blob.data(), (DWORD)blob.size(), &w, nullptr) && w == blob.size(); if (ok) FlushFileBuffers(h); CloseHandle(h);
-        if (ok && MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { LogW((L"shader cache written: " + p).c_str()); Log("  %u bytes", (unsigned)blob.size()); return true; }
+        if (ok && MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { LogW((L"shader cache written: " + p).c_str()); { size_t rawN = g_cache.dxbc.size() + g_cache.rs.size(); for (auto& l : g_cache.libs) rawN += l.data.size(); Log("  %u bytes (%u bytes unpacked)", (unsigned)blob.size(), (unsigned)rawN); } return true; }
         DeleteFileW(tmp.c_str());
     }
     Log("shader cache: could not write the cache file anywhere (game folder read-only?) - shaders will be compiled again next launch");
@@ -252,7 +274,7 @@ static ID3D12PipelineState* MakeMvPso(ID3D12Device* dev, ID3D12RootSignature* rs
         if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1), (void**)&d1)) && d1) {
             for (auto& lb : g_cache.libs) {
                 if (lb.data.empty()) continue;
-                SN_PipelineLibrary* lib = nullptr;
+                ID3D12PipelineLibrary* lib = nullptr;
                 if (SUCCEEDED(d1->CreatePipelineLibrary(lb.data.data(), lb.data.size(), IID_SN_PipelineLibrary, (void**)&lib)) && lib) {
                     HRESULT hr = lib->LoadComputePipeline(kPsoName, &pd, __uuidof(ID3D12PipelineState), (void**)&pso);
                     lib->Release();
@@ -268,7 +290,7 @@ static ID3D12PipelineState* MakeMvPso(ID3D12Device* dev, ID3D12RootSignature* rs
 }
 static bool BuildLibraryBlob(ID3D12Device* dev, ID3D12PipelineState* pso, std::vector<uint8_t>& out) {
     ID3D12Device1* d1 = nullptr; if (FAILED(dev->QueryInterface(__uuidof(ID3D12Device1), (void**)&d1)) || !d1) return false;
-    SN_PipelineLibrary* lib = nullptr; bool ok = false;
+    ID3D12PipelineLibrary* lib = nullptr; bool ok = false;
     if (SUCCEEDED(d1->CreatePipelineLibrary(nullptr, 0, IID_SN_PipelineLibrary, (void**)&lib)) && lib) {
         if (SUCCEEDED(lib->StorePipeline(kPsoName, pso))) { SIZE_T n = lib->GetSerializedSize(); if (n) { out.resize(n); ok = SUCCEEDED(lib->Serialize(out.data(), n)); } }
         lib->Release();
