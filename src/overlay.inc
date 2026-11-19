@@ -5,8 +5,8 @@
 //   * switches: frame generation itself, multiplier, auto-pause threshold, Reflex cap / sleep, camera hold, cut detection, overlay position / size / opacity
 //   * every change is written back to SN_DLSSG_cfg.txt (cfgsave.inc)
 //
-// How it is drawn: the panel text is rendered with GDI into a small memory bitmap (only when the text changes, ~2x per second), uploaded to a texture and drawn as ONE
-// alpha-blended quad on the swap-chain back buffer right before the game's Present (so it is part of the frame, no extra window, no loss of flip-model presentation).
+// How it is drawn: the panel is a modern glass card (rounded corners, soft shadow, switches, accent selection) composed on the CPU into a small premultiplied bitmap (text via a GDI coverage mask;
+// only when the content changes, ~2x per second), uploaded to a texture and drawn as ONE alpha-blended quad on the swap-chain back buffer right before the game's Present (so it is part of the frame, no extra window, no loss of flip-model presentation).
 // It runs on its own command list on the game's direct queue (same pattern as the motion-vector pass) and uses nothing the game owns except the back buffer.
 // Any failure switches the overlay off (log line) - frame generation itself is never affected.
 
@@ -18,7 +18,7 @@ static inline double OvNowMs() { if (!g_ovQf.QuadPart) QueryPerformanceFrequency
 static bool OvForegroundIsUs() { HWND h = GetForegroundWindow(); if (!h) return false; DWORD pid = 0; GetWindowThreadProcessId(h, &pid); return pid == GetCurrentProcessId(); }
 
 enum { C_TEXT, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_TITLE };
-enum OvItem { I_FG, I_PRESET, I_MULT, I_TARGET, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWGRAPH, I_SHOWVRAM, I_MINFPS, I_CAP, I_OUTCAP, I_REFLEX, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
+enum OvItem { I_FG, I_PRESET, I_MULT, I_TARGET, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWGRAPH, I_SHOWVRAM, I_MINFPS, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
 struct OvGlobals {
     std::atomic<bool> menuOpen{ false }; int sel = 0;
     std::atomic<unsigned> qHead{ 0 }, qTail{ 0 }; unsigned char q[64] = {};
@@ -171,10 +171,7 @@ static void OvAdjust(int item, int dir, bool enter) {
     case I_SHOWFT: tog(g_cfg.showFrameTime, "showframetime", "show frame time"); break;
     case I_SHOWVRAM: tog(g_cfg.showVram, "showvram", "show DLSS-G VRAM"); g_vramReq = true; break;
     case I_MINFPS: g_cfg.fgMinFps = StepCycle(kMinFpsSteps, g_cfg.fgMinFps, dir >= 0 ? 1 : -1); if (!g_cfg.fgMinFps) g_fgSusp = false; CfgSetInt("fgminfps", g_cfg.fgMinFps); OvPresetCustom(); break;
-    case I_CAP: g_cfg.baseFpsLimit = StepCycle(kCapSteps, g_cfg.baseFpsLimit, dir >= 0 ? 1 : -1); CfgSetInt("baseFpsLimit", g_cfg.baseFpsLimit); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break;
-    case I_OUTCAP: g_cfg.fpsCap = OutCapCycle(g_cfg.fpsCap, dir); CfgSet("fpscap", g_cfg.fpsCap < 0 ? "auto" : std::to_string(g_cfg.fpsCap)); if (g_slRuntimeOk) ApplyReflexOptions("menu"); break;
     case I_HUDLESS: { int nv = g_cfg.hudless == 0 ? 2 : g_cfg.hudless == 2 ? 1 : 0; if (dir < 0) nv = g_cfg.hudless == 0 ? 1 : g_cfg.hudless == 1 ? 2 : 0; g_cfg.hudless = nv; CfgSetInt("hudless", nv); if (nv) EnsureDrawHooks(); if (nv == 2) HudCalReset(); Log("menu: hudless = %d", nv); break; }
-    case I_REFLEX: tog(g_cfg.reflexSleep, "reflexsleep", "reflex sleep"); break;
     case I_REFLEXMODE: { int m = (g_cfg.reflexMode + (dir >= 0 ? 1 : 2)) % 3; g_cfg.reflexMode = m; CfgSet("reflexmode", SnReflexModeName(m)); Log("menu: reflex mode = %s", SnReflexModeName(m));
         if (g_slRuntimeOk) ApplyReflexOptions("menu"); if (m == 0) OvSay("Reflex OFF: Frame Generation needs Reflex markers - if FG stops, switch back to Low latency.", true); break; }
     case I_CAMHOLD: tog(g_cfg.camHold, "camhold", "camera hold"); break;
@@ -208,150 +205,359 @@ static void OvProcessKeys() {
 }
 
 // ------------------------------------------------------------------ panel content
-struct OvLine { std::string t; int col = C_TEXT; bool sel = false; int graph = 0; };   // graph > 0: first line of a frame-time graph spanning that many lines; graph < 0: a line covered by the graph
-static const int kGraphLines = 4;
-static void OvPushGraph(std::vector<OvLine>& L) { L.push_back({ "", C_GRAY, false, kGraphLines }); for (int i = 1; i < kGraphLines; i++) L.push_back({ "", C_TEXT, false, -1 }); }
-static void OvWrap(std::vector<OvLine>& out, const std::string& s, int col, size_t width, const char* indent = "") {
+// OvBuild only describes WHAT is shown (a list of typed lines); OvPanelRender decides how it looks.
+enum OvKind { OVK_TEXT, OVK_HUD, OVK_TOAST, OVK_TITLE, OVK_STAT, OVK_SECTION, OVK_ROW, OVK_NOTE, OVK_HINT, OVK_GAP, OVK_DIV, OVK_GRAPH, OVK_ALERT };
+enum OvCtl { OVC_NONE, OVC_TOGGLE, OVC_CHOICE, OVC_ACTION };
+// t = label / text, v = value (right column), v2 = small dim text left of the value, on = toggle state (OVK_STAT: show a status dot)
+struct OvLine { std::string t, v, v2; int col = C_TEXT; bool sel = false; int kind = OVK_TEXT; int ctl = OVC_NONE; bool on = false; };
+static OvLine OvMk(int kind, const std::string& t, int col = C_TEXT, const std::string& v = std::string()) { OvLine l; l.kind = kind; l.t = t; l.col = col; l.v = v; return l; }
+static void OvPushGraph(std::vector<OvLine>& L) { L.push_back(OvMk(OVK_GRAPH, "", C_GRAY)); }
+static void OvWrap(std::vector<OvLine>& out, const std::string& s, int col, size_t width, const char* indent = "", int kind = OVK_NOTE) {
     size_t p = 0; bool first = true;
     while (p < s.size()) { size_t e = std::min(s.size(), p + width); if (e < s.size()) { size_t sp = s.rfind(' ', e); if (sp != std::string::npos && sp > p + width / 2) e = sp; }
-        out.push_back({ (first ? "" : indent) + s.substr(p, e - p), col, false }); first = false; p = e; while (p < s.size() && s[p] == ' ') p++; }
+        out.push_back(OvMk(kind, (first ? std::string() : std::string(indent)) + s.substr(p, e - p), col)); first = false; p = e; while (p < s.size() && s[p] == ' ') p++; }
 }
 static std::string OnOff(int v) { return v ? "ON" : "OFF"; }
 static void OvBuild(std::vector<OvLine>& L) {
     // ---- compatibility banner (until the user has looked at the menu once)
     DiagVerdict v; { std::lock_guard<std::mutex> lk(g_verdictMx); v = g_verdict; }
     if (g_bannerActive.load() && v.state == 2) {
-        L.push_back({ "!! DLSS Frame Generation is NOT working here !!", C_RED, false });
+        L.push_back(OvMk(OVK_ALERT, "DLSS Frame Generation is NOT working here", C_RED));
         OvWrap(L, v.reasons.empty() ? v.headline : v.reasons[0], C_YELLOW, 58);
         if (g_reportSaved.load()) {
-            L.push_back({ "A debug report was saved as:", C_TEXT, false }); L.push_back({ "   " SN_REPORT_NAME, C_GREEN, false });
+            L.push_back(OvMk(OVK_NOTE, "A debug report was saved as:", C_TEXT)); L.push_back(OvMk(OVK_NOTE, "   " SN_REPORT_NAME, C_GREEN));
             OvWrap(L, "Please attach it to a new Issue on the project's GitHub page (Issues tab) and write the NAME of this game.", C_TEXT, 58);
         }
-        OvWrap(L, std::string("(If you are still in a menu / loading screen, wait until gameplay.)  Press ") + KeyNameOf(g_cfg.overlayKey) + " to open the menu and dismiss this notice.", C_GRAY, 58);
+        OvWrap(L, std::string("(If you are still in a menu / loading screen, wait until gameplay.)  Press ") + KeyNameOf(g_cfg.overlayKey) + " to open the menu and dismiss this notice.", C_GRAY, 58, "", OVK_HINT);
     }
     // ---- HUD lines
     bool anyHud = g_cfg.showFps || g_cfg.showFgFps || g_cfg.showFrameTime || g_cfg.showVram || g_cfg.showGraph;
     if (anyHud) {
-        if (g_cfg.showFps) { char b[96]; snprintf(b, sizeof b, "Real FPS : %6.1f", g_st.fps); L.push_back({ b, C_TEXT, false }); }
-        if (g_cfg.showFrameTime) { char b[96]; snprintf(b, sizeof b, "Frame    : %5.2f ms   1%% low %5.1f", g_st.ft, g_st.low1); L.push_back({ b, C_TEXT, false }); }
+        if (!L.empty()) L.push_back(OvMk(OVK_GAP, ""));
+        if (g_cfg.showFps) { char b[96]; snprintf(b, sizeof b, "%.1f", g_st.fps); L.push_back(OvMk(OVK_HUD, "Real FPS", C_TEXT, b)); }
+        if (g_cfg.showFrameTime) { char b[96], c[96]; snprintf(b, sizeof b, "%.2f ms", g_st.ft); snprintf(c, sizeof c, "1%% low %.1f", g_st.low1); OvLine l = OvMk(OVK_HUD, "Frame time", C_TEXT, b); l.v2 = c; L.push_back(l); }
         if (g_cfg.showGraph) OvPushGraph(L);
-        if (g_cfg.showVram) { char b[96]; if (g_wasOn && g_stVramMB > 0) snprintf(b, sizeof b, "FG VRAM  : ~%llu MB (DLSS-G)", g_stVramMB); else snprintf(b, sizeof b, "FG VRAM  : %s", g_wasOn ? "measuring ..." : "- (FG off)"); L.push_back({ b, C_TEXT, false }); }
+        if (g_cfg.showVram) {
+            char b[96]; OvLine l = OvMk(OVK_HUD, "FG VRAM", C_TEXT);
+            if (g_wasOn && g_stVramMB > 0) { snprintf(b, sizeof b, "~%llu MB", g_stVramMB); l.v = b; l.v2 = "DLSS-G"; }
+            else if (g_wasOn) { l.v = "measuring ..."; l.col = C_GRAY; }
+            else { l.v = "-"; l.v2 = "FG off"; l.col = C_GRAY; }
+            L.push_back(l);
+        }
         if (g_cfg.showFgFps) {
             char b[128];
-            if (!g_slInitOk) { L.push_back({ "DLSS-FG  : unavailable (Streamline not loaded)", C_RED, false }); }
-            else if (g_compatBlocked.load()) { L.push_back({ "DLSS-FG  : not supported on this system", C_RED, false }); }
-            else if (g_wasOn) { double r = g_fgRatio.load(); snprintf(b, sizeof b, "DLSS-FG  : %6.1f fps  (x%.1f)", g_st.fps * r, r); L.push_back({ b, C_GREEN, false }); }
-            else { snprintf(b, sizeof b, "DLSS-FG  : OFF  (%s)", g_whyNot[0] ? g_whyNot : "off"); L.push_back({ b, C_GRAY, false }); }
+            if (!g_slInitOk) { OvLine l = OvMk(OVK_HUD, "DLSS-FG", C_RED, "unavailable"); l.v2 = "Streamline not loaded"; L.push_back(l); }
+            else if (g_compatBlocked.load()) { L.push_back(OvMk(OVK_HUD, "DLSS-FG", C_RED, "not supported on this system")); }
+            else if (g_wasOn) { double r = g_fgRatio.load(); snprintf(b, sizeof b, "%.1f fps", g_st.fps * r); OvLine l = OvMk(OVK_HUD, "DLSS-FG", C_GREEN, b); snprintf(b, sizeof b, "x%.1f", r); l.v2 = b; L.push_back(l); }
+            else { OvLine l = OvMk(OVK_HUD, "DLSS-FG", C_GRAY, "OFF"); l.v2 = g_whyNot[0] ? g_whyNot : "off"; L.push_back(l); }
         }
     }
-    if (!g_ov.menuOpen.load() && !g_ov.toast.empty() && GetTickCount() - g_ov.toastTick < 2500) L.push_back({ g_ov.toast, g_ov.toastCol, false });
+    if (!g_ov.menuOpen.load() && !g_ov.toast.empty() && GetTickCount() - g_ov.toastTick < 2500) { if (!L.empty()) L.push_back(OvMk(OVK_GAP, "")); L.push_back(OvMk(OVK_TOAST, g_ov.toast, g_ov.toastCol)); }
     // ---- menu
     if (g_ov.menuOpen.load()) {
-        if (!L.empty()) L.push_back({ "", C_TEXT, false });
-        L.push_back({ "SN_DLSSG " SN_VERSION "  -  DLSS Frame Generation", C_TITLE, false });
+        if (!L.empty()) L.push_back(OvMk(OVK_DIV, ""));
+        L.push_back(OvMk(OVK_TITLE, "DLSS Frame Generation", C_TITLE, "SN_DLSSG " SN_VERSION));
         { DiagRuntime rt; DiagRuntimeFill(rt); std::string gpu; { for (auto& g : g_gpus) if (g.nvidia && !g.software) { gpu = g.name; break; } }
-          if (!gpu.empty()) L.push_back({ "GPU      : " + gpu, C_GRAY, false });
+          if (!gpu.empty()) L.push_back(OvMk(OVK_STAT, "GPU", C_TEXT, gpu));
           char b[160];
-          if (!g_slInitOk) snprintf(b, sizeof b, "FG state : UNAVAILABLE (Streamline not loaded)");
-          else if (g_compatBlocked.load()) snprintf(b, sizeof b, "FG state : UNSUPPORTED on this system");
-          else if (g_wasOn) snprintf(b, sizeof b, "FG state : ACTIVE  x%.1f   (real %.0f fps -> %.0f fps)", g_fgRatio.load(), g_st.fps, g_st.fps * g_fgRatio.load());
-          else snprintf(b, sizeof b, "FG state : off - %s", g_whyNot[0] ? g_whyNot : "off");
-          L.push_back({ b, g_wasOn ? C_GREEN : (g_compatBlocked.load() || !g_slInitOk) ? C_RED : C_YELLOW, false });
+          if (!g_slInitOk) snprintf(b, sizeof b, "UNAVAILABLE (Streamline not loaded)");
+          else if (g_compatBlocked.load()) snprintf(b, sizeof b, "UNSUPPORTED on this system");
+          else if (g_wasOn) snprintf(b, sizeof b, "ACTIVE  x%.1f   %.0f -> %.0f fps", g_fgRatio.load(), g_st.fps, g_st.fps * g_fgRatio.load());
+          else snprintf(b, sizeof b, "off - %s", g_whyNot[0] ? g_whyNot : "off");
+          { OvLine l = OvMk(OVK_STAT, "FG state", g_wasOn ? C_GREEN : (g_compatBlocked.load() || !g_slInitOk) ? C_RED : C_YELLOW, b); l.on = true; L.push_back(l); }
           int col = v.state == 1 ? C_GREEN : v.state == 2 ? C_RED : v.state == 3 ? C_GRAY : C_YELLOW;
-          L.push_back({ std::string("Compat   : ") + (v.state == 1 ? "OK - verified working" : v.state == 2 ? "PROBLEM - see report" : v.state == 3 ? "frame generation switched off" : "checking..."), col, false }); }
-        L.push_back({ "", C_TEXT, false });
-        auto row = [&](int id, const char* label, const std::string& val) { char b[160]; snprintf(b, sizeof b, "%s %-26s %s", g_ov.sel == id ? ">" : " ", label, val.c_str()); L.push_back({ b, C_TEXT, g_ov.sel == id }); };
+          { OvLine l = OvMk(OVK_STAT, "Compat", col, v.state == 1 ? "OK - verified working" : v.state == 2 ? "PROBLEM - see report" : v.state == 3 ? "frame generation switched off" : "checking..."); l.on = true; L.push_back(l); } }
+        auto sec = [&](const char* name) { L.push_back(OvMk(OVK_SECTION, name)); };
+        auto tgl = [&](int id, const char* label, int on) { OvLine l = OvMk(OVK_ROW, label); l.sel = g_ov.sel == id; l.ctl = OVC_TOGGLE; l.on = on != 0; L.push_back(l); };
+        auto cho = [&](int id, const char* label, const std::string& val) { OvLine l = OvMk(OVK_ROW, label, C_TEXT, val); l.sel = g_ov.sel == id; l.ctl = OVC_CHOICE; L.push_back(l); };
+        auto act = [&](int id, const char* label) { OvLine l = OvMk(OVK_ROW, label, C_TEXT, "ENTER"); l.sel = g_ov.sel == id; l.ctl = OVC_ACTION; L.push_back(l); };
         static const char* posN[] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
-        row(I_FG, "Frame Generation", OnOff(g_cfg.fg));
-        { static const char* pn[] = { "Custom", "Quality", "Balanced", "Performance" }; row(I_PRESET, "Preset", pn[g_cfg.preset & 3]); }
-        row(I_MULT, "Multiplier", g_cfg.targetFps > 0 ? Fmt("AUTO  (now %dx, see target fps)", CurMult()) : Fmt("%dx%s", g_cfg.mult, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : ""));
-        row(I_TARGET, "Target output fps (auto x)", g_cfg.targetFps ? Fmt("%d fps%s", g_cfg.targetFps, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : "") : std::string("OFF"));
-        row(I_SHOWFPS, "Show REAL fps", OnOff(g_cfg.showFps));
-        row(I_SHOWFG, "Show DLSS-FG fps", OnOff(g_cfg.showFgFps));
-        row(I_SHOWFT, "Show frame time / 1% low", OnOff(g_cfg.showFrameTime));
-        row(I_SHOWGRAPH, "Show frame-time graph", OnOff(g_cfg.showGraph));
-        row(I_SHOWVRAM, "Show DLSS-G VRAM estimate", OnOff(g_cfg.showVram));
-        row(I_MINFPS, "Pause FG below base fps", g_cfg.fgMinFps ? Fmt("%d fps", g_cfg.fgMinFps) : std::string("OFF"));
-        row(I_CAP, "Base fps cap (Reflex)", g_cfg.baseFpsLimit ? Fmt("%d fps", g_cfg.baseFpsLimit) : std::string("OFF"));
-        { std::string v = g_cfg.fpsCap == 0 ? "OFF" : g_cfg.fpsCap < 0 ? (g_refreshHz.load() ? Fmt("AUTO  (%d Hz -> %d fps)", g_refreshHz.load(), SnAutoOutCap(g_refreshHz.load())) : std::string("AUTO  (refresh unknown)")) : Fmt("%d fps", g_cfg.fpsCap);
-          int bl = EffectiveBaseLimit(); if (g_cfg.fpsCap != 0 && bl > 0) v += Fmt("  base<=%d", bl); row(I_OUTCAP, "Output fps cap (VRR)", v); }
-        row(I_REFLEX, "Reflex sleep (needed by FG)", OnOff(g_cfg.reflexSleep));
-        { static const char* rn[] = { "OFF (not recommended)", "Low latency", "Low latency + Boost" }; row(I_REFLEXMODE, "Reflex mode", rn[g_cfg.reflexMode % 3]); }
-        row(I_CAMHOLD, "Keep FG when camera is lost", OnOff(g_cfg.camHold));
-        row(I_CUT, "Camera-cut detection", OnOff(g_cfg.cutDetect));
-        row(I_MENUDET, "Full-screen menu detection", OnOff(g_cfg.menuDetect));
-        row(I_DYNRES, "Dynamic resolution (auto-detect)", OnOff(g_cfg.dynRes));
-        { std::string v = g_cfg.hudless == 0 ? "OFF" : g_cfg.hudless == 1 ? Fmt("ON  (draw %d)", g_cfg.hudlessDraw) : g_hc.phase.load() == 4 ? std::string("AUTO: no clear result (see log)") : Fmt("AUTO: learning %d/6 votes", HudCalVotes()); row(I_HUDLESS, "HUD-less capture", v); }
-        row(I_POS, "Overlay position", posN[g_cfg.overlayPos & 3]);
-        row(I_SCALE, "Overlay size", Fmt("%d%%", g_cfg.overlayScale));
-        row(I_OPACITY, "Overlay opacity", Fmt("%d%%", g_cfg.overlayOpacity));
-        row(I_REPORT, "Write debug report now", "[Enter]");
-        row(I_BUNDLE, "Create support zip (logs)", "[Enter]");
-        row(I_CLOSE, "Close menu", "[Enter]");
-        L.push_back({ "", C_TEXT, false });
-        L.push_back({ std::string("Up/Down select   Left/Right change   Enter act   ") + KeyNameOf(g_cfg.overlayKey) + "/Esc close", C_GRAY, false });
-        if (g_cfg.fgKey || g_cfg.hudKey) L.push_back({ std::string("Hotkeys (this session): ") + (g_cfg.fgKey ? std::string(KeyNameOf(g_cfg.fgKey)) + " = FG on/off   " : std::string()) + (g_cfg.hudKey ? std::string(KeyNameOf(g_cfg.hudKey)) + " = HUD on/off" : std::string()), C_GRAY, false });
-        if (g_cfg.autoSave) { if (g_cfgSaveState.load() < 0) L.push_back({ "Cannot write SN_DLSSG_cfg.txt (read-only folder?)", C_RED, false }); else L.push_back({ "Changes are saved to SN_DLSSG_cfg.txt automatically", C_GRAY, false }); }
+        sec("FRAME GENERATION");
+        tgl(I_FG, "Frame Generation", g_cfg.fg);
+        { static const char* pn[] = { "Custom", "Quality", "Balanced", "Performance" }; cho(I_PRESET, "Preset", pn[g_cfg.preset & 3]); }
+        cho(I_MULT, "Multiplier", g_cfg.targetFps > 0 ? Fmt("AUTO  (now %dx, see target fps)", CurMult()) : Fmt("%dx%s", g_cfg.mult, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : ""));
+        cho(I_TARGET, "Target output fps (auto x)", g_cfg.targetFps ? Fmt("%d fps%s", g_cfg.targetFps, g_maxGen ? Fmt("   (GPU max %ux)", g_maxGen + 1).c_str() : "") : std::string("OFF"));
+        sec("HUD");
+        tgl(I_SHOWFPS, "Show REAL fps", g_cfg.showFps);
+        tgl(I_SHOWFG, "Show DLSS-FG fps", g_cfg.showFgFps);
+        tgl(I_SHOWFT, "Show frame time / 1% low", g_cfg.showFrameTime);
+        tgl(I_SHOWGRAPH, "Show frame-time graph", g_cfg.showGraph);
+        tgl(I_SHOWVRAM, "Show DLSS-G VRAM estimate", g_cfg.showVram);
+        sec("PACING");
+        cho(I_MINFPS, "Pause FG below base fps", g_cfg.fgMinFps ? Fmt("%d fps", g_cfg.fgMinFps) : std::string("OFF"));
+        { static const char* rn[] = { "OFF (not recommended)", "Low latency", "Low latency + Boost" }; cho(I_REFLEXMODE, "Reflex mode", rn[g_cfg.reflexMode % 3]); }
+        sec("DETECTION");
+        tgl(I_CAMHOLD, "Keep FG when camera is lost", g_cfg.camHold);
+        tgl(I_CUT, "Camera-cut detection", g_cfg.cutDetect);
+        tgl(I_MENUDET, "Full-screen menu detection", g_cfg.menuDetect);
+        tgl(I_DYNRES, "Dynamic resolution (auto-detect)", g_cfg.dynRes);
+        { std::string vv = g_cfg.hudless == 0 ? "OFF" : g_cfg.hudless == 1 ? Fmt("ON  (draw %d)", g_cfg.hudlessDraw) : g_hc.phase.load() == 4 ? std::string("AUTO: no clear result (see log)") : Fmt("AUTO: learning %d/6 votes", HudCalVotes()); cho(I_HUDLESS, "HUD-less capture", vv); }
+        sec("OVERLAY");
+        cho(I_POS, "Overlay position", posN[g_cfg.overlayPos & 3]);
+        cho(I_SCALE, "Overlay size", Fmt("%d%%", g_cfg.overlayScale));
+        cho(I_OPACITY, "Overlay opacity", Fmt("%d%%", g_cfg.overlayOpacity));
+        sec("TOOLS");
+        act(I_REPORT, "Write debug report now");
+        act(I_BUNDLE, "Create support zip (logs)");
+        act(I_CLOSE, "Close menu");
+        L.push_back(OvMk(OVK_GAP, ""));
+        L.push_back(OvMk(OVK_HINT, std::string("Up/Down select   Left/Right change   Enter act   ") + KeyNameOf(g_cfg.overlayKey) + "/Esc close", C_GRAY));
+        if (g_cfg.fgKey || g_cfg.hudKey) L.push_back(OvMk(OVK_HINT, std::string("Hotkeys (this session): ") + (g_cfg.fgKey ? std::string(KeyNameOf(g_cfg.fgKey)) + " = FG on/off   " : std::string()) + (g_cfg.hudKey ? std::string(KeyNameOf(g_cfg.hudKey)) + " = HUD on/off" : std::string()), C_GRAY));
+        if (g_cfg.autoSave) { if (g_cfgSaveState.load() < 0) L.push_back(OvMk(OVK_HINT, "Cannot write SN_DLSSG_cfg.txt (read-only folder?)", C_RED)); else L.push_back(OvMk(OVK_HINT, "Changes are saved to SN_DLSSG_cfg.txt automatically", C_GRAY)); }
         if (!g_ov.msg.empty() && GetTickCount() - g_ov.msgTick < 6000) OvWrap(L, g_ov.msg, g_ov.msgBad ? C_RED : C_GREEN, 58);
     }
 }
 
-// ------------------------------------------------------------------ GDI panel -> BGRA bitmap
-struct OvPanel { HDC dc = nullptr; HBITMAP bmp = nullptr, oldBmp = nullptr; HFONT font = nullptr, oldFont = nullptr; void* bits = nullptr; int capW = 0, capH = 0, px = 0; int w = 0, h = 0; size_t hash = 0; bool valid = false; } g_pn;
+// ------------------------------------------------------------------ panel renderer: GDI text mask + CPU composited "glass" card -> premultiplied BGRA
+// The look (rounded glass card, soft shadow, switches, chevrons, graph) is composed on the CPU with small anti-aliased shape helpers;
+// GDI is only used to rasterise the text into a white-on-black coverage mask. It all happens only when the content changes (~2x per second,
+// 10x per second while the graph is shown), the static glass background is cached per size, nothing runs on the GPU except one textured quad.
+struct OvMet { int fs, fsSm, fsTi, rowH, hudH, statH, secH, titleH, hintH, noteH, gapH, divH, graphH, pad, padY, rad, sh; };
+static OvMet OvMetrics(int px) {
+    OvMet m; m.fs = std::max(9, (int)(px * 0.82 + 0.5)); m.fsSm = std::max(8, (int)(m.fs * 0.84 + 0.5)); m.fsTi = (int)(m.fs * 1.22 + 0.5);
+    m.rowH = (int)(m.fs * 1.58 + 0.5); m.hudH = (int)(m.fs * 1.5 + 0.5); m.statH = (int)(m.fs * 1.4 + 0.5); m.secH = (int)(m.fs * 1.8 + 0.5);
+    m.titleH = (int)(m.fs * 2.0 + 0.5); m.hintH = (int)(m.fsSm * 1.45 + 0.5); m.noteH = (int)(m.fs * 1.4 + 0.5);
+    m.gapH = std::max(3, m.fs / 2); m.divH = m.gapH * 2; m.graphH = (int)(m.fs * 3.4 + 0.5);
+    m.pad = (int)(m.fs * 1.0 + 0.5); m.padY = (int)(m.fs * 0.8 + 0.5); m.rad = (int)(m.fs * 0.95 + 0.5); m.sh = (int)(m.fs * 1.5 + 0.5);
+    return m;
+}
+struct OvPanel {
+    HDC dc = nullptr; HBITMAP maskBmp = nullptr, oldBmp = nullptr, outBmp = nullptr; void* maskBits = nullptr; void* bits = nullptr;   // bits = final premultiplied BGRA panel (uploaded as the texture)
+    HFONT fReg = nullptr, fSemi = nullptr, fCap = nullptr, fHint = nullptr, fTitle = nullptr, oldFont = nullptr;
+    int capW = 0, capH = 0, px = 0, reqPx = 0, w = 0, h = 0, sh = 0; size_t hash = 0; bool valid = false;   // w/h include the shadow margin sh
+    std::vector<uint32_t> bg; int bgW = 0, bgH = 0, bgFs = 0, bgAlert = -1, bgOp = -1;                        // cached glass background
+} g_pn;
 static void OvPanelFree() {
     if (g_pn.dc) { if (g_pn.oldBmp) SelectObject(g_pn.dc, g_pn.oldBmp); if (g_pn.oldFont) SelectObject(g_pn.dc, g_pn.oldFont); DeleteDC(g_pn.dc); }
-    if (g_pn.bmp) DeleteObject(g_pn.bmp); if (g_pn.font) DeleteObject(g_pn.font);
+    if (g_pn.maskBmp) DeleteObject(g_pn.maskBmp); if (g_pn.outBmp) DeleteObject(g_pn.outBmp);
+    HFONT fs_[5] = { g_pn.fReg, g_pn.fSemi, g_pn.fCap, g_pn.fHint, g_pn.fTitle }; for (HFONT f : fs_) if (f) DeleteObject(f);
     g_pn = OvPanel();
 }
 static bool OvPanelEnsure(int px) {
     if (g_pn.dc && g_pn.px == px) return true;
-    OvPanelFree();
+    OvPanelFree(); const OvMet m = OvMetrics(px);
     int cw = (px * 40 + 63) & ~63, ch = px * 80; if (cw > 4096) cw = 4096; if (ch > 4096) ch = 4096;
     HDC dc = CreateCompatibleDC(nullptr); if (!dc) return false;
     BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = cw; bi.bmiHeader.biHeight = -ch; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr; HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0); if (!bmp || !bits) { DeleteDC(dc); if (bmp) DeleteObject(bmp); return false; }
-    HFONT f = CreateFontA(-px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
-    if (!f) f = CreateFontA(-px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Courier New");
-    g_pn.dc = dc; g_pn.bmp = bmp; g_pn.bits = bits; g_pn.font = f; g_pn.oldBmp = (HBITMAP)SelectObject(dc, bmp); g_pn.oldFont = f ? (HFONT)SelectObject(dc, f) : nullptr;
-    g_pn.capW = cw; g_pn.capH = ch; g_pn.px = px; SetBkMode(dc, TRANSPARENT); return true;
+    void* mb = nullptr; HBITMAP mbmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mb, nullptr, 0);
+    void* ob = nullptr; HBITMAP obmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &ob, nullptr, 0);
+    if (!mbmp || !mb || !obmp || !ob) { if (mbmp) DeleteObject(mbmp); if (obmp) DeleteObject(obmp); DeleteDC(dc); return false; }
+    auto mk = [&](int hgt, int wt) { return CreateFontA(-hgt, 0, 0, 0, wt, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI"); };
+    g_pn.fReg = mk(m.fs, FW_NORMAL); g_pn.fSemi = mk(m.fs, FW_SEMIBOLD); g_pn.fCap = mk(m.fsSm, FW_SEMIBOLD); g_pn.fHint = mk(m.fsSm, FW_NORMAL); g_pn.fTitle = mk(m.fsTi, FW_BOLD);
+    g_pn.dc = dc; g_pn.maskBmp = mbmp; g_pn.maskBits = mb; g_pn.outBmp = obmp; g_pn.bits = ob;
+    g_pn.oldBmp = (HBITMAP)SelectObject(dc, mbmp); g_pn.oldFont = g_pn.fReg ? (HFONT)SelectObject(dc, g_pn.fReg) : nullptr;
+    g_pn.capW = cw; g_pn.capH = ch; g_pn.px = px; SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(255, 255, 255)); return true;
 }
-static COLORREF OvColor(int c) { switch (c) { case C_GREEN: return RGB(110, 235, 130); case C_YELLOW: return RGB(255, 213, 90); case C_RED: return RGB(255, 100, 90); case C_GRAY: return RGB(165, 170, 180); case C_TITLE: return RGB(120, 200, 255); default: return RGB(240, 242, 246); } }
+static void OvRGB(int c, int& r, int& g, int& b) {
+    switch (c) { case C_GREEN: r = 82; g = 224; b = 138; break; case C_YELLOW: r = 250; g = 204; b = 72; break; case C_RED: r = 255; g = 105; b = 97; break;
+                 case C_GRAY: r = 142; g = 150; b = 168; break; case C_TITLE: r = 125; g = 190; b = 255; break; default: r = 236; g = 240; b = 247; break; }
+}
+static std::wstring OvWide(const std::string& s) {
+    if (s.empty()) return std::wstring(); int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)std::max(0, n), L'\0'); if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n); return w;
+}
+// --- tiny anti-aliased 2D helpers on the premultiplied panel buffer (stride = capW pixels)
+static inline void OvBlend(uint32_t* d, int r, int g, int b, float a) {   // "over" with a straight colour + alpha onto a premultiplied pixel
+    if (a <= 0.003f) return; if (a > 1.f) a = 1.f;
+    uint32_t o = *d; float ia = 1.f - a;
+    int na = (int)(((o >> 24) & 255) * ia + 255.f * a + 0.5f), nr = (int)(((o >> 16) & 255) * ia + r * a + 0.5f), ng = (int)(((o >> 8) & 255) * ia + g * a + 0.5f), nb = (int)((o & 255) * ia + b * a + 0.5f);
+    *d = ((uint32_t)std::min(na, 255) << 24) | ((uint32_t)std::min(nr, 255) << 16) | ((uint32_t)std::min(ng, 255) << 8) | (uint32_t)std::min(nb, 255);
+}
+static inline float OvSdRR(float px, float py, float cx, float cy, float hw, float hh, float r) {   // signed distance to a rounded rectangle (negative inside)
+    float qx = fabsf(px - cx) - (hw - r), qy = fabsf(py - cy) - (hh - r);
+    if (qx <= 0.f && qy <= 0.f) return std::max(qx, qy) - r;
+    float ax = std::max(qx, 0.f), ay = std::max(qy, 0.f); return sqrtf(ax * ax + ay * ay) + std::min(std::max(qx, qy), 0.f) - r;
+}
+static void OvRect(int x0, int y0, int x1, int y1, int r, int g, int b, float a) {
+    x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::min(x1, g_pn.w); y1 = std::min(y1, g_pn.h); uint32_t* P = (uint32_t*)g_pn.bits;
+    for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) OvBlend(&P[(size_t)y * g_pn.capW + x], r, g, b, a);
+}
+static void OvRR(float x, float y, float w, float h, float r, float th, int cr, int cg, int cb, float a) {   // th <= 0: filled, th > 0: outline of that thickness
+    if (w <= 0.f || h <= 0.f || a <= 0.f) return; r = std::min(r, std::min(w, h) * 0.5f);
+    int bx0 = std::max(0, (int)floorf(x) - 1), by0 = std::max(0, (int)floorf(y) - 1), bx1 = std::min(g_pn.w, (int)ceilf(x + w) + 1), by1 = std::min(g_pn.h, (int)ceilf(y + h) + 1);
+    float cx = x + w * .5f, cy = y + h * .5f, hw = w * .5f, hh = h * .5f; uint32_t* P = (uint32_t*)g_pn.bits;
+    for (int yy = by0; yy < by1; yy++) for (int xx = bx0; xx < bx1; xx++) {
+        float sd = OvSdRR(xx + .5f, yy + .5f, cx, cy, hw, hh, r); if (th > 0.f) sd = fabsf(sd + th * .5f) - th * .5f;
+        float c = .5f - sd; if (c <= 0.f) continue; if (c > 1.f) c = 1.f;
+        OvBlend(&P[(size_t)yy * g_pn.capW + xx], cr, cg, cb, a * c);
+    }
+}
+static void OvLn(float x0, float y0, float x1, float y1, float th, int cr, int cg, int cb, float a) {
+    int bx0 = std::max(0, (int)floorf(std::min(x0, x1) - th) - 1), by0 = std::max(0, (int)floorf(std::min(y0, y1) - th) - 1);
+    int bx1 = std::min(g_pn.w, (int)ceilf(std::max(x0, x1) + th) + 1), by1 = std::min(g_pn.h, (int)ceilf(std::max(y0, y1) + th) + 1);
+    float dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy; uint32_t* P = (uint32_t*)g_pn.bits;
+    for (int yy = by0; yy < by1; yy++) for (int xx = bx0; xx < bx1; xx++) {
+        float px = xx + .5f - x0, py = yy + .5f - y0; float t = l2 > 0.f ? std::min(1.f, std::max(0.f, (px * dx + py * dy) / l2)) : 0.f;
+        float ex = px - t * dx, ey = py - t * dy; float c = th * .5f + .5f - sqrtf(ex * ex + ey * ey); if (c <= 0.f) continue; if (c > 1.f) c = 1.f;
+        OvBlend(&P[(size_t)yy * g_pn.capW + xx], cr, cg, cb, a * c);
+    }
+}
+// the glass card: soft shadow, dark frosted tint (vertical gradient), diagonal sheen at the top, thin light border (brighter on top). Opacity is baked in here
+// (the text stays fully opaque, only the glass gets more / less transparent).
+static void OvBuildBg(int w, int h, const OvMet& m, bool alert, int opPct) {
+    g_pn.bg.assign((size_t)w * (size_t)h, 0u);
+    float op = (float)opPct / 100.f, gx = (float)m.sh, gy = (float)m.sh, gw = (float)(w - 2 * m.sh), gh = (float)(h - 2 * m.sh);
+    float r = std::min((float)m.rad, std::min(gw, gh) * 0.5f), cx = gx + gw * .5f, cy = gy + gh * .5f, hw = gw * .5f, hh = gh * .5f, blur = (float)m.sh * 0.95f, soff = (float)m.sh * 0.28f;
+    for (int y = 0; y < h; y++) {
+        float fy = y + .5f, t = std::min(1.f, std::max(0.f, (fy - gy) / gh));
+        float br = 22.f + (11.f - 22.f) * t, bgc = 27.f + (13.f - 27.f) * t, bb = 40.f + (21.f - 40.f) * t;
+        if (alert) { br = br * 0.7f + 70.f * 0.3f; bgc = bgc * 0.7f + 18.f * 0.3f; bb = bb * 0.7f + 22.f * 0.3f; }
+        float baseA = op * (0.92f + 0.08f * t), sheen0 = std::max(0.f, 1.f - t / 0.5f) * 0.075f, borderA = 0.36f - 0.24f * t;
+        float bcr = alert ? 255.f : 255.f, bcg = alert ? 120.f : 255.f, bcb = alert ? 110.f : 255.f; if (alert) borderA += 0.25f;
+        uint32_t* row = &g_pn.bg[(size_t)y * (size_t)w];
+        for (int x = 0; x < w; x++) {
+            float fx = x + .5f, sd = OvSdRR(fx, fy, cx, cy, hw, hh, r);
+            if (sd > 0.5f) {   // outside the card: shadow only
+                float sd2 = OvSdRR(fx, fy - soff, cx, cy, hw, hh, r), k = 1.f - sd2 / blur; if (k <= 0.f) continue;
+                float a = 0.46f * k * k * (0.45f + 0.55f * op); row[x] = (uint32_t)(a * 255.f + 0.5f) << 24; continue;
+            }
+            float cov = std::min(1.f, 0.5f - sd), nx = (fx - gx) / gw, s = std::max(0.f, sheen0 * (1.f - 0.55f * nx));
+            float a = baseA, pr = br * a, pg = bgc * a, pb = bb * a;
+            pr = pr * (1.f - s) + 255.f * s; pg = pg * (1.f - s) + 255.f * s; pb = pb * (1.f - s) + 255.f * s; a = a * (1.f - s) + s;
+            float bc = std::min(1.f, std::max(0.f, 1.5f - (-sd))), bA = bc * borderA;
+            pr = pr * (1.f - bA) + bcr * bA; pg = pg * (1.f - bA) + bcg * bA; pb = pb * (1.f - bA) + bcb * bA; a = a * (1.f - bA) + bA;
+            auto q = [&](float v) { int i = (int)(v * cov + 0.5f); return (uint32_t)(i < 0 ? 0 : i > 255 ? 255 : i); };
+            row[x] = (q(a * 255.f) << 24) | (q(pr) << 16) | (q(pg) << 8) | q(pb);
+        }
+    }
+    g_pn.bgW = w; g_pn.bgH = h; g_pn.bgFs = m.fs; g_pn.bgAlert = alert ? 1 : 0; g_pn.bgOp = opPct;
+}
 // 1.0.0: frame-time graph of the last ~120 real frames (newest on the right). Bars: green = normal, yellow = 25 % above the average, red = 70 % above (a visible spike = stutter / "ticking").
-static void OvDrawGraph(HDC dc, int x0, int y0, int x1, int y1) {
-    const int N = 120; int n = std::min(N, g_st.n); int w = x1 - x0, h = y1 - y0; if (w < 20 || h < 8) return;
-    RECT r = { x0, y0, x1, y1 }; HBRUSH bg = CreateSolidBrush(RGB(22, 26, 36)); FillRect(dc, &r, bg); DeleteObject(bg);
-    if (n < 2) return;
+// Returns the top of the scale in ms (0 if there is nothing to show yet).
+static double OvDrawGraph(int x0, int y0, int x1, int y1, int fs) {
+    const int N = 120; int n = std::min(N, g_st.n); int w = x1 - x0, h = y1 - y0; if (w < 20 || h < 8) return 0.0;
+    OvRR((float)x0, (float)y0, (float)w, (float)h, fs * 0.4f, 0.f, 0, 0, 0, 0.38f); OvRR((float)x0, (float)y0, (float)w, (float)h, fs * 0.4f, 1.f, 255, 255, 255, 0.07f);
+    if (n < 2) return 0.0;
     float v[N]; double sum = 0, mx = 0;
     for (int i = 0; i < n; i++) { int idx = ((g_st.pos - n + i) % 600 + 600) % 600; v[i] = g_st.ring[idx]; sum += v[i]; mx = std::max<double>(mx, v[i]); }
     double avg = sum / n; static const double ladder[] = { 8.4, 16.8, 25.0, 33.4, 50.0, 66.8, 100.0 }; double top = ladder[6]; for (double c : ladder) if (mx * 1.05 <= c) { top = c; break; }
-    HBRUSH bgr = CreateSolidBrush(RGB(110, 235, 130)), byl = CreateSolidBrush(RGB(255, 213, 90)), brd = CreateSolidBrush(RGB(255, 100, 90)), bln = CreateSolidBrush(RGB(120, 130, 150));
-    int bw = std::max(1, w / N);
+    int ix0 = x0 + 2, ix1 = x1 - 2, iy0 = y0 + 2, iy1 = y1 - 2, iw = ix1 - ix0, ih = iy1 - iy0; if (iw < 10 || ih < 4) return top;
+    float step = (float)iw / (float)N;   // bars fill the whole graph width
     for (int i = 0; i < n; i++) {
-        int bh = std::max(1, std::min(h, (int)(std::min<double>(v[i], top) / top * h + 0.5))); int xr = x1 - (n - 1 - i) * bw, xl = xr - std::max(1, bw - (bw > 2 ? 1 : 0));
-        RECT b = { xl, y1 - bh, xr, y1 }; FillRect(dc, &b, v[i] <= avg * 1.25 ? bgr : v[i] <= avg * 1.7 ? byl : brd);
+        int bh = std::max(1, std::min(ih, (int)(std::min<double>(v[i], top) / top * ih + 0.5))); int xr = ix1 - (int)((n - 1 - i) * step + 0.5f), xl = std::max(ix0, xr - std::max(1, (int)step - (step > 2.f ? 1 : 0)));
+        int cr, cg, cb; OvRGB(v[i] <= avg * 1.25 ? C_GREEN : v[i] <= avg * 1.7 ? C_YELLOW : C_RED, cr, cg, cb);
+        OvRect(xl, iy1 - bh, xr, iy1, cr, cg, cb, 0.80f); OvRect(xl, iy1 - bh, xr, iy1 - bh + 1, std::min(255, cr + 40), std::min(255, cg + 30), std::min(255, cb + 30), 1.f);
     }
-    int ya = y1 - (int)(avg / top * h + 0.5); if (ya >= y0 && ya < y1) { RECT a = { x0, ya, x1, ya + 1 }; FillRect(dc, &a, bln); }
-    DeleteObject(bgr); DeleteObject(byl); DeleteObject(brd); DeleteObject(bln);
-    char t[48]; snprintf(t, sizeof t, "%.0f ms", top); SetTextColor(dc, OvColor(C_GRAY)); TextOutA(dc, x0 + 2, y0, t, (int)strlen(t));
+    int ya = iy1 - (int)(avg / top * ih + 0.5); if (ya >= iy0 && ya < iy1) OvRect(ix0, ya, ix1, ya + 1, 255, 255, 255, 0.35f);
+    return top;
 }
-// renders the lines; returns false if nothing to draw
+// lays out + draws the lines; returns false if nothing to draw
 static bool OvPanelRender(const std::vector<OvLine>& L, int px) {
     if (!OvPanelEnsure(px)) return false;
-    HDC dc = g_pn.dc; TEXTMETRICA tm = {}; GetTextMetricsA(dc, &tm); int lh = tm.tmHeight + std::max(2, px / 7), pad = std::max(6, px / 3);
-    int maxW = 0; bool hasGraph = false; for (auto& l : L) { SIZE sz = {}; GetTextExtentPoint32A(dc, l.t.c_str(), (int)l.t.size(), &sz); maxW = std::max(maxW, (int)sz.cx); if (l.graph > 0) hasGraph = true; }
-    if (hasGraph) maxW = std::max(maxW, px * 14);   // the graph needs a minimum width
-    int nl = (int)std::min<size_t>(L.size(), (size_t)((g_pn.capH - 2 * pad) / lh));
-    int w = std::min(g_pn.capW, maxW + 2 * pad), h = std::min(g_pn.capH, nl * lh + 2 * pad); if (w < 8 || h < 8) return false;
-    RECT rc = { 0, 0, w, h }; HBRUSH bg = CreateSolidBrush(RGB(12, 14, 20)); FillRect(dc, &rc, bg); DeleteObject(bg);
-    HBRUSH bd = CreateSolidBrush(RGB(70, 80, 100)); FrameRect(dc, &rc, bd); DeleteObject(bd);
-    for (int i = 0; i < nl; i++) {
-        int y = pad + i * lh;
-        if (L[i].sel) { RECT sr = { 2, y - 1, w - 2, y + lh - 1 }; HBRUSH sb = CreateSolidBrush(RGB(34, 66, 112)); FillRect(dc, &sr, sb); DeleteObject(sb); }
-        if (L[i].graph > 0) { int gh = std::min(L[i].graph, nl - i) * lh - 3; if (gh > 8) OvDrawGraph(dc, pad, y, w - pad, y + gh); continue; }
-        if (L[i].graph < 0) continue;
-        SetTextColor(dc, OvColor(L[i].col)); TextOutA(dc, pad, y, L[i].t.c_str(), (int)L[i].t.size());
+    const OvMet m = OvMetrics(px); HDC dc = g_pn.dc;
+    auto tw = [&](HFONT f, const std::string& s) -> int { if (s.empty()) return 0; std::wstring ws = OvWide(s); SelectObject(dc, f); SIZE z = {}; GetTextExtentPoint32W(dc, ws.c_str(), (int)ws.size(), &z); return (int)z.cx; };
+    const int chevW = m.fs, swW = (int)(m.fs * 2.1f + .5f), swH = (int)(m.fs * 1.12f + .5f);
+    const int chipW = tw(g_pn.fCap, "ENTER") + (int)(m.fs * 1.1f + .5f), chipH = (int)(m.fs * 1.4f + .5f);
+    bool menu = false, alert = false; for (auto& l : L) { if (l.kind == OVK_TITLE) menu = true; if (l.kind == OVK_ALERT) alert = true; }
+    // ---- pass 1: heights + needed width
+    std::vector<int> ys(L.size()), hs(L.size()); int y = m.padY, contentW = 0;
+    for (size_t i = 0; i < L.size(); i++) {
+        const OvLine& l = L[i]; int h = 0, need = 0;
+        switch (l.kind) {
+        case OVK_HUD: h = m.hudH; need = tw(g_pn.fReg, l.t) + m.fs * 2 + tw(g_pn.fSemi, l.v) + (l.v2.empty() ? 0 : (int)(m.fs * .7f) + tw(g_pn.fHint, l.v2)); break;
+        case OVK_STAT: h = m.statH; need = (int)(m.fs * 1.25f) + tw(g_pn.fReg, l.t) + m.fs * 2 + tw(g_pn.fSemi, l.v); break;
+        case OVK_ROW: h = m.rowH; need = tw(g_pn.fReg, l.t) + m.fs * 2 + chevW + (l.ctl == OVC_TOGGLE ? swW : l.ctl == OVC_ACTION ? chipW : tw(g_pn.fSemi, l.v)); break;
+        case OVK_SECTION: h = m.secH; need = tw(g_pn.fCap, l.t) + m.fs * 2; break;
+        case OVK_TITLE: h = m.titleH; need = 11 + tw(g_pn.fTitle, l.t) + m.fs * 2 + tw(g_pn.fHint, l.v); break;
+        case OVK_ALERT: h = m.rowH; need = (int)(m.fs * 1.8f) + tw(g_pn.fSemi, l.t); break;
+        case OVK_TOAST: h = m.hudH; need = (int)(m.fs * 1.25f) + tw(g_pn.fSemi, l.t); break;
+        case OVK_HINT: h = m.hintH; need = tw(g_pn.fHint, l.t); break;
+        case OVK_GRAPH: h = m.graphH; need = m.fs * 14; break;
+        case OVK_GAP: h = m.gapH; break;
+        case OVK_DIV: h = m.divH; break;
+        default: h = m.noteH; need = tw(g_pn.fReg, l.t); break;
+        }
+        ys[i] = y; hs[i] = h; y += h; contentW = std::max(contentW, need);
     }
-    GdiFlush(); g_pn.w = w; g_pn.h = h; g_pn.valid = true; return true;
+    int innerW = std::max(contentW + 2 * m.pad, menu ? m.fs * 30 : m.fs * 15), innerH = y + m.padY;
+    int w = std::min(g_pn.capW, innerW + 2 * m.sh), h = std::min(g_pn.capH, innerH + 2 * m.sh); if (w < 8 || h < 8) return false;
+    innerW = w - 2 * m.sh; innerH = h - 2 * m.sh;
+    g_pn.w = w; g_pn.h = h; g_pn.sh = m.sh;
+    // ---- background: cached glass card copied into the (cleared) output, text mask cleared
+    GdiFlush(); memset(g_pn.maskBits, 0, (size_t)g_pn.capW * 4 * (size_t)h);
+    if (g_pn.bgW != w || g_pn.bgH != h || g_pn.bgFs != m.fs || g_pn.bgAlert != (alert ? 1 : 0) || g_pn.bgOp != g_cfg.overlayOpacity) OvBuildBg(w, h, m, alert, g_cfg.overlayOpacity);
+    for (int yy = 0; yy < h; yy++) memcpy((uint32_t*)g_pn.bits + (size_t)yy * g_pn.capW, &g_pn.bg[(size_t)yy * (size_t)w], (size_t)w * 4);
+    // ---- pass 2: draw
+    struct TOp { int x, y, w, h, r, g, b; float a; }; std::vector<TOp> ops; ops.reserve(L.size() * 3);
+    auto txt = [&](HFONT f, const std::string& s, int x, int cy, int align, int r, int g, int b, float a, int spacing) -> int {   // align 0 = left, 1 = right, 2 = centre; (x, cy) = anchor, vertically centred on cy
+        if (s.empty()) return 0; std::wstring ws = OvWide(s); SelectObject(dc, f); SetTextCharacterExtra(dc, spacing);
+        SIZE z = {}; GetTextExtentPoint32W(dc, ws.c_str(), (int)ws.size(), &z);
+        int xx = align == 1 ? x - (int)z.cx : align == 2 ? x - (int)z.cx / 2 : x, yy = cy - (int)z.cy / 2;
+        TextOutW(dc, xx, yy, ws.c_str(), (int)ws.size()); SetTextCharacterExtra(dc, 0);
+        ops.push_back(TOp{ xx, yy, (int)z.cx + 2, (int)z.cy, r, g, b, a }); return (int)z.cx; };
+    const int gx = m.sh, gy = m.sh, L0 = gx + m.pad, R0 = gx + innerW - m.pad;
+    for (size_t i = 0; i < L.size(); i++) {
+        const OvLine& l = L[i]; const int Y = gy + ys[i], H = hs[i], cy = Y + H / 2; if (Y + H > h - m.sh) continue;
+        int cr, cg, cb; OvRGB(l.col, cr, cg, cb);
+        switch (l.kind) {
+        case OVK_ROW: {
+            const bool sel = l.sel;
+            if (sel) {   // accent "pill" behind the selected row
+                float hx = (float)(gx + m.pad / 2), hw_ = (float)(innerW - m.pad), hy = (float)Y + 1.f, hh_ = (float)H - 2.f;
+                OvRR(hx, hy, hw_, hh_, hh_ * 0.32f, 0.f, 96, 165, 250, 0.20f); OvRR(hx, hy, hw_, hh_, hh_ * 0.32f, 1.f, 130, 190, 255, 0.42f);
+                OvRR(hx + 2.f, (float)Y + H * 0.26f, 3.f, H * 0.48f, 1.5f, 0.f, 120, 190, 255, 1.f);
+            }
+            txt(g_pn.fReg, l.t, L0, cy, 0, sel ? 246 : 204, sel ? 249 : 210, sel ? 253 : 222, 1.f, 0);
+            const int xr = R0 - chevW;
+            if (l.ctl == OVC_TOGGLE) {
+                float sx = (float)(xr - swW), sy = (float)cy - swH * .5f, kr = swH * .5f - 2.5f, kx = l.on ? sx + swW - swH * .5f : sx + swH * .5f;
+                if (l.on) OvRR(sx, sy, (float)swW, (float)swH, swH * .5f, 0.f, 52, 199, 120, 0.95f); else OvRR(sx, sy, (float)swW, (float)swH, swH * .5f, 0.f, sel ? 110 : 88, sel ? 118 : 95, sel ? 136 : 112, 0.95f);
+                OvRR(kx - kr, (float)cy - kr, kr * 2.f, kr * 2.f, kr, 0.f, 255, 255, 255, l.on ? 1.f : 0.88f);
+            } else if (l.ctl == OVC_ACTION) {
+                OvRR((float)(xr - chipW), (float)cy - chipH * .5f, (float)chipW, (float)chipH, chipH * .3f, 0.f, 255, 255, 255, sel ? 0.18f : 0.08f);
+                OvRR((float)(xr - chipW), (float)cy - chipH * .5f, (float)chipW, (float)chipH, chipH * .3f, 1.f, 255, 255, 255, sel ? 0.45f : 0.16f);
+                txt(g_pn.fCap, l.v, xr - chipW / 2, cy, 2, 214, 222, 235, 1.f, 0);
+            } else {
+                const bool off = l.v == "OFF"; int vr = sel ? 246 : 225, vg = sel ? 249 : 230, vb = sel ? 253 : 240; if (off) OvRGB(C_GRAY, vr, vg, vb);
+                int vw = txt(g_pn.fSemi, l.v, xr, cy, 1, vr, vg, vb, 1.f, 0);
+                if (sel) {   // < value >
+                    float cs = m.fs * 0.28f, lx = (float)(xr - vw) - m.fs * 0.75f, rx = (float)xr + m.fs * 0.45f;
+                    OvLn(lx + cs, cy - cs * 1.25f, lx, (float)cy, 1.7f, 150, 200, 255, 1.f); OvLn(lx, (float)cy, lx + cs, cy + cs * 1.25f, 1.7f, 150, 200, 255, 1.f);
+                    OvLn(rx, cy - cs * 1.25f, rx + cs, (float)cy, 1.7f, 150, 200, 255, 1.f); OvLn(rx + cs, (float)cy, rx, cy + cs * 1.25f, 1.7f, 150, 200, 255, 1.f);
+                }
+            }
+            break; }
+        case OVK_SECTION: { int sy = Y + (int)(H * 0.68f); int t_ = txt(g_pn.fCap, l.t, L0, sy, 0, 118, 160, 222, 1.f, 1); int lx0 = L0 + t_ + (int)(m.fs * .7f); if (lx0 < R0) OvRect(lx0, sy, R0, sy + 1, 255, 255, 255, 0.10f); break; }
+        case OVK_TITLE: {
+            int ty = Y + H / 2 - 1; OvRR((float)L0, (float)ty - m.fsTi * .5f, 4.f, (float)m.fsTi, 2.f, 0.f, 96, 165, 250, 1.f);
+            txt(g_pn.fTitle, l.t, L0 + 11, ty, 0, 244, 247, 252, 1.f, 0); txt(g_pn.fHint, l.v, R0, ty + 1, 1, 142, 150, 168, 1.f, 0);
+            int ly = Y + H - 3; int span = std::max(1, R0 - L0); for (int x = L0; x < R0; x++) { float t = (float)(x - L0) / (float)span; OvRect(x, ly, x + 1, ly + 1, 96, 165, 250, 0.55f * (1.f - t) * (1.f - t) + 0.04f); }
+            break; }
+        case OVK_STAT: {
+            if (l.on) { float dr = m.fs * .2f, dx = (float)L0 + m.fs * .3f; OvRR(dx - dr * 2.1f, cy - dr * 2.1f, dr * 4.2f, dr * 4.2f, dr * 2.1f, 0.f, cr, cg, cb, 0.18f); OvRR(dx - dr, cy - dr, dr * 2.f, dr * 2.f, dr, 0.f, cr, cg, cb, 1.f); }
+            txt(g_pn.fReg, l.t, L0 + (int)(m.fs * 1.25f), cy, 0, 150, 158, 175, 1.f, 0);
+            if (l.col == C_TEXT) { cr = 205; cg = 211; cb = 224; } txt(g_pn.fSemi, l.v, R0, cy, 1, cr, cg, cb, 1.f, 0); break; }
+        case OVK_HUD: {
+            if (l.col == C_TEXT) { cr = 244; cg = 247; cb = 252; }
+            txt(g_pn.fReg, l.t, L0, cy, 0, 150, 158, 175, 1.f, 0); int vw = txt(g_pn.fSemi, l.v, R0, cy, 1, cr, cg, cb, 1.f, 0);
+            if (!l.v2.empty()) txt(g_pn.fHint, l.v2, R0 - vw - (int)(m.fs * .7f), cy + 1, 1, 128, 136, 154, 1.f, 0);
+            break; }
+        case OVK_TOAST: { float dr = m.fs * .2f, dx = (float)L0 + m.fs * .3f; OvRR(dx - dr * 2.1f, cy - dr * 2.1f, dr * 4.2f, dr * 4.2f, dr * 2.1f, 0.f, cr, cg, cb, 0.18f); OvRR(dx - dr, cy - dr, dr * 2.f, dr * 2.f, dr, 0.f, cr, cg, cb, 1.f);
+                          txt(g_pn.fSemi, l.t, L0 + (int)(m.fs * 1.25f), cy, 0, cr, cg, cb, 1.f, 0); break; }
+        case OVK_ALERT: { float ir = m.fs * .62f; OvRR((float)L0, cy - ir, ir * 2.f, ir * 2.f, ir, 0.f, 255, 105, 97, 1.f); txt(g_pn.fSemi, "!", L0 + (int)ir, cy, 2, 255, 255, 255, 1.f, 0);
+                          txt(g_pn.fSemi, l.t, L0 + (int)(ir * 2.f + m.fs * .55f), cy, 0, 255, 120, 110, 1.f, 0); break; }
+        case OVK_HINT: if (l.col == C_GRAY) { cr = 128; cg = 136; cb = 154; } txt(g_pn.fHint, l.t, L0, cy, 0, cr, cg, cb, 1.f, 0); break;
+        case OVK_DIV: OvRect(gx + m.pad / 2, cy, gx + innerW - m.pad / 2, cy + 1, 255, 255, 255, 0.10f); break;
+        case OVK_GRAPH: {
+            int g0 = Y + 2, g1 = Y + H - 2; double top = OvDrawGraph(L0, g0, R0, g1, m.fs);
+            if (top > 0.0) { char tb[32]; snprintf(tb, sizeof tb, "%.0f ms", top); txt(g_pn.fHint, tb, L0 + 6, g0 + (int)(m.fsSm * 0.9f), 0, 138, 146, 164, 0.95f, 0); }
+            break; }
+        case OVK_GAP: break;
+        default: if (l.col == C_TEXT) { cr = 214; cg = 219; cb = 230; } txt(g_pn.fReg, l.t, L0, cy, 0, cr, cg, cb, 1.f, 0); break;   // OVK_TEXT / OVK_NOTE
+        }
+    }
+    // ---- composite the text: coverage mask (white on black) tinted per run, drawn over the card
+    GdiFlush();
+    static float cov[256]; static bool covInit = false; if (!covInit) { for (int i = 0; i < 256; i++) cov[i] = powf((float)i / 255.f, 0.85f); covInit = true; }
+    const uint8_t* mk = (const uint8_t*)g_pn.maskBits;
+    for (const TOp& o : ops) {
+        int x0 = std::max(0, o.x), x1 = std::min(w, o.x + o.w), y0 = std::max(0, o.y), y1 = std::min(h, o.y + o.h);
+        for (int yy = y0; yy < y1; yy++) {
+            const uint32_t* mr = (const uint32_t*)(mk + (size_t)yy * g_pn.capW * 4); uint32_t* pr = (uint32_t*)g_pn.bits + (size_t)yy * g_pn.capW;
+            for (int xx = x0; xx < x1; xx++) { uint32_t mp = mr[xx]; if (!(mp & 0xFFFFFFu)) continue; OvBlend(&pr[xx], o.r, o.g, o.b, cov[(mp >> 8) & 255] * o.a); }
+        }
+    }
+    g_pn.valid = true; return true;
 }
 
 // ------------------------------------------------------------------ D3D12 renderer
@@ -366,8 +572,8 @@ static const char* kOvHlsl =
 "}\n"
 "float4 ps(VO i) : SV_Target {\n"
 "    int2 q = int2(i.p.xy - rect.xy);\n"
-"    float3 t = T.Load(int3(q, 0)).rgb * gain;\n"
-"    return float4(t * alpha, alpha);\n"
+"    float4 t = T.Load(int3(q, 0));\n"
+"    return float4(t.rgb * gain * alpha, t.a * alpha);\n"
 "}\n";
 static const int OV_RING = 6, OV_UP = 3;
 static ID3D12RootSignature* g_ovRS = nullptr; static std::map<int, ID3D12PipelineState*> g_ovPso; static std::mutex g_ovPsoMx;
@@ -513,9 +719,9 @@ static bool OvRecordAndSubmit(IDXGISwapChain* sc, bool upload) {
         g_ovTexValid = true; g_ovNeedUpload = false; g_ovUploadedHash = g_pn.hash; g_ovUploadedPx = g_pn.px; g_ovUpVal[us] = g_ovFenceNext + 1; g_ovUpPos = (us + 1) % OV_UP;
     }
     // position of the panel
-    float W = (float)bd.Width, H = (float)bd.Height; float mg = std::max(8.f, (float)g_pn.px * 0.6f); float pw = (float)g_pn.w, ph = (float)g_pn.h; float x, y;
-    switch (g_cfg.overlayPos & 3) { case 1: x = W - pw - mg; y = mg; break; case 2: x = mg; y = H - ph - mg; break; case 3: x = W - pw - mg; y = H - ph - mg; break; default: x = mg; y = mg; }
-    x = floorf(std::max(0.f, x)); y = floorf(std::max(0.f, y));
+    float W = (float)bd.Width, H = (float)bd.Height; float mg = std::max(10.f, (float)g_pn.px * 0.8f); float pw = (float)g_pn.w, ph = (float)g_pn.h; float sh = (float)g_pn.sh, x, y;   // pw/ph include the soft shadow margin 'sh' around the glass card
+    switch (g_cfg.overlayPos & 3) { case 1: x = W - pw - mg + sh; y = mg - sh; break; case 2: x = mg - sh; y = H - ph - mg + sh; break; case 3: x = W - pw - mg + sh; y = H - ph - mg + sh; break; default: x = mg - sh; y = mg - sh; }
+    x = floorf(x); y = floorf(y);
     // draw
     D3D12_RESOURCE_BARRIER b0 = {}; b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b0.Transition.pResource = bb; b0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b0.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT; b0.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     oResBarrier(cl, 1, &b0);
@@ -528,7 +734,7 @@ static bool OvRecordAndSubmit(IDXGISwapChain* sc, bool upload) {
     D3D12_VIEWPORT vp = { 0.f, 0.f, W, H, 0.f, 1.f }; D3D12_RECT sr = { 0, 0, (LONG)bd.Width, (LONG)bd.Height };
     if (oRSSetVP) oRSSetVP(cl, 1, &vp); else cl->RSSetViewports(1, &vp); cl->RSSetScissorRects(1, &sr);
     if (oOMSetRT) oOMSetRT(cl, 1, &rtv, FALSE, nullptr); else cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    struct { float r[4]; float scr[2]; float alpha; float gain; } k = { { x, y, pw, ph }, { W, H }, (float)g_cfg.overlayOpacity / 100.f, rtvFmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 2.5f : 1.0f };
+    struct { float r[4]; float scr[2]; float alpha; float gain; } k = { { x, y, pw, ph }, { W, H }, 1.0f, rtvFmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 2.5f : 1.0f };
     cl->SetGraphicsRoot32BitConstants(0, 8, &k, 0); cl->SetGraphicsRootDescriptorTable(1, GpuStart(g_ovSrvHeap));
     if (oDrawInst) oDrawInst(cl, 4, 1, 0, 0); else cl->DrawInstanced(4, 1, 0, 0);
     b0.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b0.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT; oResBarrier(cl, 1, &b0);
@@ -545,10 +751,18 @@ static void OvDraw(IDXGISwapChain* sc) {
     if (L.empty()) return;
     // font size from the back-buffer height
     double fh = g_dispH ? (double)g_dispH / 1080.0 : 1.0; int px = (int)(18.0 * fh * (double)g_cfg.overlayScale / 100.0 + 0.5); px = std::min(64, std::max(12, px));
-    std::string key; for (auto& l : L) { key += l.t; key += (char)('0' + l.col); key += l.sel ? '*' : '.'; if (l.graph > 0) key += std::to_string((long long)(OvNowMs() / 100.0)); key += '\n'; }   // 1.0.0: a graph is redrawn 10x per second
+    std::string key; for (auto& l : L) { key += l.t; key += '\x01'; key += l.v; key += '\x01'; key += l.v2; key += (char)('0' + l.col); key += l.sel ? '*' : '.'; key += (char)('a' + l.kind); key += (char)('a' + l.ctl); key += l.on ? '1' : '0'; if (l.kind == OVK_GRAPH) key += std::to_string((long long)(OvNowMs() / 100.0)); key += '\n'; }   // 1.0.0: a graph is redrawn 10x per second
+    key += std::to_string(g_cfg.overlayOpacity);
     size_t h = std::hash<std::string>()(key) ^ ((size_t)px << 40);
-    if (h != g_pn.hash || !g_pn.valid || g_pn.px != px) {
-        if (!OvPanelRender(L, px)) return; g_pn.hash = h; g_ovNeedUpload = true;
+    if (h != g_pn.hash || !g_pn.valid || g_pn.reqPx != px) {
+        int use = px;   // a tall menu on a small screen is shrunk until it fits (the user's size setting itself stays untouched)
+        for (int pass = 0; pass < 3; pass++) {
+            if (!OvPanelRender(L, use)) return;
+            double mg = std::max(10.0, use * 0.8), availH = (g_dispH ? (double)g_dispH : 1080.0) - 2.0 * mg, inner = (double)(g_pn.h - 2 * g_pn.sh);
+            if (inner <= availH || use <= 10) break;
+            use = std::max(10, std::min(use - 1, (int)((double)use * availH / inner)));
+        }
+        g_pn.hash = h; g_pn.reqPx = px; g_ovNeedUpload = true;
     }
     if (!OvEnsureGpu(g_pn.capW, g_pn.capH)) { if (++g_ovFail >= 5) { g_ovBroken = true; Log("overlay: GPU resources could not be created -> overlay disabled"); } return; }
     if (g_ovBuild.load() < 0) { g_ovBroken = true; return; }
