@@ -32,3 +32,34 @@ static inline bool CamFindPair(const float* p, int avail, int* ji, int* nj, long
 static inline int CamCollectC2P(const float* p, int avail, int nj, int cand[4]) {
     int nc = 0; for (int q = nj + 16; q + 16 <= avail && nc < 4; q += 4) if (CamLooksLikeC2P(p + q)) cand[nc++] = q; return nc;
 }
+
+// ---- 1.1.6: judge a ClipToPrevClip by its EFFECT, not by the size of its entries.
+// The MV shader does   pc = mul(float4(sp, z, 1), M);   back = sp - pc.xy / pc.w   (row-vector layout, sp = NDC xy, z = reverse-Z depth value).
+// In a narrow-FOV (telephoto) cutscene (m0=11.4, m5=20.3) even a small, perfectly valid camera move gives translation entries of 1..300 (1.1.5 threw those away).
+// So: reproject a grid of screen points at several depths. A real matrix moves every point by a bounded amount (< half the screen = 1.0 NDC);
+// a garbage matrix (random / UI / other-view data) does not. z = near/d for UE's reverse-Z: 0.1 .. 0 = 10x near .. infinity.
+static inline void CamC2pReproj(const float* M, int* valid, int* total, float* farMaxMv) {
+    static const float kX[3] = { -0.9f, 0.f, 0.9f };
+    static const float kZ[5] = { 0.1f, 0.02f, 0.004f, 0.0008f, 0.f };
+    int v = 0, t = 0; float fm = 0.f;
+    for (int zi = 0; zi < 5; zi++) for (int yi = 0; yi < 3; yi++) for (int xi = 0; xi < 3; xi++) {
+        double sx = kX[xi], sy = kX[yi], z = kZ[zi];
+        double px = sx * M[0] + sy * M[4] + z * M[8] + M[12];
+        double py = sx * M[1] + sy * M[5] + z * M[9] + M[13];
+        double pw = sx * M[3] + sy * M[7] + z * M[11] + M[15];
+        t++;
+        if (!(pw > 1e-6) || !std::isfinite(px) || !std::isfinite(py)) continue;
+        double bx = sx - px / pw, by = sy - py / pw;
+        if (!std::isfinite(bx) || !std::isfinite(by)) continue;
+        double m = std::max(fabs(bx), fabs(by));
+        if (zi >= 3 && m > fm) fm = (float)m;
+        if (m <= 1.0) v++;
+    }
+    if (valid) *valid = v; if (total) *total = t; if (farMaxMv) *farMaxMv = fm;
+}
+// plausible = at least 60% of the sample points reproject to a sane place (3 of the 5 depth layers). diag / invertibility checks stay with the caller.
+static inline bool CamC2pReprojOk(const float* M) {
+    for (int i = 0; i < 16; i++) if (!std::isfinite(M[i])) return false;
+    int v = 0, t = 0; CamC2pReproj(M, &v, &t, nullptr);
+    return v * 10 >= t * 6;
+}
