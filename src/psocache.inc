@@ -16,24 +16,35 @@
 //   * The game's own CachedPSO (UE pipeline-library) is never touched: pipelines that already carry a blob are passed through unchanged.
 //
 // File layout (little endian, append-only, every record has its own CRC; a torn last record after a crash is simply cut off)
-//   PsoFileHeader (32 bytes) | { PsoRecHeader (16 bytes) , blob bytes } ...
+//   v2 (1.1.7): PsoFileHeader (32 bytes, version 2) | { PsoRecHeader2 (24 bytes) , stored bytes } ...
+//   v1 (<= 1.1.6): PsoFileHeader (version 1)        | { PsoRecHeader  (16 bytes) , raw blob bytes } ...   (still readable; converted to v2 in the background)
+//
+// Compression (1.1.7, cachecompress=1): the driver blobs are packed with SNLZ (snpack.h) on the background appender thread.  The packed form is what is
+// written to the file AND what stays in RAM; it is unpacked (about 1 GB/s) only when the game asks for exactly that pipeline.  psocachemb limits the STORED
+// bytes, so the same budget now holds roughly twice as many pipelines.  Blobs that do not shrink by at least 6 % are stored raw (method 0).
 #pragma once
 #include <memory>
+#include "snpack.h"
 
 #pragma pack(push, 1)
 struct PsoFileHeader { char magic[4]; uint16_t version; uint16_t headerSize; uint64_t gpuKey; uint64_t reserved0; uint64_t reserved1; };
-struct PsoRecHeader  { uint64_t hash; uint32_t size; uint32_t crc; };
+struct PsoRecHeader  { uint64_t hash; uint32_t size; uint32_t crc; };                                                  // v1 record (read only)
+struct PsoRecHeader2 { uint64_t hash; uint32_t size; uint32_t crc; uint32_t rawSize; uint32_t method; };               // v2: size/crc = the STORED bytes, rawSize = after unpacking, method = snpack::Method
 #pragma pack(pop)
 static_assert(sizeof(PsoFileHeader) == 32, "PsoFileHeader size");
 static_assert(sizeof(PsoRecHeader) == 16, "PsoRecHeader size");
+static_assert(sizeof(PsoRecHeader2) == 24, "PsoRecHeader2 size");
 
 typedef std::shared_ptr<const std::vector<uint8_t>> PsoBlobPtr;
-static std::unordered_map<uint64_t, PsoBlobPtr> g_psoMap; static std::shared_mutex g_psoMx;
-static std::vector<std::pair<uint64_t, PsoBlobPtr>> g_psoPending; static std::mutex g_psoQMx;     // new blobs waiting to be appended to the file
+struct PsoEntry { PsoBlobPtr data; uint32_t raw = 0; uint8_t method = snpack::kStored; };     // data = stored bytes (packed when method != 0), raw = size of the driver blob
+static std::unordered_map<uint64_t, PsoEntry> g_psoMap; static std::shared_mutex g_psoMx;
+static std::vector<std::pair<uint64_t, PsoBlobPtr>> g_psoPending; static std::mutex g_psoQMx;     // new (still raw) blobs waiting to be packed + appended to the file
 static std::atomic<bool> g_psoReady{ false };                  // the cache file has been read (or there is none)
 static HANDLE g_psoReadyEv = nullptr;
-static std::atomic<size_t> g_psoBytes{ 0 };
-static std::atomic<long> g_psoHit{ 0 }, g_psoNew{ 0 }, g_psoRejected{ 0 }, g_psoSkipFull{ 0 }, g_psoSeen{ 0 };
+static std::atomic<size_t> g_psoBytes{ 0 }, g_psoRawBytes{ 0 };   // bytes held in RAM (stored form) / the same pipelines unpacked
+static std::atomic<long> g_psoHit{ 0 }, g_psoNew{ 0 }, g_psoRejected{ 0 }, g_psoSkipFull{ 0 }, g_psoSeen{ 0 }, g_psoCorrupt{ 0 };
+static int g_psoFileVer = 0;                                   // format version of the file we append to (touched only by the cache thread)
+static void SubSat(std::atomic<size_t>& a, size_t v) { size_t c = a.load(); while (!a.compare_exchange_weak(c, c > v ? c - v : 0)) {} }
 static std::wstring g_psoPath; static uint64_t g_psoGpuKey = 0; static bool g_psoFileOk = false;
 
 // root signature identity: hash of the serialized blob, remembered per object (updated on every creation, so a recycled address never keeps a stale hash)
@@ -92,8 +103,21 @@ static uint64_t HashCompDesc(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d) {
 }
 
 // ------------------------------------------------------------------ lookup / store
-static PsoBlobPtr PsoFind(uint64_t key) { std::shared_lock<std::shared_mutex> lk(g_psoMx); auto it = g_psoMap.find(key); return it != g_psoMap.end() ? it->second : PsoBlobPtr(); }
-static void PsoErase(uint64_t key) { std::unique_lock<std::shared_mutex> lk(g_psoMx); auto it = g_psoMap.find(key); if (it != g_psoMap.end()) { g_psoBytes -= std::min(g_psoBytes.load(), it->second->size()); g_psoMap.erase(it); } }
+static void PsoErase(uint64_t key) {
+    std::unique_lock<std::shared_mutex> lk(g_psoMx); auto it = g_psoMap.find(key);
+    if (it != g_psoMap.end()) { SubSat(g_psoBytes, it->second.data->size()); SubSat(g_psoRawBytes, it->second.raw); g_psoMap.erase(it); }
+}
+// Returns the driver blob ready to hand to D3D12 (unpacked when it is stored packed).  A blob that does not unpack is dropped like one the driver rejects.
+static PsoBlobPtr PsoFind(uint64_t key) {
+    PsoEntry e; { std::shared_lock<std::shared_mutex> lk(g_psoMx); auto it = g_psoMap.find(key); if (it == g_psoMap.end()) return PsoBlobPtr(); e = it->second; }
+    if (e.method == snpack::kStored) return e.data;
+    auto out = std::make_shared<std::vector<uint8_t>>(e.raw);
+    if (!snpack::Unpack(e.data->data(), e.data->size(), out->data(), e.raw)) {
+        long n = ++g_psoCorrupt; PsoErase(key); if (n <= 4) Log("pso-cache: a stored pipeline could not be unpacked -> entry dropped, compiling normally");
+        return PsoBlobPtr();
+    }
+    return out;
+}
 static void PsoStore(uint64_t key, ID3D12PipelineState* pso) {
     if (!pso || !key) return;
     const size_t cap = (size_t)g_cfg.psoCacheMB << 20;
@@ -102,10 +126,27 @@ static void PsoStore(uint64_t key, ID3D12PipelineState* pso) {
     size_t n = b->GetBufferSize();
     if (n == 0 || n > (32u << 20)) { b->Release(); return; }
     auto v = std::make_shared<std::vector<uint8_t>>((uint8_t*)b->GetBufferPointer(), (uint8_t*)b->GetBufferPointer() + n); b->Release();
-    PsoBlobPtr p = v;
-    { std::unique_lock<std::shared_mutex> lk(g_psoMx); if (!g_psoMap.emplace(key, p).second) return; }
-    g_psoBytes += n; g_psoNew++;
+    PsoBlobPtr p = v; PsoEntry e; e.data = p; e.raw = (uint32_t)n; e.method = snpack::kStored;       // stays raw until the cache thread has packed it (a few seconds)
+    { std::unique_lock<std::shared_mutex> lk(g_psoMx); if (!g_psoMap.emplace(key, e).second) return; }
+    g_psoBytes += n; g_psoRawBytes += n; g_psoNew++;
     { std::lock_guard<std::mutex> lk(g_psoQMx); g_psoPending.emplace_back(key, p); }
+}
+// cache thread only: packs one raw entry.  Returns false (= keep it raw) when disabled, tiny, or it does not shrink by at least 1/16.
+static bool PsoPackEntry(snpack::Packer& pk, std::vector<uint8_t>& scratch, const PsoEntry& e, PsoEntry& out) {
+    if (!g_cfg.cacheCompress || e.method != snpack::kStored || e.raw < 64) return false;
+    scratch.resize(snpack::Bound(e.raw));
+    size_t pn = pk.Pack(e.data->data(), e.raw, scratch.data(), scratch.size());
+    if (!pn || pn > (size_t)e.raw - e.raw / 16) return false;
+    out.data = std::make_shared<const std::vector<uint8_t>>(scratch.begin(), scratch.begin() + pn); out.raw = e.raw; out.method = snpack::kSnLz; return true;
+}
+static void PsoSwapPacked(uint64_t key, const PsoBlobPtr& oldRaw, const PsoEntry& np) {    // RAM: replace the raw copy by the packed one (only if the entry is still the same)
+    std::unique_lock<std::shared_mutex> lk(g_psoMx); auto it = g_psoMap.find(key);
+    if (it == g_psoMap.end() || it->second.data != oldRaw) return;
+    SubSat(g_psoBytes, oldRaw->size() - np.data->size()); it->second = np;
+}
+static void PsoAppendRec(std::vector<uint8_t>& buf, uint64_t key, const PsoEntry& e) {
+    PsoRecHeader2 rh; rh.hash = key; rh.size = (uint32_t)e.data->size(); rh.crc = Crc32(e.data->data(), e.data->size()); rh.rawSize = e.raw; rh.method = e.method;
+    buf.insert(buf.end(), (uint8_t*)&rh, (uint8_t*)&rh + sizeof rh); buf.insert(buf.end(), e.data->begin(), e.data->end());
 }
 
 // ------------------------------------------------------------------ file
@@ -120,62 +161,101 @@ static bool WriteFileSync(HANDLE h, const void* d, size_t n) { const uint8_t* p 
 static bool WriteNewPsoFile(const std::wstring& p) {
     size_t sl = p.find_last_of(L'\\'); if (sl != std::wstring::npos) CreateDirectoryW(p.substr(0, sl).c_str(), nullptr);
     HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (h == INVALID_HANDLE_VALUE) return false;
-    PsoFileHeader fh = {}; memcpy(fh.magic, "SNPC", 4); fh.version = 1; fh.headerSize = sizeof fh; fh.gpuKey = g_psoGpuKey;
-    bool ok = WriteFileSync(h, &fh, sizeof fh); CloseHandle(h); return ok;
+    PsoFileHeader fh = {}; memcpy(fh.magic, "SNPC", 4); fh.version = 2; fh.headerSize = sizeof fh; fh.gpuKey = g_psoGpuKey;
+    bool ok = WriteFileSync(h, &fh, sizeof fh); CloseHandle(h); if (ok) g_psoFileVer = 2; return ok;
 }
 // returns: 1 = loaded (or empty but valid), 0 = not usable (a new file was started or none can be written)
 static void PsoLoadFile() {
     const size_t cap = (size_t)g_cfg.psoCacheMB << 20; DWORD t0 = GetTickCount();
     for (auto& p : PsoPaths()) {
         HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        bool usable = false; LONGLONG validLen = 0, fileLen = 0; size_t count = 0, bytes = 0;
+        bool usable = false; LONGLONG validLen = 0, fileLen = 0; size_t count = 0, bytes = 0, rawBytes = 0; int ver = 0;
         if (h != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER sz = {}; GetFileSizeEx(h, &sz); fileLen = sz.QuadPart;
             PsoFileHeader fh; const char* why = "";
             if (!ReadExact(h, &fh, sizeof fh)) why = "file too small";
-            else if (memcmp(fh.magic, "SNPC", 4) != 0 || fh.version != 1 || fh.headerSize != sizeof fh) why = "unknown format";
+            else if (memcmp(fh.magic, "SNPC", 4) != 0 || (fh.version != 1 && fh.version != 2) || fh.headerSize != sizeof fh) why = "unknown format";
             else if (fh.gpuKey != g_psoGpuKey) why = "GPU or driver changed (cached blobs are driver specific)";
-            else usable = true;
+            else { usable = true; ver = fh.version; }
             if (!usable) Log("pso-cache: %s -> starting a new file", why);
             else {
                 validLen = sizeof fh; std::unique_lock<std::shared_mutex> lk(g_psoMx);
+                const LONGLONG hs = ver == 2 ? (LONGLONG)sizeof(PsoRecHeader2) : (LONGLONG)sizeof(PsoRecHeader);
                 for (;;) {
-                    PsoRecHeader rh; if (!ReadExact(h, &rh, sizeof rh)) break;
-                    if (rh.size == 0 || rh.size > (32u << 20) || (LONGLONG)rh.size > fileLen - validLen - (LONGLONG)sizeof rh) break;
-                    std::vector<uint8_t> d(rh.size); if (!ReadExact(h, d.data(), d.size())) break;
-                    if (Crc32(d.data(), d.size()) != rh.crc) break;
-                    validLen += sizeof rh + rh.size;
-                    if (bytes + d.size() > cap) { g_psoSkipFull++; continue; }
-                    bytes += d.size(); count++; g_psoMap[rh.hash] = std::make_shared<const std::vector<uint8_t>>(std::move(d));
+                    uint64_t hash; uint32_t stored, crc, raw, method;
+                    if (ver == 2) { PsoRecHeader2 rh; if (!ReadExact(h, &rh, sizeof rh)) break; hash = rh.hash; stored = rh.size; crc = rh.crc; raw = rh.rawSize; method = rh.method; }
+                    else { PsoRecHeader rh; if (!ReadExact(h, &rh, sizeof rh)) break; hash = rh.hash; stored = rh.size; crc = rh.crc; raw = rh.size; method = snpack::kStored; }
+                    if (stored == 0 || stored > (32u << 20) || raw == 0 || raw > (32u << 20) || method > snpack::kSnLz || (LONGLONG)stored > fileLen - validLen - hs) break;
+                    if (method == snpack::kStored ? raw != stored : stored >= raw) break;            // a packed record is always smaller than its raw size
+                    std::vector<uint8_t> d(stored); if (!ReadExact(h, d.data(), d.size())) break;
+                    if (Crc32(d.data(), d.size()) != crc) break;
+                    validLen += hs + stored;
+                    if (bytes + stored > cap) { g_psoSkipFull++; continue; }
+                    auto old = g_psoMap.find(hash); if (old != g_psoMap.end()) { bytes -= old->second.data->size(); rawBytes -= old->second.raw; count--; }   // same pipeline twice (race / interrupted run): the newer record wins
+                    PsoEntry e; e.data = std::make_shared<const std::vector<uint8_t>>(std::move(d)); e.raw = raw; e.method = (uint8_t)method;
+                    bytes += stored; rawBytes += raw; count++; g_psoMap[hash] = std::move(e);
                 }
             }
             CloseHandle(h);
         }
         if (usable) {
             if (validLen < fileLen) { HANDLE w = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr); if (w != INVALID_HANDLE_VALUE) { LARGE_INTEGER pos; pos.QuadPart = validLen; SetFilePointerEx(w, pos, nullptr, FILE_BEGIN); SetEndOfFile(w); CloseHandle(w); Log("pso-cache: cut %lld bytes of damaged data from the end of the file", fileLen - validLen); } }
-            g_psoBytes = bytes; g_psoPath = p; g_psoFileOk = true;
-            LogW((L"pso-cache loaded: " + p).c_str()); Log("pso-cache: %u pipelines, %u MB, read in %u ms (they will be handed to the driver instead of being compiled)", (unsigned)count, (unsigned)(bytes >> 20), (unsigned)(GetTickCount() - t0));
+            g_psoBytes = bytes; g_psoRawBytes = rawBytes; g_psoPath = p; g_psoFileOk = true; g_psoFileVer = ver;
+            LogW((L"pso-cache loaded: " + p).c_str()); Log("pso-cache: %u pipelines, %u MB in RAM (%u MB unpacked), read in %u ms (they will be handed to the driver instead of being compiled)", (unsigned)count, (unsigned)(bytes >> 20), (unsigned)(rawBytes >> 20), (unsigned)(GetTickCount() - t0));
+            if (ver == 1) Log("pso-cache: old file format (v1, uncompressed) -> it is converted to the compressed v2 format in the background");
             return;
         }
-        if (WriteNewPsoFile(p)) { g_psoPath = p; g_psoFileOk = true; { std::unique_lock<std::shared_mutex> lk(g_psoMx); g_psoMap.clear(); } g_psoBytes = 0; LogW((L"pso-cache: new file " + p).c_str()); return; }
+        if (WriteNewPsoFile(p)) { g_psoPath = p; g_psoFileOk = true; { std::unique_lock<std::shared_mutex> lk(g_psoMx); g_psoMap.clear(); } g_psoBytes = 0; g_psoRawBytes = 0; LogW((L"pso-cache: new file " + p).c_str()); return; }
     }
     Log("pso-cache: no writable location (game folder read-only and no LOCALAPPDATA?) - the pipeline cache is kept in memory only");
 }
-static void PsoFlush() {
+// appender: packs the new blobs (RAM, and file when there is one) and appends them as v2 records
+static void PsoFlush(snpack::Packer& pk) {
     std::vector<std::pair<uint64_t, PsoBlobPtr>> q;
     { std::lock_guard<std::mutex> lk(g_psoQMx); q.swap(g_psoPending); }
-    if (q.empty() || !g_psoFileOk) return;
-    HANDLE h = CreateFileW(g_psoPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { Log("pso-cache: cannot append to the cache file (0x%08X)", (unsigned)GetLastError()); return; }
-    std::vector<uint8_t> buf; bool ok = true; size_t total = 0;
+    if (q.empty()) return;
+    HANDLE h = INVALID_HANDLE_VALUE;                      // no file (read-only location): the blobs are still packed in RAM, so psocachemb goes just as far
+    if (g_psoFileOk) { h = CreateFileW(g_psoPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr); if (h == INVALID_HANDLE_VALUE) Log("pso-cache: cannot append to the cache file (0x%08X)", (unsigned)GetLastError()); }
+    std::vector<uint8_t> buf, scratch; bool ok = true; size_t total = 0, rawTotal = 0, nPacked = 0;
     for (auto& e : q) {
-        PsoRecHeader rh; rh.hash = e.first; rh.size = (uint32_t)e.second->size(); rh.crc = Crc32(e.second->data(), e.second->size());
-        buf.insert(buf.end(), (uint8_t*)&rh, (uint8_t*)&rh + sizeof rh); buf.insert(buf.end(), e.second->begin(), e.second->end());
+        PsoEntry cur; cur.data = e.second; cur.raw = (uint32_t)e.second->size(); PsoEntry np;
+        const bool packed = PsoPackEntry(pk, scratch, cur, np);
+        if (packed) { PsoSwapPacked(e.first, e.second, np); nPacked++; }
+        rawTotal += cur.raw;
+        if (h == INVALID_HANDLE_VALUE) continue;
+        PsoAppendRec(buf, e.first, packed ? np : cur);
         if (buf.size() >= (8u << 20)) { ok = ok && WriteFileSync(h, buf.data(), buf.size()); total += buf.size(); buf.clear(); }
     }
-    if (!buf.empty()) { ok = ok && WriteFileSync(h, buf.data(), buf.size()); total += buf.size(); }
-    CloseHandle(h);
-    Log("pso-cache: +%u pipelines appended (%u KB) | total %u MB | hits %ld new %ld rejected %ld of %ld created%s", (unsigned)q.size(), (unsigned)(total >> 10), (unsigned)(g_psoBytes.load() >> 20), g_psoHit.load(), g_psoNew.load(), g_psoRejected.load(), g_psoSeen.load(), ok ? "" : " (WRITE ERROR)");
+    if (h != INVALID_HANDLE_VALUE) { if (!buf.empty()) { ok = ok && WriteFileSync(h, buf.data(), buf.size()); total += buf.size(); } CloseHandle(h); }
+    Log("pso-cache: +%u pipelines (%u KB unpacked, %u packed, %u KB written) | total %u MB in RAM (%u MB unpacked) | hits %ld new %ld rejected %ld of %ld created%s", (unsigned)q.size(), (unsigned)(rawTotal >> 10), (unsigned)nPacked, (unsigned)(total >> 10), (unsigned)(g_psoBytes.load() >> 20), (unsigned)(g_psoRawBytes.load() >> 20), g_psoHit.load(), g_psoNew.load(), g_psoRejected.load(), g_psoSeen.load(), ok ? "" : " (WRITE ERROR)");
+}
+// appender, once per start with a v1 file: rewrites the whole cache as a compressed v2 file (tmp file + atomic rename).  The game keeps running; RAM shrinks as entries get packed.
+static void PsoCompact(snpack::Packer& pk) {
+    DWORD t0 = GetTickCount();
+    std::vector<std::pair<uint64_t, PsoEntry>> snap;
+    { std::shared_lock<std::shared_mutex> lk(g_psoMx); snap.reserve(g_psoMap.size()); for (auto& kv : g_psoMap) snap.emplace_back(kv.first, kv.second); }
+    std::unordered_map<uint64_t, const void*> inFile; inFile.reserve(snap.size()); for (auto& kv : snap) inFile[kv.first] = kv.second.data.get();   // identity of every raw blob that goes into the new file
+    std::wstring tmp = g_psoPath + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { static std::atomic<bool> once{ false }; if (!once.exchange(true)) Log("pso-cache: cannot create the temporary file for the format conversion (0x%08X) - will retry", (unsigned)GetLastError()); return; }
+    PsoFileHeader fh = {}; memcpy(fh.magic, "SNPC", 4); fh.version = 2; fh.headerSize = sizeof fh; fh.gpuKey = g_psoGpuKey;
+    std::vector<uint8_t> buf, scratch; bool ok = WriteFileSync(h, &fh, sizeof fh); size_t outBytes = sizeof fh, rawBytes = 0, sinceYield = 0;
+    for (auto& kv : snap) {
+        PsoEntry np; const bool packed = PsoPackEntry(pk, scratch, kv.second, np);
+        const PsoEntry& w = packed ? np : kv.second;
+        PsoAppendRec(buf, kv.first, w); outBytes += sizeof(PsoRecHeader2) + w.data->size(); rawBytes += w.raw;
+        if (packed) { PsoSwapPacked(kv.first, kv.second.data, np); if ((sinceYield += kv.second.raw) >= (4u << 20)) { sinceYield = 0; Sleep(1); } }   // low priority + short naps: never starve the game
+        kv.second.data.reset();                          // the map holds the packed copy now: let go of the raw one right away (keeps the RAM peak of the conversion low)
+        if (buf.size() >= (8u << 20)) { ok = WriteFileSync(h, buf.data(), buf.size()); buf.clear(); if (!ok) break; }
+    }
+    if (ok && !buf.empty()) ok = WriteFileSync(h, buf.data(), buf.size());
+    if (ok) FlushFileBuffers(h); CloseHandle(h);
+    if (ok && MoveFileExW(tmp.c_str(), g_psoPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        g_psoFileVer = 2;
+        { std::lock_guard<std::mutex> lk(g_psoQMx);       // pipelines stored while we were writing and already part of the snapshot are in the new file: do not append them a second time
+            g_psoPending.erase(std::remove_if(g_psoPending.begin(), g_psoPending.end(), [&](const std::pair<uint64_t, PsoBlobPtr>& e) { auto it = inFile.find(e.first); return it != inFile.end() && it->second == e.second.get(); }), g_psoPending.end()); }
+        Log("pso-cache: converted to the compressed v2 format: %u pipelines, %u MB unpacked -> %u MB on disk (%.0f%%) in %u ms", (unsigned)snap.size(), (unsigned)(rawBytes >> 20), (unsigned)(outBytes >> 20), rawBytes ? 100.0 * (double)outBytes / (double)rawBytes : 100.0, (unsigned)(GetTickCount() - t0));
+    } else { DeleteFileW(tmp.c_str()); static std::atomic<bool> once{ false }; if (!once.exchange(true)) Log("pso-cache: format conversion failed (disk full?) - the old file is kept, will retry"); }
 }
 
 // ------------------------------------------------------------------ GPU/driver key (same adapter pick as the shader warm-up)
@@ -188,11 +268,13 @@ static DWORD WINAPI PsoCacheThread(LPVOID) {
         PsoLoadFile();
     } catch (...) { Log("pso-cache: exception while loading (ignored)"); }
     g_psoReady = true; SetEvent(g_psoReadyEv);
-    DWORD lastLog = GetTickCount();
-    for (;;) {                                          // appender: new pipelines are written in the background, never on a render / RHI thread
-        Sleep(15000);
-        try { size_t pend; { std::lock_guard<std::mutex> lk(g_psoQMx); pend = g_psoPending.size(); } if (pend) PsoFlush(); } catch (...) {}
-        (void)lastLog;
+    snpack::Packer packer;                              // work tables of the compressor (owned by this thread only)
+    for (;;) {                                          // appender: new pipelines are packed + written in the background, never on a render / RHI thread
+        Sleep(g_psoFileOk && g_psoFileVer != 2 ? 3000 : 15000);
+        try {
+            if (g_psoFileOk && g_psoFileVer != 2) PsoCompact(packer);        // old v1 file: convert it (the entries stay usable in RAM the whole time)
+            else { size_t pend; { std::lock_guard<std::mutex> lk(g_psoQMx); pend = g_psoPending.size(); } if (pend) PsoFlush(packer); }
+        } catch (...) {}
     }
     return 0;
 }
