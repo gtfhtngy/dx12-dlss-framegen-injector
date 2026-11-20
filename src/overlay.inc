@@ -93,12 +93,12 @@ static void OvUpdateStats() {
 
 // ------------------------------------------------------------------ diagnostics glue
 static void DiagRuntimeFill(DiagRuntime& rt) {
-    rt.frame = g_frame.load(); rt.warmup = g_cfg.warmup; rt.busyFrames = g_busyFrames.load(); rt.scene3dFrames = g_scene3dFrames.load(); int cf = g_camFrame.load(); rt.camAge = cf >= 0 ? rt.frame - cf : -1;
+    rt.frame = g_frame.load(); rt.warmup = g_cfg.warmup; rt.busyFrames = g_busyFrames.load(); rt.scene3dFrames = g_scene3dFrames.load(); int cf = g_cam.camFrame.load(); rt.camAge = cf >= 0 ? rt.frame - cf : -1;
     rt.fgWanted = g_cfg.fg && g_cfg.stage >= 2; rt.everOn = g_everOn; rt.wasOn = g_wasOn; rt.susp = g_fgSusp; rt.compatBlocked = g_compatBlocked.load(); rt.stage = g_cfg.stage;
     rt.slInit = g_slInitOk; rt.slDev = g_slDevSet; rt.slRuntime = g_slRuntimeOk; rt.haveQueue = g_queue != nullptr; rt.haveDevice = g_device != nullptr;
-    rt.depthPinned = g_pinDepth != nullptr; rt.velPinned = g_pinVel != nullptr; rt.velDummy = g_pinVel && g_pinVel == g_dummyVel; rt.camLocked = g_camLocked.load() != 0;
+    rt.depthPinned = g_pinDepth != nullptr; rt.velPinned = g_pinVel != nullptr; rt.velDummy = g_pinVel && g_pinVel == g_dummyVel; rt.camLocked = g_cam.locked.load() != 0;
     rt.mvReady = g_mvPSO && g_mvOutA[0]; rt.mvFailed = g_mvFailed && !g_mvPreIniting.load(); rt.d3d12Swap = g_swapD3D12;
-    rt.projSeen = g_projSeen.load(); rt.scanRuns = g_scanRuns.load(); rt.tagRes = g_lastTagRes; rt.constRes = g_lastConstRes; rt.optRes = g_lastOptRes;
+    rt.projSeen = g_cam.projSeen.load(); rt.scanRuns = g_cam.scanRuns.load(); rt.tagRes = g_lastTagRes; rt.constRes = g_lastConstRes; rt.optRes = g_lastOptRes;
     rt.status = g_lastStatus; rt.haveState = g_haveState; rt.ratio = g_fgRatio.load(); rt.baseFps = g_st.fps; rt.maxGen = g_maxGen; rt.minWH = g_stMinWH; rt.vramMB = g_stVramMB;
     rt.projOff = g_cfg.projOff; rt.noaaOff = g_cfg.noAAOff; rt.mvOff = g_cfg.mvOff; rt.effW = g_effW.load(); rt.effH = g_effH.load();
     rt.dispW = g_dispW; rt.dispH = g_dispH; rt.bufCount = g_scBufs; rt.fmt = g_scFmt; rt.swapEffect = g_scEffect; rt.why = g_whyNot; rt.focused = OvForegroundIsUs();
