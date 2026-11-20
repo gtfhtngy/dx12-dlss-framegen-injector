@@ -27,4 +27,23 @@ echo "== camera scan self test"
 tests/bin/replay_viewbuf --selftest
 echo "== replay of recorded dumps (tests/data/*.txt, first line '# expect: PROJ NOAA MV')"
 for f in tests/data/*.txt; do [ -f "$f" ] && tests/bin/replay_viewbuf "$f"; done
+echo "== camtrace format (SNCT v1)"
+$CXX -std=c++17 -O1 -Wall -Wextra -o tests/bin/test_camtrace tests/test_camtrace.cpp
+tests/bin/test_camtrace
+if command -v python3 >/dev/null 2>&1; then
+  echo "== camera tracker (step 5): CamTracker::Parse / Frame = the REAL text of src/main.cpp (SN_EXTRACT markers), built in TRACKER mode (-DSN_CAM_USE_TRACKER) on a Linux shim"
+  python3 tests/camera_seq/extract_camera_code.py src tests/bin && python3 tests/camera_seq/extract_camera_code.py src tests/bin camhold
+  $CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -DSN_CAM_USE_TRACKER -Itests/bin -o tests/bin/test_extract_smoke tests/camera_seq/test_extract_smoke.cpp
+  for sc in strict lock5 scan_no_budget hits_cleared_on_lock; do tests/bin/test_extract_smoke $sc; done
+  echo "== camera tracker: SNCT sequence replay (REAL Parse + Frame), typed events cross-checked against the log-derived events"
+  $CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -DSN_CAM_USE_TRACKER -Itests/bin -o tests/bin/replay_seq tests/camera_seq/replay_seq.cpp
+  for sc in mislock12752 alt_views c2p_never_moved c2p_monitor_needs_lock hard_cut hold_then_return hold_long_reset rescan_giveup; do tests/bin/replay_seq $sc; done
+  echo "== sparse-vs-full gate (recorder rule vs full buffers, on generated sequences + every tests/data dump)"
+  tests/bin/replay_seq --gate tests/data
+  echo "== camtracker layout: no mutable static left in the regions, members declared, no legacy global in the host; default state; host-apply of results"
+  python3 tests/camera_seq/check_state_inventory.py tests/bin src/camtracker.h tests/camera_seq/cam_shim.h src
+  $CXX -std=c++17 -O1 -Wall -Wextra -Wno-misleading-indentation -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Itests/bin -o tests/bin/test_camtracker_layout tests/camera_seq/test_camtracker_layout.cpp
+  tests/bin/test_camtracker_layout
+  $CXX -std=c++17 -Wall -Wextra -Wno-misleading-indentation -Wno-unused-function -Wno-unused-variable -fsyntax-only -DSN_CAM_USE_TRACKER -Itests/bin tests/camera_seq/check_compat_tracker_syntax.cpp
+else echo "(python3 not found - camera tracker extraction tests skipped)"; fi
 echo "ALL TESTS PASSED"
