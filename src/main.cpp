@@ -359,8 +359,8 @@ static bool GetSubState(void* r, UINT sub, UINT* st) { std::lock_guard<std::mute
 // ---- camera / jitter from the UE4 view uniform buffer (upload heap buffers are mapped once and kept)
 struct BufInfo { UINT64 size = 0; ID3D12Resource* res = nullptr; BYTE* map = nullptr; std::atomic<int> lastUse{0}; UINT64 seq = 0; };
 static std::map<UINT64, BufInfo> g_bufs; static std::shared_mutex g_bufMx;
-static float g_vtcNoAA[16] = {}, g_c2p[16] = {}; static float g_jitPX = 0.f, g_jitPY = 0.f; static float g_jitNX = 0.f, g_jitNY = 0.f;   // v20: g_jitN* = jitter in NDC*0.5 (scaled by the CURRENT view size in BuildConstants, dynamic resolution changes it every frame)
-static std::atomic<int> g_camFrame{-1}; static std::mutex g_camMx; static std::atomic<int> g_camRescan{0};   // v24: 1 = camera lost for a while: relaxed checks + scanning even though the offsets were locked before
+#include "camtracker.h"   // step 5: ALL camera tracker state (camFrame, locked, camMx, vtcNoAA, c2p, jitter, scan/monitor/cut/hold state) is one object; bodies below between the SN_EXTRACT markers
+static CamTracker g_cam;   // v20: g_cam.jitN* = jitter in NDC*0.5 (scaled by the CURRENT view size in BuildConstants, dynamic resolution changes it every frame); v24: g_cam.camRescan = 1: camera lost for a while: relaxed checks + scanning even though the offsets were locked before
 // The registry keeps one reference to every upload buffer (>=64 KB) so the mapped pointer stays valid.
 // v13 never let go of them: after a long session the 4096-entry cap was full of buffers the game had destroyed long ago,
 // NEW constant-buffer pages were no longer registered -> the view buffer was "not found" -> frame generation flapped on/off (stutter + ghosting).
@@ -427,11 +427,8 @@ static void RegisterUploadBuf(ID3D12Resource* r) {
     auto& e = g_bufs[r->GetGPUVirtualAddress()];
     e.size = d.Width; e.res = r; e.map = (BYTE*)ptr; e.lastUse.store(g_frame.load()); e.seq = ++g_regSeq; g_bufBytes += d.Width;
 }
-static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0}, g_projSeen{0}, g_scanRuns{0}; static std::atomic<int> g_camLocked{0};
-static std::atomic<int> g_lastJitFrame{-1000};
-static bool IsProj(const float* m, bool loose) { return CamIsProj(m, loose, (float)EffW() / (float)EffH()); }   // v27: pure part lives in camcore.h
-static bool LooksLikeC2P(const float* c) { return CamLooksLikeC2P(c); }
-// Auto-detect: find ViewToClip (jittered) + ViewToClipNoAA (+16..64 floats later) + ClipToPrevClip (identity-like) in a UE4 view uniform buffer
+static std::atomic<long> g_cbvCalls{0}, g_cbvMiss{0};   // ProbeView statistics (split from the camera state in step 5: they are NOT tracker state)
+// DumpViewBuf: file I/O, stays in the host (the tracker calls it through CamEnv::dumpViewBuf)
 static void DumpViewBuf(const float* p, int avail, UINT64 off, const char* why) {
     static int nd = 0, lastFr = -100000; int fr = g_frame.load();
     if (nd >= 4 || fr < 300 || fr - lastFr < 300) return;
@@ -441,44 +438,11 @@ static void DumpViewBuf(const float* p, int avail, UINT64 off, const char* why) 
     for (int i = 0; i + 4 <= avail; i += 4) fprintf(f, "%4d: %.8g %.8g %.8g %.8g\n", i, p[i], p[i + 1], p[i + 2], p[i + 3]);
     fclose(f); Log("cam-scan: wrote view-buffer dump %d to SN_DLSSG_viewbuf.txt (move/rotate the camera a bit before the next one)", nd);
 }
-static int g_c2pCand[4] = { -1, -1, -1, -1 }; static int g_c2pCandN = 0;   // v21: identity-like matrices found after ViewToClipNoAA at lock time (float offsets)
-static void ScanViewBuffer(const float* p, int avail, UINT64 off) {
-    static int s_frame = -1, s_budget = 0; int fr = g_frame.load();
-    if (fr != s_frame) { s_frame = fr; s_budget = 24; }   // v16: was 600 full-buffer scans per frame if (s_budget-- <= 0) return;
-    g_scanRuns++;
-    int ji = -1, nj = -1;
-    { long ps = 0; CamFindPair(p, avail, &ji, &nj, &ps); g_projSeen += ps; }   // v27: pure core in camcore.h
-    if (ji < 0) {
-        static unsigned seen[16]; static int nseen = 0, nlog = 0; unsigned h = 2166136261u; int cnt = 0; char line[900]; int len = 0; line[0] = 0;
-        for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(p + i, true)) { cnt++; h = (h ^ (unsigned)i) * 16777619u; if (len < 760) len += snprintf(line + len, sizeof line - len, " [%d: m0=%.4f m5=%.4f m8=%.5f m9=%.5f m10=%.3f m11=%.1f m14=%.3f]", i, p[i], p[i + 5], p[i + 8], p[i + 9], p[i + 10], p[i + 11], p[i + 14]); }
-        int jc = 0; for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(p + i, true) && (p[i + 8] != 0.f || p[i + 9] != 0.f)) jc++;
-        if (jc >= 2) DumpViewBuf(p, avail, off, "2+ jittered projections, no NoAA pair");
-        if (cnt > 0 && nlog < 25) { bool dup = false; for (int q = 0; q < nseen; q++) if (seen[q] == h) dup = true; if (!dup) { if (nseen < 16) seen[nseen++] = h; nlog++; Log("cam-scan: no jittered/NoAA pair, but %d projection-like matrices (buffer offset %llu, avail %d floats):%s", cnt, (unsigned long long)off, avail, line); } }
-        return;
-    }
-    // v18: collect up to 4 identity-like matrices after ViewToClipNoAA (UE5 has more matrices in front of / behind ClipToPrevClip); c2pidx picks one (default: the first = UE4 behaviour)
-    int k = -1; { int cand[4]; int nc = 0; static bool s_listed = false; int need = 4;   // v21: always collect all 4 (the monitor below needs every candidate)
-      (void)need; nc = CamCollectC2P(p, avail, nj, cand);
-      if (!s_listed && nc > 0) { s_listed = true; char l[700]; int ln = 0; l[0] = 0;
-        for (int i = 0; i < nc && ln < 600; i++) { const float* c = p + cand[i]; ln += snprintf(l + ln, sizeof l - ln, " #%d@%d[diag %.4f %.4f %.4f %.4f | z-row xy %.5f %.5f | trans xy %.5f %.5f]", i, cand[i], c[0], c[5], c[10], c[15], c[8], c[9], c[12], c[13]); }
-        Log("cam-scan: identity-like matrices after ViewToClipNoAA:%s  -> c2pidx=%d", l, g_cfg.c2pIdx); }
-      for (int i = 0; i < nc; i++) g_c2pCand[i] = cand[i]; g_c2pCandN = nc;
-      if (g_cfg.c2pIdx < nc) k = cand[g_cfg.c2pIdx]; }
-    static int n = 0; static int li = -1, lj = -1, lk = -1, hits = 0;
-    if (k < 0) { DumpViewBuf(p, avail, off, "pair found, no ClipToPrevClip"); if (n++ < 10) Log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)off, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
-    if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (n++ < 20) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
-    if (hits >= 5 && !SnScanMayLock(g_camFrame.load(), fr, g_camRescan.load() != 0, 90)) {   // 1.1.7: the current offsets still deliver the camera -> this is some other buffer, do NOT lock / save it
-        static int s_nl = 0; if (s_nl++ < 5) Log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d ignored - the current offsets (proj=%d noaa=%d mv=%d) still deliver the camera (age %d)", ji, nj, k, g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, fr - g_camFrame.load());
-        hits = 0; return; }
-    if (hits >= 5) {
-        g_cfg.projOff = ji; g_cfg.noAAOff = nj; g_cfg.mvOff = k; g_camLocked = 1; if (g_cfg.autoLearn) { CfgSetInt("projoff", ji); CfgSetInt("noaaoff", nj); CfgSetInt("mvoff", k); } if (g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at projoff=%d noaaoff=%d mvoff=%d", ji, nj, k);
-        Log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> saved to SN_DLSSG_cfg.txt automatically (autolearn=1) so the next start skips the scan", ji, nj, k);
-    }
-}
-
-// ---- "legacy" UE4 view-buffer layout (CODE VEIN 1; found from the raw dumps): no ClipToPrevClip / ViewToClipNoAA in the buffer.
-//   float index: 16 WorldToClip(jittered) | 96 ViewToClip(jittered) | 252 PrevViewProj(prev jitter) | 456 TemporalAAJitter(cur xy, prev xy) | 472 ViewSizeAndInvSize
-//   ClipToPrevClip (no-AA) is built here: C = inverse(WorldToClip_noAA) * PrevViewProj_noAA   (row-vector convention like UE)
+static const CamEnv& CamHostEnv() { static const CamEnv e = [] { CamEnv x; x.cfg = &g_cfg; x.frame = &g_frame; x.effW = EffW; x.effH = EffH; x.log = Log; x.dumpViewBuf = DumpViewBuf; return x; }(); return e; }
+// SN_EXTRACT_BEGIN camera   (tests/camera_seq/extract_camera_code.py cuts this region out; keep the markers when editing)
+// Step 5: the 1.1.7 camera tracker, MOVED (not rewritten) into CamTracker::Parse and its helpers. State = members of CamTracker (src/camtracker.h); host globals are reached only
+// through `env` (config, g_frame, EffW/EffH, Log, DumpViewBuf); what used to be written to the host (g_forceReset, g_cfg offsets, CfgSetInt) is reported in CamParseResult.
+// Pure helpers (no state) stay free functions. The host applies the result right after the call (CamHostApply).
 static bool Inv4d(const double* m, double* out) {
     double a[4][8]; for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { a[r][c] = m[r * 4 + c]; a[r][4 + c] = (r == c) ? 1.0 : 0.0; }
     for (int i = 0; i < 4; i++) {
@@ -491,44 +455,6 @@ static bool Inv4d(const double* m, double* out) {
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][4 + c];
     return true;
 }
-static std::atomic<int> g_lastRealViewFrame{-100000};
-static bool TryLegacyLayout(const float* p, int availF) {
-    if (availF < 480) return false;
-    const float* a = p + 96;
-    if (!IsProj(a, false)) return false;
-    if (fabsf(p[456] - a[8]) > 1e-7f || fabsf(p[457] - a[9]) > 1e-7f) return false;                 // TemporalAAJitter must match the projection
-    if (!(p[472] >= 320.f && p[473] >= 200.f) || fabsf(p[472] / p[473] - a[5] / a[0]) > 0.05f) return false;   // ViewSizeAndInvSize consistent with the projection aspect
-    if (fabsf(p[458]) > 0.02f || fabsf(p[459]) > 0.02f || !std::isfinite(p[458]) || !std::isfinite(p[459])) return false;
-    for (int i = 0; i < 16; i++) if (!std::isfinite(p[16 + i]) || !std::isfinite(p[252 + i])) return false;
-    // main camera vs. dummy identity view (UI / default view): identity rotation + zero pre-view translation
-    static const float kRot[16] = { 0,0,1,0, 1,0,0,0, 0,1,0,0, 0,0,0,1 };
-    bool dummy = !memcmp(p + 32, kRot, sizeof kRot) && !memcmp(p, p + 16, 64);
-    int fr = g_frame.load();
-    if (!dummy) g_lastRealViewFrame = fr; else if (fr - g_lastRealViewFrame < 120) return true;   // a real view was seen recently: ignore the dummy view (return true = handled)
-    double W[16], Wp[16], Wi[16], C[16];
-    double jx = p[456], jy = p[457], pjx = p[458], pjy = p[459];
-    for (int i = 0; i < 16; i++) { W[i] = p[16 + i]; Wp[i] = p[252 + i]; }
-    for (int r = 0; r < 4; r++) { W[r * 4 + 0] -= W[r * 4 + 3] * jx; W[r * 4 + 1] -= W[r * 4 + 3] * jy; Wp[r * 4 + 0] -= Wp[r * 4 + 3] * pjx; Wp[r * 4 + 1] -= Wp[r * 4 + 3] * pjy; }
-    if (!Inv4d(W, Wi)) return true;
-    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { double v = 0; for (int k = 0; k < 4; k++) v += Wi[r * 4 + k] * Wp[k * 4 + c]; C[r * 4 + c] = v; }
-    float c2p[16], vtc[16]; for (int i = 0; i < 16; i++) { c2p[i] = (float)C[i]; if (!std::isfinite(c2p[i]) || fabsf(c2p[i]) > 1e6f) return true; }
-    memcpy(vtc, a, sizeof vtc); vtc[8] = 0.f; vtc[9] = 0.f;   // ViewToClipNoAA = ViewToClip without the jitter
-    { std::lock_guard<std::mutex> lk2(g_camMx);
-      memcpy(g_vtcNoAA, vtc, sizeof g_vtcNoAA); memcpy(g_c2p, c2p, sizeof g_c2p);
-      g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY; g_jitNX = a[8] * 0.5f * (float)g_cfg.jitSX; g_jitNY = -a[9] * 0.5f * (float)g_cfg.jitSY;
-      g_camFrame = fr; }
-    if (g_lastJitFrame < fr) g_lastJitFrame = fr;
-    static int n = 0; if (n++ < 8) Log("camera(legacy layout): frame=%d %s jitter px=(%.4f,%.4f) m0=%.5f m5=%.5f near=%.3f viewsize=%.0fx%.0f c2p diag=%.5f %.5f %.5f %.5f", fr, dummy ? "DUMMY-identity-view" : "main-view", g_jitPX, g_jitPY, a[0], a[5], a[14], p[472], p[473], c2p[0], c2p[5], c2p[10], c2p[15]);
-    return true;
-}
-// ---- v21: c2p monitor. The scan locks onto an identity-like matrix while the camera is still (menu / first frames) - at that moment ALL candidates look identical, so the
-// choice is a guess. If the chosen matrix is not the real ClipToPrevClip (e.g. a constant placeholder), frame generation gets zero camera motion for the static scenery and the
-// generated frames show the world NOT following the camera (judder / rubber-band / swimming = "the camera does things it should not"). The monitor measures, per candidate,
-// how far it is from identity while the game runs. The DLL itself only READS these matrices (it has no way to move the camera).
-struct C2pStat { int active = 0; double maxDev = 0.0; double minDev = 1e9; double sumDev = 0.0; int bad = 0; };   // v23: + minDev / bad (implausible frames)
-static C2pStat g_c2pSt[4]; static int g_c2pStFrames = 0, g_c2pLastFrame = -1, g_c2pWinStart = 0;
-// v23: a real ClipToPrevClip is ~identity (diagonal ~1) for any sane camera move. The Silent Hill Townfall (UE5) log showed the USED candidate (#0@256, an identity placeholder in the
-// menu) turn into a CONSTANT diag(0.136,0.136,0.136,1) matrix in the game -> every motion vector was a zoom towards the screen centre (warped picture around the middle, the rest zeroed by the v22 MV guard).
 static bool C2pInvertible(const float* c) {   // 1.1.4: |det| must be sane - a singular / degenerate matrix cannot be inverted for sl::Constants::prevClipToClip
     for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) return false;
     double m[16], out[16]; for (int i = 0; i < 16; i++) m[i] = (double)c[i];
@@ -536,8 +462,6 @@ static bool C2pInvertible(const float* c) {   // 1.1.4: |det| must be sane - a s
     for (int i = 0; i < 16; i++) if (!std::isfinite(out[i]) || fabs(out[i]) > 1e6) return false;
     return true;
 }
-static double C2pDev(const float* m);   // 1.1.5: forward declaration
-static std::atomic<bool> g_c2pGarbage{false};   // 1.1.5: the USED ClipToPrevClip is mostly implausible (not a real matrix) -> no camera-cut resets, identity only
 static bool C2pPlausible(const float* c) {
     for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) return false;
     // 1.1.6: the 1.1.5 rule "any entry deviates > 1.0 from identity = garbage" also threw away REAL matrices in narrow-FOV (telephoto) cutscenes (m0=11.4 m5=20.3: a small camera move gives translation entries of 1..300).
@@ -546,120 +470,229 @@ static bool C2pPlausible(const float* c) {
     if (!CamC2pReprojOk(c)) return false;
     return C2pInvertible(c);   // 1.1.4
 }
-static int g_c2pSwitches = 0; static std::atomic<int> g_c2pBadTotal{0}; static int g_c2pBanned[8] = { -1, -1, -1, -1, -1, -1, -1, -1 }; static int g_c2pBanFrame[8] = {}; static int g_c2pBannedN = 0;   // 1.1.4: offsets that were proven invalid; 1.1.6: the ban expires (a hard cut must not ruin the right offset for the whole game)
-static bool C2pIsBanned(int off) { int fr = g_frame.load(); for (int i = 0; i < g_c2pBannedN && i < 8; i++) if (g_c2pBanned[i] == off && fr - g_c2pBanFrame[i] < 1800) return true; return false; }   // 1.1.6: 1800 frames
 static double C2pDev(const float* m) { double d = 0.0; for (int i = 0; i < 16; i++) { double e = fabs((double)m[i] - ((i % 5) == 0 ? 1.0 : 0.0)); if (!(e == e)) return 1e9; if (e > d) d = e; } return d; }
-static void C2pMonitor(const float* p, int availF, int fr) {
-    if (!g_camLocked.load(std::memory_order_relaxed) || g_c2pCandN <= 0 || fr == g_c2pLastFrame) return;
-    g_c2pLastFrame = fr;
-    if (g_c2pStFrames == 0) g_c2pWinStart = fr;
-    for (int i = 0; i < g_c2pCandN && i < 4; i++) {
-        int o = g_c2pCand[i]; if (o < 0 || o + 16 > availF) continue;
-        double d = C2pDev(p + o); if (d > 1e-6) g_c2pSt[i].active++; g_c2pSt[i].sumDev += d; if (d > g_c2pSt[i].maxDev) g_c2pSt[i].maxDev = d; if (d < g_c2pSt[i].minDev) g_c2pSt[i].minDev = d; if (!C2pPlausible(p + o)) g_c2pSt[i].bad++;
+bool CamTracker::IsProj(const CamEnv& env, const float* m, bool loose) const { return CamIsProj(m, loose, (float)env.effW() / (float)env.effH()); }   // v27: pure part lives in camcore.h
+// Auto-detect: find ViewToClip (jittered) + ViewToClipNoAA (+16..64 floats later) + ClipToPrevClip (identity-like) in a UE4 view uniform buffer
+void CamTracker::Scan(const CamEnv& env, CamParseResult& R, const float* p, int avail, uint64_t bufOff) {   // = ScanViewBuffer
+    const Cfg& cfg = *env.cfg; int fr = env.frame->load();
+    // (step 6: the v16 per-frame scan budget is gone - its check had sat inside a // comment since v16, so it never ran. Probes are capped upstream: TrackCamera, 24 per frame / 96 while the camera is lost)
+    scanRuns++;
+    int ji = -1, nj = -1;
+    { long ps = 0; CamFindPair(p, avail, &ji, &nj, &ps); projSeen += ps; }   // v27: pure core in camcore.h
+    if (ji < 0) {
+        unsigned h = 2166136261u; int cnt = 0; char line[900]; int len = 0; line[0] = 0;
+        for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(env, p + i, true)) { cnt++; h = (h ^ (unsigned)i) * 16777619u; if (len < 760) len += snprintf(line + len, sizeof line - len, " [%d: m0=%.4f m5=%.4f m8=%.5f m9=%.5f m10=%.3f m11=%.1f m14=%.3f]", i, p[i], p[i + 5], p[i + 8], p[i + 9], p[i + 10], p[i + 11], p[i + 14]); }
+        int jc = 0; for (int i = 0; i + 16 <= avail; i += 4) if (IsProj(env, p + i, true) && (p[i + 8] != 0.f || p[i + 9] != 0.f)) jc++;
+        if (jc >= 2) env.dumpViewBuf(p, avail, bufOff, "2+ jittered projections, no NoAA pair");
+        if (cnt > 0 && lim.nlog < 25) { bool dup = false; for (int q = 0; q < lim.nseen; q++) if (lim.seen[q] == h) dup = true; if (!dup) { if (lim.nseen < 16) lim.seen[lim.nseen++] = h; lim.nlog++; env.log("cam-scan: no jittered/NoAA pair, but %d projection-like matrices (buffer offset %llu, avail %d floats):%s", cnt, (unsigned long long)bufOff, avail, line); } }
+        return;
     }
-    if (++g_c2pStFrames < ((g_c2pSwitches == 0 && fr < 1500) ? 120 : 300)) return;   // v24: first verdict after 120 frames (at the 10 fps start of Townfall 300 frames = 25 s with a dead ClipToPrevClip)
-    static int s_nlog = 0; int used = -1; for (int i = 0; i < g_c2pCandN && i < 4; i++) if (g_c2pCand[i] == g_cfg.mvOff) used = i;
-    if (s_nlog++ < 60) {
+    // v18: collect up to 4 identity-like matrices after ViewToClipNoAA (UE5 has more matrices in front of / behind ClipToPrevClip); c2pidx picks one (default: the first = UE4 behaviour)
+    int k = -1; { int cand[4]; int nc = CamCollectC2P(p, avail, nj, cand);   // v21: always collect all 4 (the monitor below needs every candidate)
+      if (!lim.listed && nc > 0) { lim.listed = true; char l[700]; int ln = 0; l[0] = 0;
+        for (int i = 0; i < nc && ln < 600; i++) { const float* c = p + cand[i]; ln += snprintf(l + ln, sizeof l - ln, " #%d@%d[diag %.4f %.4f %.4f %.4f | z-row xy %.5f %.5f | trans xy %.5f %.5f]", i, cand[i], c[0], c[5], c[10], c[15], c[8], c[9], c[12], c[13]); }
+        env.log("cam-scan: identity-like matrices after ViewToClipNoAA:%s  -> c2pidx=%d", l, cfg.c2pIdx); }
+      for (int i = 0; i < nc; i++) c2pCand[i] = cand[i]; c2pCandN = nc;
+      if (cfg.c2pIdx < nc) k = cand[cfg.c2pIdx]; }
+    if (k < 0) { env.dumpViewBuf(p, avail, bufOff, "pair found, no ClipToPrevClip"); if (lim.scanN++ < 10) env.log("cam-scan: projection pair at floats %d/%d (buffer offset %llu, avail %d floats, m0=%.4f m5=%.4f aspect=%.4f) but no identity-like ClipToPrevClip found after it", ji, nj, (unsigned long long)bufOff, avail, p[ji], p[ji + 5], p[ji + 5] / p[ji]); return; }
+    if (ji == li && nj == lj && k == lk) hits++; else { li = ji; lj = nj; lk = k; hits = 1; if (lim.scanN++ < 20) env.log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d (jitter=%.5f,%.5f aspect=%.4f c2p diag=%.5f %.5f %.5f %.5f)", ji, nj, k, p[ji + 8], p[ji + 9], p[ji + 5] / p[ji], p[k], p[k + 5], p[k + 10], p[k + 15]); }
+    if (hits >= 5 && !SnScanMayLock(camFrame.load(), fr, camRescan.load() != 0, 90)) {   // 1.1.7: the current offsets still deliver the camera -> this is some other buffer, do NOT lock / save it
+        if (lim.scanIgnoredN++ < 5) env.log("cam-scan: candidate projoff=%d noaaoff=%d mvoff=%d ignored - the current offsets (proj=%d noaa=%d mv=%d) still deliver the camera (age %d)", ji, nj, k, off.proj, off.noaa, off.mv, fr - camFrame.load());
+        R.events.Add(CAMEV_CAND_IGNORED, fr, ji, k);
+        hits = 0; return; }   // ignored: only the counter restarts (li/lj/lk stay)
+    if (hits >= 5) {
+        off.proj = ji; off.noaa = nj; off.mv = k; locked = 1; R.offsetsChanged = true; R.offsets = off; if (cfg.autoLearn) R.persist |= (CAMP_PROJOFF | CAMP_NOAAOFF | CAMP_MVOFF);
+        li = lj = lk = -1; hits = 0;   // step 6 (behaviour change, was carried over until 1.1.7): a later re-scan must see its candidate 5x again before it locks (hits_cleared_on_lock)
+        if (camRescan.exchange(0)) { env.log("camera re-scan: view buffer found again at projoff=%d noaaoff=%d mvoff=%d", ji, nj, k); R.events.Add(CAMEV_RESCAN_FOUND, fr, 0, 0); }
+        env.log("cam-scan: LOCKED projoff=%d noaaoff=%d mvoff=%d  -> saved to SN_DLSSG_cfg.txt automatically (autolearn=1) so the next start skips the scan", ji, nj, k);
+        R.events.Add(CAMEV_LOCKED, fr, ji, k);
+    }
+}
+
+// ---- "legacy" UE4 view-buffer layout (CODE VEIN 1; found from the raw dumps): no ClipToPrevClip / ViewToClipNoAA in the buffer.
+//   float index: 16 WorldToClip(jittered) | 96 ViewToClip(jittered) | 252 PrevViewProj(prev jitter) | 456 TemporalAAJitter(cur xy, prev xy) | 472 ViewSizeAndInvSize
+//   ClipToPrevClip (no-AA) is built here: C = inverse(WorldToClip_noAA) * PrevViewProj_noAA   (row-vector convention like UE)
+bool CamTracker::TryLegacy(const CamEnv& env, const float* p, int availF) {   // = TryLegacyLayout
+    const Cfg& cfg = *env.cfg;
+    if (availF < 480) return false;
+    const float* a = p + 96;
+    if (!IsProj(env, a, false)) return false;
+    if (fabsf(p[456] - a[8]) > 1e-7f || fabsf(p[457] - a[9]) > 1e-7f) return false;                 // TemporalAAJitter must match the projection
+    if (!(p[472] >= 320.f && p[473] >= 200.f) || fabsf(p[472] / p[473] - a[5] / a[0]) > 0.05f) return false;   // ViewSizeAndInvSize consistent with the projection aspect
+    if (fabsf(p[458]) > 0.02f || fabsf(p[459]) > 0.02f || !std::isfinite(p[458]) || !std::isfinite(p[459])) return false;
+    for (int i = 0; i < 16; i++) if (!std::isfinite(p[16 + i]) || !std::isfinite(p[252 + i])) return false;
+    // main camera vs. dummy identity view (UI / default view): identity rotation + zero pre-view translation
+    static const float kRot[16] = { 0,0,1,0, 1,0,0,0, 0,1,0,0, 0,0,0,1 };
+    bool dummy = !memcmp(p + 32, kRot, sizeof kRot) && !memcmp(p, p + 16, 64);
+    int fr = env.frame->load();
+    if (!dummy) lastRealViewFrame = fr; else if (fr - lastRealViewFrame < 120) return true;   // a real view was seen recently: ignore the dummy view (return true = handled)
+    double W[16], Wp[16], Wi[16], C[16];
+    double jx = p[456], jy = p[457], pjx = p[458], pjy = p[459];
+    for (int i = 0; i < 16; i++) { W[i] = p[16 + i]; Wp[i] = p[252 + i]; }
+    for (int r = 0; r < 4; r++) { W[r * 4 + 0] -= W[r * 4 + 3] * jx; W[r * 4 + 1] -= W[r * 4 + 3] * jy; Wp[r * 4 + 0] -= Wp[r * 4 + 3] * pjx; Wp[r * 4 + 1] -= Wp[r * 4 + 3] * pjy; }
+    if (!Inv4d(W, Wi)) return true;
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { double v = 0; for (int k = 0; k < 4; k++) v += Wi[r * 4 + k] * Wp[k * 4 + c]; C[r * 4 + c] = v; }
+    float c2pM[16], vtc[16]; for (int i = 0; i < 16; i++) { c2pM[i] = (float)C[i]; if (!std::isfinite(c2pM[i]) || fabsf(c2pM[i]) > 1e6f) return true; }
+    memcpy(vtc, a, sizeof vtc); vtc[8] = 0.f; vtc[9] = 0.f;   // ViewToClipNoAA = ViewToClip without the jitter
+    { std::lock_guard<std::mutex> lk2(camMx);
+      memcpy(vtcNoAA, vtc, sizeof vtcNoAA); memcpy(c2p, c2pM, sizeof c2p);
+      jitPX = a[8] * 0.5f * (float)env.effW() * (float)cfg.jitSX; jitPY = -a[9] * 0.5f * (float)env.effH() * (float)cfg.jitSY; jitNX = a[8] * 0.5f * (float)cfg.jitSX; jitNY = -a[9] * 0.5f * (float)cfg.jitSY;
+      camFrame = fr; }
+    if (lastJitFrame < fr) lastJitFrame = fr;
+    if (lim.legacyN++ < 8) env.log("camera(legacy layout): frame=%d %s jitter px=(%.4f,%.4f) m0=%.5f m5=%.5f near=%.3f viewsize=%.0fx%.0f c2p diag=%.5f %.5f %.5f %.5f", fr, dummy ? "DUMMY-identity-view" : "main-view", jitPX, jitPY, a[0], a[5], a[14], p[472], p[473], c2pM[0], c2pM[5], c2pM[10], c2pM[15]);
+    return true;
+}
+// ---- v21: c2p monitor. The scan locks onto an identity-like matrix while the camera is still (menu / first frames) - at that moment ALL candidates look identical, so the
+// choice is a guess. If the chosen matrix is not the real ClipToPrevClip (e.g. a constant placeholder), frame generation gets zero camera motion for the static scenery and the
+// generated frames show the world NOT following the camera (judder / rubber-band / swimming = "the camera does things it should not"). The monitor measures, per candidate,
+// how far it is from identity while the game runs. The DLL itself only READS these matrices (it has no way to move the camera).
+// v23: a real ClipToPrevClip is ~identity (diagonal ~1) for any sane camera move. The Silent Hill Townfall (UE5) log showed the USED candidate (#0@256, an identity placeholder in the
+// menu) turn into a CONSTANT diag(0.136,0.136,0.136,1) matrix in the game -> every motion vector was a zoom towards the screen centre (warped picture around the middle, the rest zeroed by the v22 MV guard).
+bool CamTracker::IsBanned(const CamEnv& env, int offF) const { int fr = env.frame->load(); for (int i = 0; i < c2pBannedN && i < 8; i++) if (c2pBanned[i] == offF && fr - c2pBanFrame[i] < 1800) return true; return false; }   // 1.1.6: 1800 frames
+void CamTracker::Monitor(const CamEnv& env, CamParseResult& R, const float* p, int availF, int fr) {   // = C2pMonitor
+    const Cfg& cfg = *env.cfg;
+    if (!locked.load(std::memory_order_relaxed) || c2pCandN <= 0 || fr == c2pLastFrame) return;
+    c2pLastFrame = fr;
+    if (c2pStFrames == 0) c2pWinStart = fr;
+    for (int i = 0; i < c2pCandN && i < 4; i++) {
+        int o = c2pCand[i]; if (o < 0 || o + 16 > availF) continue;
+        double d = C2pDev(p + o); if (d > 1e-6) c2pSt[i].active++; c2pSt[i].sumDev += d; if (d > c2pSt[i].maxDev) c2pSt[i].maxDev = d; if (d < c2pSt[i].minDev) c2pSt[i].minDev = d; if (!C2pPlausible(p + o)) c2pSt[i].bad++;
+    }
+    if (++c2pStFrames < ((c2pSwitches == 0 && fr < 1500) ? 120 : 300)) return;   // v24: first verdict after 120 frames (at the 10 fps start of Townfall 300 frames = 25 s with a dead ClipToPrevClip)
+    int used = -1; for (int i = 0; i < c2pCandN && i < 4; i++) if (c2pCand[i] == off.mv) used = i;
+    if (lim.monN++ < 60) {
         char l[600]; int ln = 0; l[0] = 0;
-        for (int i = 0; i < g_c2pCandN && i < 4; i++) ln += snprintf(l + ln, sizeof l - ln, " #%d@%d active=%d/%d maxdev=%.6f avgdev=%.6f bad=%d%s |", i, g_c2pCand[i], g_c2pSt[i].active, g_c2pStFrames, g_c2pSt[i].maxDev, g_c2pSt[i].sumDev / g_c2pStFrames, g_c2pSt[i].bad, i == used ? " (USED)" : "");
-        Log("c2p-monitor (frames %d..%d):%s  [a real ClipToPrevClip is exactly identity only while the camera stands still]", g_c2pWinStart, fr, l);
+        for (int i = 0; i < c2pCandN && i < 4; i++) ln += snprintf(l + ln, sizeof l - ln, " #%d@%d active=%d/%d maxdev=%.6f avgdev=%.6f bad=%d%s |", i, c2pCand[i], c2pSt[i].active, c2pStFrames, c2pSt[i].maxDev, c2pSt[i].sumDev / c2pStFrames, c2pSt[i].bad, i == used ? " (USED)" : "");
+        env.log("c2p-monitor (frames %d..%d):%s  [a real ClipToPrevClip is exactly identity only while the camera stands still]", c2pWinStart, fr, l);
     }
-    if (g_cfg.c2pAuto && used >= 0 && g_c2pSwitches < 6) {   // v23: switch when the used matrix is DEAD (never moves) or INVALID (constant non-identity / mostly implausible) and another candidate looks like a real ClipToPrevClip
-        const int F = g_c2pStFrames; const C2pStat& u = g_c2pSt[used];
+    if (cfg.c2pAuto && used >= 0 && c2pSwitches < 6) {   // v23: switch when the used matrix is DEAD (never moves) or INVALID (constant non-identity / mostly implausible) and another candidate looks like a real ClipToPrevClip
+        const int F = c2pStFrames; const C2pStat& u = c2pSt[used];
         auto isConst = [&](const C2pStat& c) { return c.active * 10 >= F * 9 && (c.maxDev - c.minDev) < 1e-3 && c.minDev > 0.02; };
         bool usedInvalid = u.bad * 2 >= F || isConst(u), usedDead = u.maxDev < 1e-7;
-        if (usedInvalid && !C2pIsBanned(g_cfg.mvOff)) {   // 1.1.6: temporary ban (1800 frames) instead of "never again"; the slot is reused / refreshed
-            int slot = -1; for (int i = 0; i < g_c2pBannedN && i < 8; i++) if (g_c2pBanned[i] == g_cfg.mvOff) slot = i;
-            if (slot < 0) slot = (g_c2pBannedN < 8) ? g_c2pBannedN++ : 0;
-            g_c2pBanned[slot] = g_cfg.mvOff; g_c2pBanFrame[slot] = fr; Log("c2p-monitor: float %d is INVALID - not selected for the next 1800 frames", g_cfg.mvOff); }
+        if (usedInvalid && !IsBanned(env, off.mv)) {   // 1.1.6: temporary ban (1800 frames) instead of "never again"; the slot is reused / refreshed
+            int slot = -1; for (int i = 0; i < c2pBannedN && i < 8; i++) if (c2pBanned[i] == off.mv) slot = i;
+            if (slot < 0) slot = (c2pBannedN < 8) ? c2pBannedN++ : 0;
+            c2pBanned[slot] = off.mv; c2pBanFrame[slot] = fr; env.log("c2p-monitor: float %d is INVALID - not selected for the next 1800 frames", off.mv); R.events.Add(CAMEV_C2P_BANNED, fr, off.mv, 0); }
         if (usedInvalid || usedDead) {
             int best = -1;
-            for (int i = 0; i < g_c2pCandN && i < 4; i++) { if (i == used) continue; const C2pStat& c = g_c2pSt[i];
-                bool ok = !C2pIsBanned(g_c2pCand[i]) && c.bad * 10 <= F && !isConst(c) && c.active >= 5 && c.maxDev > 4e-3 ;   // 1.1.6: (1.1.4/1.1.5 also required maxdev <= 6 or avgdev <= 4 - that rejected real telephoto matrices; "bad" is now reprojection based) 1.1.4: fast camera / cut scenes give a few huge frames (max 14..48) but a small average - those windows were rejected for 15000 frames   // 4e-3 >> TAA jitter ~7e-4; > 6.0 = garbage
-                if (ok && (best < 0 || c.active > g_c2pSt[best].active)) best = i; }
+            for (int i = 0; i < c2pCandN && i < 4; i++) { if (i == used) continue; const C2pStat& c = c2pSt[i];
+                bool ok = !IsBanned(env, c2pCand[i]) && c.bad * 10 <= F && !isConst(c) && c.active >= 5 && c.maxDev > 4e-3 ;   // 1.1.6: (1.1.4/1.1.5 also required maxdev <= 6 or avgdev <= 4 - that rejected real telephoto matrices; "bad" is now reprojection based) 1.1.4: fast camera / cut scenes give a few huge frames (max 14..48) but a small average - those windows were rejected for 15000 frames   // 4e-3 >> TAA jitter ~7e-4; > 6.0 = garbage
+                if (ok && (best < 0 || c.active > c2pSt[best].active)) best = i; }
             if (best >= 0) {
-                Log("c2p-monitor: SWITCH ClipToPrevClip from float %d (%s) to float %d (active %d/%d maxdev %.5f) - frame generation history is reset", g_cfg.mvOff, usedInvalid ? "INVALID: constant / implausible matrix" : "never moved", g_c2pCand[best], g_c2pSt[best].active, F, g_c2pSt[best].maxDev);
-                g_cfg.mvOff = g_c2pCand[best]; g_forceReset = true; g_c2pSwitches++; if (g_cfg.autoLearn) CfgSetInt("mvoff", g_cfg.mvOff); }
-            else if (usedInvalid) { static int w = 0; if (w++ < 6) Log("c2p-monitor: the USED ClipToPrevClip (float %d) is invalid and no other candidate looks usable - implausible frames are sent as identity (camera-only motion off, optical flow only)", g_cfg.mvOff); }
+                env.log("c2p-monitor: SWITCH ClipToPrevClip from float %d (%s) to float %d (active %d/%d maxdev %.5f) - frame generation history is reset", off.mv, usedInvalid ? "INVALID: constant / implausible matrix" : "never moved", c2pCand[best], c2pSt[best].active, F, c2pSt[best].maxDev);
+                const int mvBefore = off.mv;
+                off.mv = c2pCand[best]; R.forceReset = true; c2pSwitches++; R.offsetsChanged = true; R.offsets = off; if (cfg.autoLearn) R.persist |= CAMP_MVOFF;
+                R.events.Add(CAMEV_SWITCHED, fr, mvBefore, off.mv); }
+            else if (usedInvalid) { if (lim.monNoUsableN++ < 6) env.log("c2p-monitor: the USED ClipToPrevClip (float %d) is invalid and no other candidate looks usable - implausible frames are sent as identity (camera-only motion off, optical flow only)", off.mv); }
         }
     }
-    if (used >= 0) { bool gb = g_c2pSt[used].bad * 2 >= g_c2pStFrames; if (gb != g_c2pGarbage.load()) Log("c2p-monitor: used matrix is %s (bad %d of %d frames) -> camera-cut guard %s", gb ? "GARBAGE" : "plausible again", g_c2pSt[used].bad, g_c2pStFrames, gb ? "off, identity sent" : "on"); g_c2pGarbage = gb; }   // 1.1.5
-    for (int i = 0; i < 4; i++) g_c2pSt[i] = C2pStat(); g_c2pStFrames = 0;
+    if (used >= 0) { bool gb = c2pSt[used].bad * 2 >= c2pStFrames; if (gb != c2pGarbage.load()) { env.log("c2p-monitor: used matrix is %s (bad %d of %d frames) -> camera-cut guard %s", gb ? "GARBAGE" : "plausible again", c2pSt[used].bad, c2pStFrames, gb ? "off, identity sent" : "on"); R.events.Add(gb ? CAMEV_GARBAGE : CAMEV_GARBAGE_CLEARED, fr, c2pSt[used].bad, c2pStFrames); } c2pGarbage = gb; }   // 1.1.5
+    for (int i = 0; i < 4; i++) c2pSt[i] = C2pStat(); c2pStFrames = 0;
 }
 // ---- v22: camera-cut guard. Special Shots / cutscenes switch the camera (or its FOV) from one frame to the next. Frame generation then interpolates between two
 // unrelated pictures with motion vectors that describe the wrong camera -> whole image regions get smeared. Detected: ClipToPrevClip far from identity, or a sudden change of the
 // projection (FOV). Reaction: reset the DLSS-G history and run a few frames WITHOUT frame generation (clean real frames), then resume.
-static std::atomic<int> g_cutHold{0};
-static float g_prevM0 = 0.f, g_prevM5 = 0.f; static int g_prevCamFrame = -1;
-static int g_cutWinStart = 0, g_cutWinCount = 0, g_cutSuppressUntil = 0, g_cutTotal = 0;
-static SnProjHist g_projHist;   // 1.1.7: the last distinct projections (alternating views are not camera cuts)
-static void CamCutCheck(const float* b, const float* c, int fr) {   // called with g_camMx held, once per frame at most
-    if (!g_cfg.cutDetect || fr == g_prevCamFrame) return;
+void CamTracker::CutCheck(const CamEnv& env, CamParseResult& R, const float* b, const float* c, int fr) {   // = CamCutCheck; called with camMx held, once per frame at most
+    const Cfg& cfg = *env.cfg;
+    if (!cfg.cutDetect || fr == prevCamFrame) return;
     bool cut = false; const char* why = ""; double val = 0.0;
     double dev = C2pDev(c); int rv = 0, rt = 0; float rfar = 0.f; CamC2pReproj(c, &rv, &rt, &rfar);
-    if (g_c2pGarbage.load()) { g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr; g_projHist.Add(b[0], b[5], fr); return; }   // 1.1.5: garbage matrix / UI projection: its jumps are not camera cuts (every one of them reset the DLSS-G history = flicker)
+    if (c2pGarbage.load()) { prevM0 = b[0]; prevM5 = b[5]; prevCamFrame = fr; projHist.Add(b[0], b[5], fr); return; }   // 1.1.5: garbage matrix / UI projection: its jumps are not camera cuts (every one of them reset the DLSS-G history = flicker)
     // 1.1.6: a cut = the matrix does NOT reproject sanely (a fast / telephoto camera move has large entries but reprojects fine: 1.1.5 reset the history on every frame of such a move). cutthresh is no longer used.
     // 1.1.6b: only the FIRST frame of an implausible run is a cut. The log showed 4 consecutive frames with dev 150..167 / 19 of 45 samples ok (frames 2929-2932): one fast, smooth camera move
     // (close geometry fails the 1.0 NDC test, but nothing jumps) that reset the DLSS-G history 4 times in a row. A real hard cut is a single-frame event.
-    static bool s_prevBad = false; bool badNow = !C2pPlausible(c);
-    bool wasBad = s_prevBad; s_prevBad = badNow;   // also catches NaN
+    bool badNow = !C2pPlausible(c);
+    bool wasBad = prevBad; prevBad = badNow;   // also catches NaN
     if (badNow) { if (!wasBad) { cut = true; why = "ClipToPrevClip does not reproject sanely (hard camera cut)"; val = dev; } }
-    else if (g_prevCamFrame >= 0 && g_prevM0 > 0.f && g_prevM5 > 0.f && fr - g_prevCamFrame <= 3) {
-        double d0 = fabs((double)b[0] - g_prevM0) / g_prevM0, d5 = fabs((double)b[5] - g_prevM5) / g_prevM5;
-        if (d0 > g_cfg.cutFov / 100.0 || d5 > g_cfg.cutFov / 100.0) {
+    else if (prevCamFrame >= 0 && prevM0 > 0.f && prevM5 > 0.f && fr - prevCamFrame <= 3) {
+        double d0 = fabs((double)b[0] - prevM0) / prevM0, d5 = fabs((double)b[5] - prevM5) / prevM5;
+        if (d0 > cfg.cutFov / 100.0 || d5 > cfg.cutFov / 100.0) {
             // 1.1.6: a REAL zoom (telephoto cutscene: FOV changes by 0.4..1.0 per frame for many frames) is described by ClipToPrevClip itself: for a pure FOV change its x/y scale is prevM/curM.
             // A true camera cut gives (nearly) identity there. So the jump counts as a cut only if the matrix does NOT move towards the value the FOV change predicts.
-            double e0 = g_prevM0 / (double)b[0], e5 = g_prevM5 / (double)b[5];
+            double e0 = prevM0 / (double)b[0], e5 = prevM5 / (double)b[5];
             bool explained = fabs((double)c[0] - e0) <= 0.25 * fabs(e0 - 1.0) && fabs((double)c[5] - e5) <= 0.25 * fabs(e5 - 1.0);
             // 1.1.7: the 1.1.6 log has 40+ "FOV jump" resets with 45/45 samples ok where m0 simply flips between two values (1.0 <-> 1.6406 on consecutive frames): two views alternate.
             // A projection that was seen within the last 8 frames is an alternating view, not a cut.
-            bool alt = !explained && g_projHist.SeenRecently(b[0], b[5], fr, 8);   // (separate flag: the 1.1.7 build set explained=true here and then printed the misleading "explained by ClipToPrevClip (scale 1.0000, expected 1.4239)" line)
-            if (alt) { static int s_alt = 0; if (s_alt++ < 10) Log("camera: projection %.4f/%.4f was seen %s -> alternating views, not a camera cut (no history reset)", b[0], b[5], "within the last 8 frames"); }
-            static int s_nz = 0; if (explained && s_nz++ < 20) Log("camera: FOV change %.4f is explained by ClipToPrevClip (scale %.4f %.4f, expected %.4f %.4f) -> real zoom, no history reset", std::max(d0, d5), c[0], c[5], e0, e5);
+            bool alt = !explained && projHist.SeenRecently(b[0], b[5], fr, 8);   // (separate flag: the 1.1.7 build set explained=true here and then printed the misleading "explained by ClipToPrevClip (scale 1.0000, expected 1.4239)" line)
+            if (alt) { if (lim.cutAltN++ < 10) env.log("camera: projection %.4f/%.4f was seen %s -> alternating views, not a camera cut (no history reset)", b[0], b[5], "within the last 8 frames"); R.events.Add(CAMEV_ALT_VIEW, fr, 0, 0); }
+            if (explained && lim.cutExplainedN++ < 20) env.log("camera: FOV change %.4f is explained by ClipToPrevClip (scale %.4f %.4f, expected %.4f %.4f) -> real zoom, no history reset", std::max(d0, d5), c[0], c[5], e0, e5);
             if (!explained && !alt) { cut = true; why = "projection (FOV) jump"; val = std::max(d0, d5); }
         }
     }
-    g_prevM0 = b[0]; g_prevM5 = b[5]; g_prevCamFrame = fr; g_projHist.Add(b[0], b[5], fr);
-    if (!cut || fr < g_cutSuppressUntil) return;
-    if (fr - g_cutWinStart > 120) { g_cutWinStart = fr; g_cutWinCount = 0; }
-    if (++g_cutWinCount > 8) {   // the 'cut' keeps firing = this game changes its projection every frame (e.g. two alternating views): stop guarding, never leave FG off permanently
-        g_cutSuppressUntil = fr + 900; g_cutWinCount = 0; Log("camera-cut guard: fires too often (%s) -> suspended for 900 frames", why); return; }
-    int cur = g_cutHold.load(); if (cur < 2) g_cutHold = 2;   // v23: only the DLSS-G reset flag is raised for these frames; frame generation itself is NOT switched off (every on/off switch = SetMaximumFrameLatency 1<->2 + RSYNC flush = 100+ ms hitch in sl.log)
-    g_forceReset = true; g_cutTotal++;
-    if (g_cutTotal <= 60) Log("camera cut at frame %d: %s (%.4f, %d/%d reprojection samples ok) -> DLSS-G history reset (FG stays on)", fr, why, val, rv, rt);
+    prevM0 = b[0]; prevM5 = b[5]; prevCamFrame = fr; projHist.Add(b[0], b[5], fr);
+    if (!cut || fr < cutSuppressUntil) return;
+    if (fr - cutWinStart > 120) { cutWinStart = fr; cutWinCount = 0; }
+    if (++cutWinCount > 8) {   // the 'cut' keeps firing = this game changes its projection every frame (e.g. two alternating views): stop guarding, never leave FG off permanently
+        cutSuppressUntil = fr + 900; cutWinCount = 0; env.log("camera-cut guard: fires too often (%s) -> suspended for 900 frames", why); R.events.Add(CAMEV_CUT_SUSPENDED, fr, 0, 0); return; }
+    int cur = cutHold.load(); if (cur < 2) cutHold = 2;   // v23: only the DLSS-G reset flag is raised for these frames; frame generation itself is NOT switched off (every on/off switch = SetMaximumFrameLatency 1<->2 + RSYNC flush = 100+ ms hitch in sl.log)
+    R.forceReset = true; cutTotal++;
+    R.events.Add(CAMEV_CUT, fr, 0, 0);
+    if (cutTotal <= 60) env.log("camera cut at frame %d: %s (%.4f, %d/%d reprojection samples ok) -> DLSS-G history reset (FG stays on)", fr, why, val, rv, rt);
 }
-// Parses one view-buffer candidate (a COPY in normal memory). true = recognised as a camera view buffer.
-static bool ParseViewBuffer(const float* p, int availF, UINT64 off) {
-    bool strict = availF >= std::max(g_cfg.mvOff + 16, 148) && g_cfg.projOff >= 0 && g_cfg.noAAOff >= 0 && g_cfg.mvOff >= 0;
+// The body of the old ParseViewBuffer (its `return true/false` lines are unchanged; step 5 kept it inside a lambda, step 6 made it this private member). true = recognised as a camera view buffer.
+bool CamTracker::ParseBody(const CamEnv& env, CamParseResult& R, const float* p, int availF, uint64_t bufOff) {
+    const Cfg& cfg = *env.cfg;
+    bool strict = availF >= std::max(off.mv + 16, 148) && off.proj >= 0 && off.noaa >= 0 && off.mv >= 0;
     const float* a = nullptr; const float* b = nullptr; const float* c = nullptr;
-    const bool rescanMode = g_camRescan.load(std::memory_order_relaxed) != 0;   // v24: while the camera is lost the aspect check is relaxed (cinematic bars / a different view aspect after a level load)
-    if (strict) { a = p + g_cfg.projOff; b = p + g_cfg.noAAOff; c = p + g_cfg.mvOff;
-        if (!IsProj(a, rescanMode) || !IsProj(b, rescanMode) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) strict = false; }
+    const bool rescanMode = camRescan.load(std::memory_order_relaxed) != 0;   // v24: while the camera is lost the aspect check is relaxed (cinematic bars / a different view aspect after a level load)
+    if (strict) { a = p + off.proj; b = p + off.noaa; c = p + off.mv;
+        if (!IsProj(env, a, rescanMode) || !IsProj(env, b, rescanMode) || b[8] != 0.f || b[9] != 0.f || a[0] != b[0] || a[5] != b[5]) strict = false; }
     if (strict) { for (int i = 0; i < 16; i++) if (!std::isfinite(c[i])) strict = false; }
     if (!strict) {
-        if (g_cfg.camAuto && TryLegacyLayout(p, availF)) return true;
-        if (g_cfg.camAuto && (!g_camLocked.load() || rescanMode) && availF >= 64) ScanViewBuffer(p, availF, off);
+        if (cfg.camAuto && TryLegacy(env, p, availF)) return true;
+        if (cfg.camAuto && (!locked.load() || rescanMode) && availF >= 64) Scan(env, R, p, availF, bufOff);
         return false;
     }
-    int fr = g_frame.load();
+    int fr = env.frame->load();
     bool jittered = (a[8] != 0.f || a[9] != 0.f);
-    if (jittered) g_lastJitFrame = fr;
-    else if (fr - g_lastJitFrame < 90) return true;   // un-jittered view of a non-TAA pass while TAA is active: keep the last real one (no TAA at all -> accepted after 90 frames)
-    C2pMonitor(p, availF, fr);   // v21 (read-only statistics)
-    std::lock_guard<std::mutex> lk2(g_camMx);
-    CamCutCheck(b, c, fr);   // v22
-    memcpy(g_vtcNoAA, b, sizeof g_vtcNoAA); memcpy(g_c2p, c, sizeof g_c2p);
+    if (jittered) lastJitFrame = fr;
+    else if (fr - lastJitFrame < 90) return true;   // un-jittered view of a non-TAA pass while TAA is active: keep the last real one (no TAA at all -> accepted after 90 frames)
+    Monitor(env, R, p, availF, fr);   // v21 (read-only statistics)
+    std::lock_guard<std::mutex> lk2(camMx);
+    CutCheck(env, R, b, c, fr);   // v22
+    memcpy(vtcNoAA, b, sizeof vtcNoAA); memcpy(c2p, c, sizeof c2p);
     if (!C2pPlausible(c)) {   // v23: never feed garbage / placeholder matrices into the motion-vector pass: send identity (= no camera motion for this frame; DLSS-G optical flow still works)
-        for (int i = 0; i < 16; i++) g_c2p[i] = ((i % 5) == 0) ? 1.f : 0.f;
-        int nb = ++g_c2pBadTotal; if (nb <= 8 || (nb % 2000) == 0) Log("camera: ClipToPrevClip at float %d is implausible (diag %.4f %.4f %.4f %.4f, total %d) -> identity used for this frame", g_cfg.mvOff, c[0], c[5], c[10], c[15], nb);
+        for (int i = 0; i < 16; i++) c2p[i] = ((i % 5) == 0) ? 1.f : 0.f;
+        int nb = ++c2pBadTotal; if (nb <= 8 || (nb % 2000) == 0) env.log("camera: ClipToPrevClip at float %d is implausible (diag %.4f %.4f %.4f %.4f, total %d) -> identity used for this frame", off.mv, c[0], c[5], c[10], c[15], nb);
     }
-    g_jitPX = a[8] * 0.5f * (float)EffW() * (float)g_cfg.jitSX; g_jitPY = -a[9] * 0.5f * (float)EffH() * (float)g_cfg.jitSY; g_jitNX = a[8] * 0.5f * (float)g_cfg.jitSX; g_jitNY = -a[9] * 0.5f * (float)g_cfg.jitSY;
-    g_camFrame = fr;
-    if (rescanMode && g_camRescan.exchange(0)) Log("camera re-scan: view buffer found again at frame %d (relaxed aspect check)", fr);
-    static int n = 0; if (n++ < 6) Log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f%s", fr, g_jitPX, g_jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15], jittered ? "" : " (NO TAA jitter)");
+    jitPX = a[8] * 0.5f * (float)env.effW() * (float)cfg.jitSX; jitPY = -a[9] * 0.5f * (float)env.effH() * (float)cfg.jitSY; jitNX = a[8] * 0.5f * (float)cfg.jitSX; jitNY = -a[9] * 0.5f * (float)cfg.jitSY;
+    camFrame = fr;
+    if (rescanMode && camRescan.exchange(0)) { env.log("camera re-scan: view buffer found again at frame %d (relaxed aspect check)", fr); R.events.Add(CAMEV_RESCAN_FOUND, fr, 0, 0); }
+    if (lim.parseN++ < 6) env.log("camera: frame=%d jitter px=(%.4f,%.4f) near=%.3f fov-ish m0=%.5f m5=%.5f c2p diag=%.5f %.5f %.5f %.5f%s", fr, jitPX, jitPY, b[14], b[0], b[5], c[0], c[5], c[10], c[15], jittered ? "" : " (NO TAA jitter)");
     return true;
 }
-
+// Parses one view-buffer candidate (a COPY in normal memory). recognised = recognised as a camera view buffer.   (= ParseViewBuffer; the result snapshot is taken once, after the body)
+CamParseResult CamTracker::Parse(const CamEnv& env, const float* p, int availF, uint64_t bufOff) {
+    CamParseResult R;
+    R.recognised = ParseBody(env, R, p, availF, bufOff);
+    R.cutHold = cutHold.load(); R.c2pGarbage = c2pGarbage.load();
+    return R;
+}
+// SN_EXTRACT_END camera
+// SN_EXTRACT_BEGIN camhold   (tests/camera_seq/extract_camera_code.py <src> <out> camhold: per-frame camera age / rescan / camhold / cut-hold decay; keep the markers when editing)
+// Step 5: the per-frame bookkeeping that used to sit inline in the frame loop, MOVED into CamTracker::Frame. Inputs come in CamFrameIn, outputs go out in CamFrameResult.
+CamFrameResult CamTracker::Frame(const CamEnv& env, const CamFrameIn& in) {
+    CamFrameResult R; const Cfg& cfg = *env.cfg; const int fr = in.frame;
+    int camAge = fr - camFrame.load(); bool camOk = camFrame.load() >= 0 && camAge <= cfg.camStale;
+    // v24: camera tracker lost the view buffer (loading screen, level streaming, tracker blind spot): re-scan with relaxed checks, and - if FG was running - keep it running.
+    if (cfg.camRescan > 0 && camFrame.load() >= 0 && !camOk && camAge > cfg.camRescan && !camRescan.load() && fr >= rescanCool) {
+        camRescan = 1; rescanStart = fr; env.log("camera lost for %d frames (last view buffer at frame %d) -> re-scanning with relaxed checks (registry %llu MB, evicted %ld, skipped %ld)", camAge, camFrame.load(), (unsigned long long)in.regMB, in.evicted, in.regSkipped);
+        R.events.Add(CAMEV_RESCAN, fr, camAge, 0);
+    }
+    if (camRescan.load() && fr - rescanStart > 1200) { camRescan = 0; rescanCool = fr + 600; env.log("camera re-scan: giving up for 600 frames (no view buffer found in 1200 frames)"); R.events.Add(CAMEV_RESCAN_GIVEUP, fr, fr - rescanStart, 0); }
+    if (!camOk && cfg.camHold && camFrame.load() >= 0 && camAge <= cfg.camHoldMax && (in.wasOn || held)) {
+        { std::lock_guard<std::mutex> lkh(camMx); for (int i = 0; i < 16; i++) c2p[i] = ((i % 5) == 0) ? 1.f : 0.f; jitPX = jitPY = jitNX = jitNY = 0.f; }
+        if (!held) { held = true; heldSince = fr; env.log("camera lost (age %d) while FG is running -> camhold: FG stays ON with the last projection + identity ClipToPrevClip (optical flow only) until the camera is found again", camAge); R.events.Add(CAMEV_LOST, fr, camAge, 0); }
+        camOk = true;
+    } else if (held && camOk) { held = false; bool longHold = (fr - heldSince) > 240; if (longHold) R.forceReset = true; env.log("camera found again (frame %d) -> camhold released after %d frames%s", fr, fr - heldSince, longHold ? ", DLSS-G history reset" : " (short hold: history kept)"); R.events.Add(CAMEV_HOLD, fr, fr - heldSince, longHold ? 1 : 0); }   // v28: a short hold keeps the history (v27 reset every time = hitch)
+    else if (held && (!cfg.camHold || camAge > cfg.camHoldMax)) { held = false; env.log("camhold ended (age %d) -> FG off until the camera is back", camAge); R.events.Add(CAMEV_HOLD_ENDED, fr, camAge, 0); }
+    if (camOk) camStreak++; else camStreak = 0;
+    bool delayOk = in.wasOn || camStreak >= cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
+    bool cutNow = false; { int hh = cutHold.load(); if (hh > 0) { cutHold = hh - 1; cutNow = true; } }   // v22: camera cut -> this frame goes out without frame generation
+    R.camOk = camOk; R.delayOk = delayOk; R.cutNow = cutNow; R.camAge = camAge;
+    return R;
+}
+// SN_EXTRACT_END camhold
 // TrackCamera runs on EVERY SetGraphicsRootConstantBufferView / SetComputeRootConstantBufferView of the game, on every worker thread
 // (thousands per frame in a busy scene). v13 took a global mutex, did a std::map lookup and read the (write-combined = very slow to read)
 // upload memory on each of those calls. Now the common case is a few thread-local compares and an early return:
@@ -702,13 +735,14 @@ static __attribute__((noinline)) void ProbeView(UINT64 va, bool known, int fr) {
         int availF = (int)std::min<UINT64>((it->second.size - off) / 4, 4096);
         // v18: a known view buffer is re-read up to the locked ClipToPrevClip (UE4: 492 -> still 640 floats; UE5: it can be far beyond float 640, v17 cut it off there -> camera lost right after the lock)
         int cap = known ? std::max(640, g_cfg.mvOff + 20) : availF;
-        if (!known && g_camLocked.load(std::memory_order_relaxed) && !g_camRescan.load(std::memory_order_relaxed)) cap = std::max(g_cfg.mvOff + 20, 160);   // v19: offsets locked by the scan -> an unknown address only needs the head up to ClipToPrevClip (v18 copied up to 16 KB of write-combined memory per probe = ~2 ms/frame in the UE5 log)
+        if (!known && g_cam.locked.load(std::memory_order_relaxed) && !g_cam.camRescan.load(std::memory_order_relaxed)) cap = std::max(g_cfg.mvOff + 20, 160);   // v19: offsets locked by the scan -> an unknown address only needs the head up to ClipToPrevClip (v18 copied up to 16 KB of write-combined memory per probe = ~2 ms/frame in the UE5 log)
         nf = std::min(availF, cap);
         if (nf < 64) return;
         memcpy(tmp, it->second.map + off, (size_t)nf * 4);
         it->second.lastUse.store(fr, std::memory_order_relaxed);
     }
-    bool ok = ParseViewBuffer(tmp, nf, off);
+    CamParseResult camPr = g_cam.Parse(CamHostEnv(), tmp, nf, off); CamHostApply(camPr);   // step 5
+    bool ok = camPr.recognised;
     if (ok) { if (!known) AddKnownVA(va); }
     else if (known) DropKnownVA(va);
     else { unsigned h = HashVA(va); g_negVA[h].store(va); g_negFrame[h].store(fr); }
@@ -727,17 +761,17 @@ static void TrackCamera(UINT64 va) {
         // v23: ... and at most 12 re-reads of known view buffers per frame over ALL threads (each one copies up to ~5 KB from write-combined memory = 30-70 us; the log showed ~38 probes/frame = ~1.1 ms/frame)
         { static std::atomic<int> s_kFrame{-1}, s_kCnt{0}; if (s_kFrame.load(std::memory_order_relaxed) != fr) { s_kFrame.store(fr); s_kCnt.store(0); } if (s_kCnt.fetch_add(1) >= 12) return; }
     } else {
-        // 1.0.0 camfast: the camera of THIS frame was already read from a view buffer that matches the offsets (g_camFrame is only set by the strict parse) -> unknown addresses cannot teach us anything new this frame:
+        // 1.0.0 camfast: the camera of THIS frame was already read from a view buffer that matches the offsets (g_cam.camFrame is only set by the strict parse) -> unknown addresses cannot teach us anything new this frame:
         // skip the thread-local table, the negative cache and the probe counters (thousands of draw calls per frame go through here)
-        if (g_cfg.camFast && g_camFrame.load(std::memory_order_relaxed) == fr && !g_camRescan.load(std::memory_order_relaxed)) return;
+        if (g_cfg.camFast && g_cam.camFrame.load(std::memory_order_relaxed) == fr && !g_cam.camRescan.load(std::memory_order_relaxed)) return;
         unsigned h = HashVA(va);
         TcEntry& e = t.e[h];
         if (e.va != va || e.frame != fr) { e.va = va; e.frame = fr; e.cnt = 0; }
         if (++e.cnt != 2) return;                       // only buffers bound >= 2x in one frame on this thread (the view buffer is bound by every pass)
         // v16: while a BUSY 3D scene is rendering but no camera was found for >2 frames, search harder (more probes per frame, short negative cache:
         // the allocator re-uses addresses, so an address rejected earlier may hold the view buffer now). Menus/loading (few CBV calls) are not boosted.
-        bool lost = (fr - g_camFrame.load(std::memory_order_relaxed)) > 2 && g_cbvPerFrame.load(std::memory_order_relaxed) > 1000;
-        if (g_negVA[h].load(std::memory_order_relaxed) == va && fr - g_negFrame[h].load(std::memory_order_relaxed) < (lost ? 2 : (g_camLocked.load(std::memory_order_relaxed) ? 120 : 30))) return;   // v23: 120 frames once the offsets are locked
+        bool lost = (fr - g_cam.camFrame.load(std::memory_order_relaxed)) > 2 && g_cbvPerFrame.load(std::memory_order_relaxed) > 1000;
+        if (g_negVA[h].load(std::memory_order_relaxed) == va && fr - g_negFrame[h].load(std::memory_order_relaxed) < (lost ? 2 : (g_cam.locked.load(std::memory_order_relaxed) ? 120 : 30))) return;   // v23: 120 frames once the offsets are locked
         if (g_probeFrame.load(std::memory_order_relaxed) != fr) { g_probeFrame.store(fr); g_probeCnt.store(0); }
         if (g_probeCnt.fetch_add(1) >= (lost ? 96 : 24)) return;
     }
@@ -1163,7 +1197,7 @@ static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3
     c.ptr += g_mvInc; sv.Format = DepthSrvFormat(ResDesc(depth).Format); g_device->CreateShaderResourceView(depth, &sv, c);
     c.ptr += g_mvInc; D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; uv.Format = DXGI_FORMAT_R16G16_FLOAT; g_device->CreateUnorderedAccessView(g_mvOut, nullptr, &uv, c);
     c.ptr += g_mvInc; uv.Format = DXGI_FORMAT_R32_FLOAT; g_device->CreateUnorderedAccessView(g_depthOut, nullptr, &uv, c);
-    struct { float m[16]; UINT w, h; float sx, sy; UINT fw, fh; } k; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(k.m, g_c2p, sizeof k.m); }
+    struct { float m[16]; UINT w, h; float sx, sy; UINT fw, fh; } k; { std::lock_guard<std::mutex> lk(g_cam.camMx); memcpy(k.m, g_cam.c2p, sizeof k.m); }
     k.w = VW; k.h = VH; k.sx = (float)g_cfg.mvSX; k.sy = (float)g_cfg.mvSY; k.fw = W; k.fh = H;
     ID3D12DescriptorHeap* hh[1] = { g_mvHeap }; cl->SetDescriptorHeaps(1, hh);
     cl->SetComputeRootSignature(g_mvRS); cl->SetPipelineState(g_mvPSO);
@@ -1299,7 +1333,7 @@ static bool Inv4(const float* m, float* out) {
 }
 static void ToSl(const float* m, sl::float4x4& o) { for (int r = 0; r < 4; r++) o.row[r] = sl::float4(m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]); }
 static bool BuildConstants(sl::Constants& c, bool reset) {
-    float vtc[16], c2p[16], j[2]; { std::lock_guard<std::mutex> lk(g_camMx); memcpy(vtc, g_vtcNoAA, sizeof vtc); memcpy(c2p, g_c2p, sizeof c2p); j[0] = g_jitNX * (float)EffW(); j[1] = g_jitNY * (float)EffH(); }
+    float vtc[16], c2p[16], j[2]; { std::lock_guard<std::mutex> lk(g_cam.camMx); memcpy(vtc, g_cam.vtcNoAA, sizeof vtc); memcpy(c2p, g_cam.c2p, sizeof c2p); j[0] = g_cam.jitNX * (float)EffW(); j[1] = g_cam.jitNY * (float)EffH(); }
     float inv1[16], inv2[16];
     if (!Inv4(vtc, inv1)) return false;
     if (!Inv4(c2p, inv2)) {   // 1.1.4: a non-invertible ClipToPrevClip used to make this return false EVERY frame -> frame generation never started (log: 'FG not ready' for 15000+ frames, ON immediately after the candidate switch)
@@ -1501,13 +1535,13 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     if (fr == 1 || (fr % 600) == 0) {
         DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d))) { g_dispW = d.BufferDesc.Width; g_dispH = d.BufferDesc.Height; g_scW = g_dispW; g_scH = g_dispH; if (g_dispW) { g_autoW = g_dispW; g_autoH = g_dispH; } }
         size_t nb_; { std::shared_lock<std::shared_mutex> lkb(g_bufMx); nb_ = g_bufs.size(); }
-        Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_camFrame.load(), bbd);
+        Log("Present: frame=%d swapchain %ux%u fmt=%d buffers=%u | pins vel=%p depth=%p | camFrame=%d | bbdraws(last)=%d", fr, g_dispW, g_dispH, (int)d.BufferDesc.Format, d.BufferCount, (void*)g_pinVel, (void*)g_pinDepth, g_cam.camFrame.load(), bbd);
         static long s_pn = 0, s_pns = 0; long pn = g_probeN.load(), pns = g_probeNs.load();
         Log("cam-diag: probes +%ld (%.2f ms total, %.1f us each) cbv/frame=%ld", pn - s_pn, (pns - s_pns) / 1e6, pn > s_pn ? (pns - s_pns) / 1e3 / (double)(pn - s_pn) : 0.0, g_cbvPerFrame.load()); s_pn = pn; s_pns = pns;
-        Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_projSeen.load(), g_scanRuns.load(), g_camLocked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
+        Log("cam-diag: upload bufs registered=%zu rootCBV calls=%ld (no-buffer misses=%ld) projection-like matrices seen=%ld scans=%ld locked=%d offsets proj=%d noaa=%d mv=%d render=%dx%d", nb_, g_cbvCalls.load(), g_cbvMiss.load(), g_cam.projSeen.load(), g_cam.scanRuns.load(), g_cam.locked.load(), g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff, EffW(), EffH());
         if (g_cfg.hookProf) { char hb[640]; int hl = 0; hb[0] = 0; for (int q = 0; q < 6; q++) { long long hn = g_hp[q].ns.exchange(0), hc = g_hp[q].calls.exchange(0); hl += snprintf(hb + hl, sizeof(hb) - (size_t)hl, " %s=%.3fms/frame(%.2fus x%lld)", kHpName[q], (double)hn / 1e6 / 600.0, hc ? (double)hn / 1e3 / (double)hc : 0.0, hc); if (hl >= (int)sizeof(hb) - 80) break; }
             Log("hook-prof (injector CPU per frame, last ~600 frames, hookfast=%d):%s", g_cfg.hookFast, hb); }
-        Log("cam-diag: registry %llu MB / cap %d MB (%zu buffers) evicted=%ld skipped=%ld rescan=%d camAge=%d", (unsigned long long)(g_bufBytes >> 20), g_cfg.bufMaxMB, nb_, g_evicted.load(), g_regSkipped.load(), g_camRescan.load(), fr - g_camFrame.load());
+        Log("cam-diag: registry %llu MB / cap %d MB (%zu buffers) evicted=%ld skipped=%ld rescan=%d camAge=%d", (unsigned long long)(g_bufBytes >> 20), g_cfg.bufMaxMB, nb_, g_evicted.load(), g_regSkipped.load(), g_cam.camRescan.load(), fr - g_cam.camFrame.load());
     }
     { double tp0 = NowMs(); UpdatePins(); g_tPins = NowMs() - tp0; }
     // Build the MV pipeline + buffers as soon as the pins are known (long before warm-up ends), on a worker thread: the first frame with frame generation
@@ -1555,22 +1589,9 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     }
     bool wantOn = g_cfg.fg && !g_acTripped.load() && g_cfg.stage >= 2 && fr >= g_cfg.warmup && !g_deviceLost.load() && !s_susp && !g_compatBlocked.load() && s_stallHold <= 0;
     if (s_stallHold > 0) s_stallHold--;
-    int camAge = fr - g_camFrame.load(); bool camOk = g_camFrame.load() >= 0 && camAge <= g_cfg.camStale;
-    // v24: camera tracker lost the view buffer (loading screen, level streaming, tracker blind spot): re-scan with relaxed checks, and - if FG was running - keep it running.
-    static bool s_held = false; static int s_rescanStart = -1, s_rescanCool = 0, s_heldSince = 0;
-    if (g_cfg.camRescan > 0 && g_camFrame.load() >= 0 && !camOk && camAge > g_cfg.camRescan && !g_camRescan.load() && fr >= s_rescanCool) {
-        g_camRescan = 1; s_rescanStart = fr; Log("camera lost for %d frames (last view buffer at frame %d) -> re-scanning with relaxed checks (registry %llu MB, evicted %ld, skipped %ld)", camAge, g_camFrame.load(), (unsigned long long)(g_bufBytes >> 20), g_evicted.load(), g_regSkipped.load());
-    }
-    if (g_camRescan.load() && fr - s_rescanStart > 1200) { g_camRescan = 0; s_rescanCool = fr + 600; Log("camera re-scan: giving up for 600 frames (no view buffer found in 1200 frames)"); }
-    if (!camOk && g_cfg.camHold && g_camFrame.load() >= 0 && camAge <= g_cfg.camHoldMax && (g_wasOn || s_held)) {
-        { std::lock_guard<std::mutex> lkh(g_camMx); for (int i = 0; i < 16; i++) g_c2p[i] = ((i % 5) == 0) ? 1.f : 0.f; g_jitPX = g_jitPY = g_jitNX = g_jitNY = 0.f; }
-        if (!s_held) { s_held = true; s_heldSince = fr; Log("camera lost (age %d) while FG is running -> camhold: FG stays ON with the last projection + identity ClipToPrevClip (optical flow only) until the camera is found again", camAge); }
-        camOk = true;
-    } else if (s_held && camOk) { s_held = false; bool longHold = (fr - s_heldSince) > 240; if (longHold) g_forceReset = true; Log("camera found again (frame %d) -> camhold released after %d frames%s", fr, fr - s_heldSince, longHold ? ", DLSS-G history reset" : " (short hold: history kept)"); }   // v28: a short hold keeps the history (v27 reset every time = hitch)
-    else if (s_held && (!g_cfg.camHold || camAge > g_cfg.camHoldMax)) { s_held = false; Log("camhold ended (age %d) -> FG off until the camera is back", camAge); }
-    static int s_camStreak = 0; if (camOk) s_camStreak++; else s_camStreak = 0;
-    bool delayOk = g_wasOn || s_camStreak >= g_cfg.fgDelay;       // already running: keep going; (re)starting: wait until the view has been stable for fgdelay frames
-    bool cutNow = false; { int hh = g_cutHold.load(); if (hh > 0) { g_cutHold = hh - 1; cutNow = true; } }   // v22: camera cut -> this frame goes out without frame generation
+    CamFrameIn camIn; camIn.frame = fr; camIn.wasOn = g_wasOn; camIn.regMB = (long)(g_bufBytes >> 20); camIn.evicted = g_evicted.load(); camIn.regSkipped = g_regSkipped.load();
+    CamFrameResult camR = g_cam.Frame(CamHostEnv(), camIn); CamHostApplyFrame(camR);   // step 5: camera age / rescan / camhold / cut-hold decay live in CamTracker::Frame
+    int camAge = camR.camAge; bool camOk = camR.camOk, delayOk = camR.delayOk, cutNow = camR.cutNow;
     bool inputs = false; sl::Constants consts{}; D3D12_RESOURCE_DESC cachedVd = {};
     if (wantOn && camOk && delayOk && g_pinVel && g_pinDepth && g_queue && !g_mvPreIniting.load()) {
         D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth); cachedVd = vd;   // v25: reused below (was queried again)
@@ -1866,7 +1887,7 @@ static HRESULT WINAPI hkCreateDXGIFactory2(UINT fl, REFIID riid, void** pp) {
 static DWORD WINAPI InitThread(LPVOID) {
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_dir = exe; g_dir = g_dir.substr(0, g_dir.find_last_of(L'\\'));
-    LoadCfg();
+    LoadCfg(); g_cam.Init({ g_cfg.projOff, g_cfg.noAAOff, g_cfg.mvOff });   // step 5: the tracker owns the working offsets from here on (g_cfg.projOff/noAAOff/mvOff = mirror written by CamHostApply)
     if (g_cfg.antiCheat) { std::string lab, wh; if (AcScanFiles(lab, wh) || AcScanModules(lab, wh)) { g_acTripped = true; AcNotice(lab, wh); return 0; } }   // v27: BEFORE anything is hooked
     else Log("anticheat=0: anti-cheat guard skipped");
     CrashInit();   // v27
