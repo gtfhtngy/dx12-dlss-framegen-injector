@@ -30,7 +30,7 @@ static bool HudCalFormat(DXGI_FORMAT f, DXGI_FORMAT* typed, int* cls) {
     default: return false; }
 }
 // camera + 3D scene present right now?
-static bool HudCalSceneOk(int fr) { int cf = g_camFrame.load(); return g_pinDepth && cf >= 0 && fr - cf <= 5; }
+static bool HudCalSceneOk(int fr) { int cf = g_cam.camFrame.load(); return g_pinDepth && cf >= 0 && fr - cf <= 5; }
 static void HudCalFinish(int phase, int n, int agree) {
     g_hc.phase = phase;
     if (phase == 3) {
