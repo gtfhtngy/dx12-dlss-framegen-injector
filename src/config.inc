@@ -54,6 +54,10 @@ struct Cfg {
     int overlayPos = 0;      // 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right
     int overlayScale = 100;  // percent
     int overlayOpacity = 80; // percent (background)
+    int brain = 1;           // 1.1.8: brain v0 - adaptive MV falloff (camera-motion driven, safe limits, session only); 0 = the fixed 1.1.7 values (also switches brainlearn / brainload off)
+    int brainLearn = 1;      // brain v1: learned camera predictor on top of the v0 rule (same limits, only ever raises the v0 target); 0 = plain v0 rule
+    int brainLoad = 1;       // brain v1: learned load governor: decides WHEN the injector's own housekeeping jobs run (hard maximum wait, nothing else touched); 0 = the fixed cadence
+    int holoQuality = 1;     // v28: system hologram density 0 = low, 1 = medium, 2 = high
     int overlayBlock = 1;    // 1 = while the menu is open, swallow the menu keys so the game does not see them
     int overlayHook = 1;     // 1 = low-level keyboard hook (never misses a key press, can swallow keys); 0 = polling inside Present only
     int autoSave = 1;        // 1 = every change made in the menu is written back to SN_DLSSG_cfg.txt
@@ -162,7 +166,7 @@ static void LoadCfg() {
                 "# overlaypos   : 0 = top-left 1 = top-right 2 = bottom-left 3 = bottom-right ; overlayscale / overlayopacity in percent\n"
                 "# overlayblock : 1 = while the menu is open the menu keys are NOT sent to the game ; overlayhook=0 = no keyboard hook (polling only)\n"
                 "# autosave     : 1 = changes made in the menu are written back to this file ; autoreport=1 = write SN_DLSSG_DEBUG_REPORT.txt when FG cannot work\n"
-                "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n"
+                "overlay=1\noverlaykey=INSERT\nshowfps=0\nshowfgfps=0\nshowframetime=0\noverlaypos=0\noverlayscale=100\noverlayopacity=80\nholoquality=1\nbrain=1\nbrainlearn=1\nbrainload=1\noverlayblock=1\noverlayhook=1\nautosave=1\nautoreport=1\nmsgbox=1\n"
                 "# ---- v26: psocache = persistent cache of the GAME's pipelines (SN_DLSSG_psocache.bin)\n"
                 "psocache=1\npsocachemb=384\n"
                 "# ---- 1.1.7: cachecompress = 1 packs SN_DLSSG_psocache.bin / SN_DLSSG_shaders.snsc (about half the size, also in RAM: the psocachemb budget holds ~2x more pipelines). 0 = store raw. Old files are converted automatically.\n"
@@ -224,7 +228,7 @@ static void LoadCfg() {
             else if (!strcmp(k, "sldir")) { wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 400); g_cfg.slDir = w; }
             else if (!strcmp(k, "overlay")) g_cfg.overlay = iv ? 1 : 0; else if (!strcmp(k, "overlaykey")) g_cfg.overlayKey = ParseKeyName(v);
             else if (!strcmp(k, "showfps")) g_cfg.showFps = iv ? 1 : 0; else if (!strcmp(k, "showfgfps")) g_cfg.showFgFps = iv ? 1 : 0; else if (!strcmp(k, "showframetime")) g_cfg.showFrameTime = iv ? 1 : 0;
-            else if (!strcmp(k, "overlaypos")) g_cfg.overlayPos = iv; else if (!strcmp(k, "overlayscale")) g_cfg.overlayScale = iv; else if (!strcmp(k, "overlayopacity")) g_cfg.overlayOpacity = iv;
+            else if (!strcmp(k, "overlaypos")) g_cfg.overlayPos = iv; else if (!strcmp(k, "overlayscale")) g_cfg.overlayScale = iv; else if (!strcmp(k, "overlayopacity")) g_cfg.overlayOpacity = iv; else if (!strcmp(k, "holoquality")) g_cfg.holoQuality = iv; else if (!strcmp(k, "brain")) g_cfg.brain = iv ? 1 : 0; else if (!strcmp(k, "brainlearn")) g_cfg.brainLearn = iv ? 1 : 0; else if (!strcmp(k, "brainload")) g_cfg.brainLoad = iv ? 1 : 0;
             else if (!strcmp(k, "overlayblock")) g_cfg.overlayBlock = iv ? 1 : 0; else if (!strcmp(k, "overlayhook")) g_cfg.overlayHook = iv ? 1 : 0;
             else if (!strcmp(k, "autosave")) g_cfg.autoSave = iv ? 1 : 0; else if (!strcmp(k, "autoreport")) g_cfg.autoReport = iv ? 1 : 0; else if (!strcmp(k, "msgbox")) g_cfg.msgBox = iv ? 1 : 0;
         }
@@ -236,7 +240,7 @@ static void LoadCfg() {
     if (g_cfg.c2pIdx < 0) g_cfg.c2pIdx = 0; if (g_cfg.c2pIdx > 3) g_cfg.c2pIdx = 3;
     if (g_cfg.renderW < 0 || g_cfg.renderH < 0) g_cfg.renderW = g_cfg.renderH = 0;
     if (g_cfg.overlayPos < 0 || g_cfg.overlayPos > 3) g_cfg.overlayPos = 0;
-    g_cfg.overlayScale = std::min(250, std::max(50, g_cfg.overlayScale)); g_cfg.overlayOpacity = std::min(100, std::max(20, g_cfg.overlayOpacity));
+    g_cfg.overlayScale = std::min(250, std::max(50, g_cfg.overlayScale)); g_cfg.overlayOpacity = std::min(100, std::max(20, g_cfg.overlayOpacity)); g_cfg.holoQuality = std::min(2, std::max(0, g_cfg.holoQuality));
     g_cfg.psoCacheMB = std::min(4096, std::max(32, g_cfg.psoCacheMB));
     if (g_cfg.targetFps < 0) g_cfg.targetFps = 0; if (g_cfg.targetFps > 1000) g_cfg.targetFps = 1000;
     if (g_cfg.fgMinFps < 0) g_cfg.fgMinFps = 0; if (g_cfg.baseFpsLimit < 0) g_cfg.baseFpsLimit = 0;
