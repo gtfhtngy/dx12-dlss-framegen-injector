@@ -10,6 +10,7 @@
 // It runs on its own command list on the game's direct queue (same pattern as the motion-vector pass) and uses nothing the game owns except the back buffer.
 // Any failure switches the overlay off (log line) - frame generation itself is never affected.
 
+#include "holo.h"   // v28: system hologram (pure C++ renderer)
 static bool g_ovBroken = false;
 
 // ------------------------------------------------------------------ small helpers
@@ -18,12 +19,13 @@ static inline double OvNowMs() { if (!g_ovQf.QuadPart) QueryPerformanceFrequency
 static bool OvForegroundIsUs() { HWND h = GetForegroundWindow(); if (!h) return false; DWORD pid = 0; GetWindowThreadProcessId(h, &pid); return pid == GetCurrentProcessId(); }
 
 enum { C_TEXT, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_TITLE };
-enum OvItem { I_FG, I_PRESET, I_MULT, I_TARGET, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWGRAPH, I_SHOWVRAM, I_MINFPS, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_POS, I_SCALE, I_OPACITY, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
+enum OvItem { I_FG, I_PRESET, I_MULT, I_TARGET, I_SHOWFPS, I_SHOWFG, I_SHOWFT, I_SHOWGRAPH, I_SHOWVRAM, I_MINFPS, I_REFLEXMODE, I_CAMHOLD, I_CUT, I_MENUDET, I_DYNRES, I_HUDLESS, I_BRAIN, I_BRAINLOAD, I_POS, I_SCALE, I_OPACITY, I_HOLOQ, I_HOLO, I_REPORT, I_BUNDLE, I_CLOSE, I_COUNT };   // v27: preset, output cap, hudless, support zip
 struct OvGlobals {
     std::atomic<bool> menuOpen{ false }; int sel = 0;
     std::atomic<unsigned> qHead{ 0 }, qTail{ 0 }; unsigned char q[64] = {};
     std::atomic<bool> hookOk{ false }, drawnOnce{ false };
     std::string msg; DWORD msgTick = 0; bool msgBad = false;
+    std::atomic<bool> holoOpen{ false }; int holoSel = 0;   // v28: hologram page open / selected node
     std::string toast; DWORD toastTick = 0; int toastCol = 0;   // v27: short on-screen note for hotkeys
 } g_ov;
 
@@ -125,6 +127,64 @@ static void Diag_OnVerdictChanged() {
     else if (v.state == 1) g_bannerActive = false;
 }
 
+
+// ------------------------------------------------------------------ v28: system hologram - live status of every subsystem
+struct OvHoloInfo { int st[holo::N_COUNT]; std::string detail[holo::N_COUNT], check[holo::N_COUNT]; };
+static void OvHoloGather(OvHoloInfo& H) {
+    using namespace holo; DiagRuntime rt; DiagRuntimeFill(rt);
+    auto set = [&](int n, int st, const std::string& d, const std::string& c = std::string()) { H.st[n] = st; H.detail[n] = d; H.check[n] = c; };
+    // GPU + driver (from the adapter scan that the compatibility check already did)
+    if (!g_gpuDone.load()) { set(N_GPU, ST_OFF, "scanning ..."); set(N_DRIVER, ST_OFF, "scanning ..."); }
+    else {
+        const GpuInfo* g = nullptr; for (auto& x : g_gpus) if (x.nvidia && !x.software) { g = &x; break; }
+        if (!g) { set(N_GPU, ST_ERR, "no NVIDIA GPU found", "DLSS frame generation needs a GeForce RTX 40 / 50 series card."); set(N_DRIVER, ST_ERR, "no NVIDIA driver", "Install the current NVIDIA Game Ready driver."); }
+        else {
+            bool noFg = g->genGuess.find("NO DLSS") != std::string::npos;
+            set(N_GPU, noFg ? ST_ERR : ST_OK, g->name + (g->genGuess.empty() ? std::string() : "  -  " + g->genGuess), noFg ? "This GPU generation has no DLSS frame generation (RTX 40 / 50 needed)." : "");
+            set(N_DRIVER, ST_OK, g->driver.empty() ? std::string("NVIDIA driver present") : "NVIDIA driver " + g->driver);
+        }
+    }
+    // Streamline
+    if (!rt.slInit) set(N_SL, ST_ERR, "Streamline is not loaded", "Check that sl.interposer.dll and the sl.*.dll files are next to the game exe (see the log).");
+    else if (!rt.slRuntime) set(N_SL, ST_WARN, "loaded, runtime not ready yet", "Wait until gameplay; if it stays like this read the log.");
+    else set(N_SL, ST_OK, "loaded and running");
+    // D3D12 device / queue / swap chain
+    if (!rt.d3d12Swap) { set(N_D3D12, ST_ERR, "the game does not use D3D12", "This injector only works with D3D12 (DX12) games."); set(N_SWAP, ST_ERR, "not a D3D12 swap chain"); }
+    else {
+        if (rt.haveDevice && rt.haveQueue) set(N_D3D12, ST_OK, "device and direct queue captured"); else set(N_D3D12, ST_WARN, "waiting for the device / queue", "Wait until the game has drawn its first frames.");
+        if (rt.dispW) set(N_SWAP, ST_OK, Fmt("%ux%u, %u buffers", rt.dispW, rt.dispH, rt.bufCount)); else set(N_SWAP, ST_WARN, "no frame presented yet");
+    }
+    // Reflex
+    if (!rt.slRuntime) set(N_REFLEX, ST_OFF, "waiting for Streamline");
+    else if (g_cfg.reflexMode == 0) set(N_REFLEX, ST_WARN, "mode OFF", "Frame Generation needs Reflex markers: set the Reflex mode to Low latency.");
+    else set(N_REFLEX, ST_OK, std::string("mode ") + SnReflexModeName(g_cfg.reflexMode));
+    // camera / depth / velocity / MV pass
+    const bool warm = rt.frame < rt.warmup;
+    if (rt.projOff) set(N_CAMERA, ST_OFF, "camera detection switched off in the config");
+    else if (rt.camLocked) set(N_CAMERA, ST_OK, rt.camAge >= 0 ? Fmt("locked, last seen %d frames ago", rt.camAge) : std::string("locked"));
+    else if (warm) set(N_CAMERA, ST_OFF, "warming up ...");
+    else set(N_CAMERA, ST_WARN, "camera not found yet", "Get into the 3D game world (not a menu / cut-scene). If it never locks, send the report.");
+    if (rt.depthPinned) set(N_DEPTH, ST_OK, "depth buffer found"); else if (warm) set(N_DEPTH, ST_OFF, "warming up ..."); else set(N_DEPTH, ST_WARN, "depth buffer not found yet", "Get into the 3D game world.");
+    if (rt.mvOff) set(N_VEL, ST_OFF, "motion vectors switched off in the config");
+    else if (rt.velPinned && !rt.velDummy) set(N_VEL, ST_OK, "game velocity buffer found");
+    else if (rt.mvReady) set(N_VEL, ST_OK, "computed by the MV pass");
+    else if (warm) set(N_VEL, ST_OFF, "warming up ...");
+    else set(N_VEL, ST_WARN, rt.velDummy ? "dummy velocity in use" : "no velocity source yet", "Wait a few seconds in gameplay.");
+    if (rt.mvOff) set(N_MV, ST_OFF, "switched off in the config");
+    else if (rt.mvFailed) set(N_MV, ST_ERR, "the MV compute pass failed to start", "Open the log (SN_DLSSG.log) and look for 'MV pass' lines; send the support zip.");
+    else if (rt.mvReady) set(N_MV, ST_OK, Fmt("running (%dx%d)", rt.effW, rt.effH));
+    else set(N_MV, ST_WARN, "building the shader ...", "First start compiles the shader; wait a moment.");
+    // DLSS-G
+    if (!rt.slInit || rt.compatBlocked) set(N_DLSSG, ST_ERR, rt.compatBlocked ? "not supported on this system" : "Streamline not loaded", "See the compatibility line in the menu and the debug report.");
+    else if (rt.tagRes > 0 || rt.constRes > 0 || rt.optRes > 0) set(N_DLSSG, ST_ERR, Fmt("Streamline error (tags %d, constants %d, options %d)", rt.tagRes, rt.constRes, rt.optRes), "Write the debug report and attach it to a GitHub Issue.");
+    else if (rt.wasOn) set(N_DLSSG, ST_OK, Fmt("ACTIVE  x%.1f", rt.ratio));
+    else if (!rt.fgWanted) set(N_DLSSG, ST_OFF, "Frame Generation is switched off");
+    else if (rt.susp) set(N_DLSSG, ST_WARN, "paused (base fps below the pause limit)");
+    else set(N_DLSSG, ST_WARN, std::string("not active - ") + (rt.why && rt.why[0] ? rt.why : "waiting"));
+    // overlay itself
+    if (g_ovBroken) set(N_OVERLAY, ST_ERR, "renderer was switched off after an error"); else if (g_ov.hookOk.load()) set(N_OVERLAY, ST_OK, "keyboard hook active"); else set(N_OVERLAY, ST_WARN, "keys are polled (no hook)");
+}
+
 // ------------------------------------------------------------------ menu model
 static const int kMinFpsSteps[] = { 0, 20, 24, 30, 40, 45, 60 };
 static const int kTargetSteps[] = { 0, 60, 72, 90, 100, 120, 144, 165, 180, 240 };   // 1.0.0: target-fps mode
@@ -138,7 +198,7 @@ template <size_t N> static int StepCycle(const int(&a)[N], int cur, int dir) {  
 static void OvToast(const std::string& s, int col) { g_ov.toast = s; g_ov.toastTick = GetTickCount(); g_ov.toastCol = col; }
 static void OvSay(const std::string& s, bool bad = false) { g_ov.msg = s; g_ov.msgTick = GetTickCount(); g_ov.msgBad = bad; }
 static DWORD WINAPI OvReportThread(LPVOID) { DiagWriteReport("manual (menu)"); return 0; }
-static void OvCloseMenu() { g_ov.menuOpen = false; CfgSaveSoon(); if (g_bannerSeen.load()) g_bannerActive = false; }
+static void OvCloseMenu() { g_ov.menuOpen = false; g_ov.holoOpen = false; CfgSaveSoon(); if (g_bannerSeen.load()) g_bannerActive = false; }
 static const int kOutCapSteps[] = { 0, -1, 60, 72, 90, 120, 144, 165, 240 };
 static int OutCapCycle(int cur, int dir) { int n = (int)(sizeof kOutCapSteps / sizeof kOutCapSteps[0]), i = 0; for (int k = 0; k < n; k++) if (kOutCapSteps[k] == cur) i = k; return kOutCapSteps[(i + (dir >= 0 ? 1 : n - 1)) % n]; }
 static void OvPresetCustom() { if (g_cfg.preset) { g_cfg.preset = 0; CfgSet("preset", "custom"); } }   // a hand-made change to a preset key makes the preset 'custom'
@@ -181,6 +241,10 @@ static void OvAdjust(int item, int dir, bool enter) {
     case I_POS: g_cfg.overlayPos = (g_cfg.overlayPos + (dir >= 0 ? 1 : 3)) % 4; CfgSetInt("overlaypos", g_cfg.overlayPos); break;
     case I_SCALE: g_cfg.overlayScale = StepCycle(kScaleSteps, g_cfg.overlayScale, dir >= 0 ? 1 : -1); CfgSetInt("overlayscale", g_cfg.overlayScale); break;
     case I_OPACITY: g_cfg.overlayOpacity = StepCycle(kOpacitySteps, g_cfg.overlayOpacity, dir >= 0 ? 1 : -1); CfgSetInt("overlayopacity", g_cfg.overlayOpacity); break;
+    case I_BRAIN: tog(g_cfg.brain, "brain", "brain (adaptive MV falloff)"); break;
+    case I_BRAINLOAD: tog(g_cfg.brainLoad, "brainload", "brain load manager (timing of background jobs)"); break;
+    case I_HOLOQ: g_cfg.holoQuality = (g_cfg.holoQuality + (dir >= 0 ? 1 : 2)) % 3; CfgSetInt("holoquality", g_cfg.holoQuality); break;
+    case I_HOLO: if (enter) { g_ov.holoOpen = true; g_ov.holoSel = 0; } break;
     case I_REPORT: if (enter) { HANDLE h = CreateThread(nullptr, 0, OvReportThread, nullptr, 0, nullptr); if (h) CloseHandle(h); OvSay("Debug report is being written next to the game exe: " SN_REPORT_NAME); } break;
     case I_BUNDLE: if (enter) { BundleStart(); OvSay("Creating the support zip ..."); } break;
     case I_CLOSE: if (enter) OvCloseMenu(); break;
@@ -193,6 +257,14 @@ static void OvProcessKeys() {
         if (g_cfg.hudKey && vk == g_cfg.hudKey && vk != g_cfg.overlayKey) { OvToggleHud(); continue; }
         if (vk == g_cfg.overlayKey) { if (g_ov.menuOpen.load()) OvCloseMenu(); else { g_ov.menuOpen = true; g_bannerSeen = true; Log("overlay menu opened"); } continue; }
         if (!g_ov.menuOpen.load()) continue;
+        if (g_ov.holoOpen.load()) {   // v28: hologram page keys
+            switch (vk) {
+            case VK_LEFT: case VK_UP: case VK_NUMPAD4: case VK_NUMPAD8: g_ov.holoSel = (g_ov.holoSel + holo::N_COUNT - 1) % holo::N_COUNT; break;
+            case VK_RIGHT: case VK_DOWN: case VK_NUMPAD6: case VK_NUMPAD2: g_ov.holoSel = (g_ov.holoSel + 1) % holo::N_COUNT; break;
+            case VK_RETURN: case VK_NUMPAD5: case VK_ESCAPE: g_ov.holoOpen = false; break;
+            }
+            continue;
+        }
         switch (vk) {
         case VK_UP: case VK_NUMPAD8: g_ov.sel = (g_ov.sel + I_COUNT - 1) % I_COUNT; break;
         case VK_DOWN: case VK_NUMPAD2: g_ov.sel = (g_ov.sel + 1) % I_COUNT; break;
@@ -206,7 +278,7 @@ static void OvProcessKeys() {
 
 // ------------------------------------------------------------------ panel content
 // OvBuild only describes WHAT is shown (a list of typed lines); OvPanelRender decides how it looks.
-enum OvKind { OVK_TEXT, OVK_HUD, OVK_TOAST, OVK_TITLE, OVK_STAT, OVK_SECTION, OVK_ROW, OVK_NOTE, OVK_HINT, OVK_GAP, OVK_DIV, OVK_GRAPH, OVK_ALERT };
+enum OvKind { OVK_TEXT, OVK_HUD, OVK_TOAST, OVK_TITLE, OVK_STAT, OVK_SECTION, OVK_ROW, OVK_NOTE, OVK_HINT, OVK_GAP, OVK_DIV, OVK_GRAPH, OVK_ALERT, OVK_HOLO };
 enum OvCtl { OVC_NONE, OVC_TOGGLE, OVC_CHOICE, OVC_ACTION };
 // t = label / text, v = value (right column), v2 = small dim text left of the value, on = toggle state (OVK_STAT: show a status dot)
 struct OvLine { std::string t, v, v2; int col = C_TEXT; bool sel = false; int kind = OVK_TEXT; int ctl = OVC_NONE; bool on = false; };
@@ -257,6 +329,32 @@ static void OvBuild(std::vector<OvLine>& L) {
     if (g_ov.menuOpen.load()) {
         if (!L.empty()) L.push_back(OvMk(OVK_DIV, ""));
         L.push_back(OvMk(OVK_TITLE, "DLSS Frame Generation", C_TITLE, "SN_DLSSG " SN_VERSION));
+        if (g_ov.holoOpen.load()) {   // v28: hologram page replaces the settings list
+            OvHoloInfo H; OvHoloGather(H); holo::Update(H.st, OvNowMs());
+            const int bMode = g_brainSnap.mode, bFrames = g_brainSnap.frames; holo::g_state.brain = g_brainSnap.activity; holo::g_state.brainMode = bFrames > 0 ? bMode : 0;   // the core of the picture = the brain
+            int n = g_ov.holoSel = (g_ov.holoSel % holo::N_COUNT + holo::N_COUNT) % holo::N_COUNT; int nerr = 0, nwarn = 0; for (int i = 0; i < holo::N_COUNT; i++) { nerr += H.st[i] == holo::ST_ERR; nwarn += H.st[i] == holo::ST_WARN; }
+            { OvLine l = OvMk(OVK_STAT, "System", nerr ? C_RED : nwarn ? C_YELLOW : C_GREEN, nerr ? Fmt("%d problem%s - see the red node", nerr, nerr > 1 ? "s" : "") : nwarn ? Fmt("%d warning%s", nwarn, nwarn > 1 ? "s" : "") : std::string("all subsystems healthy")); l.on = true; L.push_back(l); }
+            { OvLine l = OvMk(OVK_HOLO, ""); l.v = std::to_string(GetTickCount() / 83); for (int i = 0; i < holo::N_COUNT; i++) l.v2 += (char)('0' + holo::g_state.shown[i]); l.v2 += (char)('a' + n); l.on = true; L.push_back(l); }
+            { const int stt = holo::g_state.shown[n]; static const char* sn[] = { "OK", "WARNING", "ERROR", "off" }; int col = stt == holo::ST_ERR ? C_RED : stt == holo::ST_WARN ? C_YELLOW : stt == holo::ST_OFF ? C_GRAY : C_GREEN;
+              OvLine l = OvMk(OVK_STAT, holo::kNodeName[n], col, sn[stt & 3]); l.on = true; L.push_back(l);
+              OvWrap(L, H.detail[n], C_TEXT, 58); if (!H.check[n].empty() && stt != holo::ST_OK) OvWrap(L, "Check: " + H.check[n], C_YELLOW, 58, "       "); }
+            { std::string bt; int bc;   // 1.1.8: brain v0 status (the glowing core of the picture)
+              if (!g_cfg.brain) { bt = "OFF - fixed MV fade values (menu > Brain switches it on)"; bc = C_GRAY; }
+              else if (bFrames <= 0) { bt = "waiting for the first motion-vector frame"; bc = C_GRAY; }
+              else if (bMode == brain::MODE_SAFE) { bt = Fmt("SAFE - defaults (fade %.2f..%.2f) after a cut / pause / lost camera", (double)g_brainSnap.f0, (double)g_brainSnap.f1); bc = C_YELLOW; }
+              else { bt = Fmt("adapting - camera motion %.2f, MV fade %.2f..%.2f (default 0.35..1.00)", (double)g_brainSnap.cam, (double)g_brainSnap.f0, (double)g_brainSnap.f1); bc = C_GREEN; }
+              OvLine l = OvMk(OVK_STAT, "Brain", bc, bt); l.on = true; L.push_back(l);
+              if (g_cfg.brain && bFrames > 0) OvWrap(L, Fmt("adapted %d%% of the frames, %d safe hold%s. Only the fade window is touched; FG multiplier and pause limit stay yours.", (int)g_brainSnap.adaptedPct, (int)g_brainSnap.troubleHolds, g_brainSnap.troubleHolds == 1 ? "" : "s"), C_GRAY, 58);
+              if (g_cfg.brain && bFrames > 0 && g_cfg.brainLearn) OvWrap(L, g_brainSnap.predReady ? Fmt("camera predictor: learned, typical error %.3f", (double)g_brainSnap.predErr) : std::string("camera predictor: still learning (the plain rule is used meanwhile)"), C_GRAY, 58); }
+            { std::string gt; int gc;   // brain v1: load governor status
+              if (!g_cfg.brain || !g_cfg.brainLoad) { gt = "OFF - background jobs on the fixed cadence"; gc = C_GRAY; }
+              else if (g_govSnap.frames <= 0) { gt = "waiting for frames"; gc = C_GRAY; }
+              else { gt = Fmt("on - pressure %.0f%%, jitter %.0f%%, own jobs %.2f ms/s", (double)g_govSnap.pressure * 100.0, (double)g_govSnap.jitter * 100.0, (double)g_govSnap.spentMsPerSec); gc = C_GREEN; }
+              OvLine l = OvMk(OVK_STAT, "Load", gc, gt); l.on = true; L.push_back(l);
+              if (g_cfg.brain && g_cfg.brainLoad && g_govSnap.frames > 0) OvWrap(L, Fmt("learned cost (ms): prune %.2f, DLSS-G state %.2f, refresh query %.2f, frame stats %.2f. Only WHEN these internal jobs run is decided; hard maximum wait applies.", (double)g_govSnap.cost[0], (double)g_govSnap.cost[1], (double)g_govSnap.cost[2], (double)g_govSnap.cost[3]), C_GRAY, 58); }
+            L.push_back(OvMk(OVK_GAP, "")); L.push_back(OvMk(OVK_HINT, "Left/Right select a node   Enter/Esc back to the menu   (blue = healthy, red = error right now)", C_GRAY));
+            return;
+        }
         { DiagRuntime rt; DiagRuntimeFill(rt); std::string gpu; { for (auto& g : g_gpus) if (g.nvidia && !g.software) { gpu = g.name; break; } }
           if (!gpu.empty()) L.push_back(OvMk(OVK_STAT, "GPU", C_TEXT, gpu));
           char b[160];
@@ -292,11 +390,16 @@ static void OvBuild(std::vector<OvLine>& L) {
         tgl(I_MENUDET, "Full-screen menu detection", g_cfg.menuDetect);
         tgl(I_DYNRES, "Dynamic resolution (auto-detect)", g_cfg.dynRes);
         { std::string vv = g_cfg.hudless == 0 ? "OFF" : g_cfg.hudless == 1 ? Fmt("ON  (draw %d)", g_cfg.hudlessDraw) : g_hc.phase.load() == 4 ? std::string("AUTO: no clear result (see log)") : Fmt("AUTO: learning %d/6 votes", HudCalVotes()); cho(I_HUDLESS, "HUD-less capture", vv); }
+        sec("BRAIN");
+        tgl(I_BRAIN, "Brain: adapt MV fade to camera motion", g_cfg.brain);
+        tgl(I_BRAINLOAD, "Brain: time background jobs to calm frames", g_cfg.brainLoad);
         sec("OVERLAY");
         cho(I_POS, "Overlay position", posN[g_cfg.overlayPos & 3]);
         cho(I_SCALE, "Overlay size", Fmt("%d%%", g_cfg.overlayScale));
         cho(I_OPACITY, "Overlay opacity", Fmt("%d%%", g_cfg.overlayOpacity));
+        { static const char* hq[] = { "Low", "Medium", "High" }; cho(I_HOLOQ, "Hologram detail", hq[g_cfg.holoQuality % 3]); }
         sec("TOOLS");
+        act(I_HOLO, "System hologram (live health)");
         act(I_REPORT, "Write debug report now");
         act(I_BUNDLE, "Create support zip (logs)");
         act(I_CLOSE, "Close menu");
@@ -463,6 +566,7 @@ static bool OvPanelRender(const std::vector<OvLine>& L, int px) {
         case OVK_TOAST: h = m.hudH; need = (int)(m.fs * 1.25f) + tw(g_pn.fSemi, l.t); break;
         case OVK_HINT: h = m.hintH; need = tw(g_pn.fHint, l.t); break;
         case OVK_GRAPH: h = m.graphH; need = m.fs * 14; break;
+        case OVK_HOLO: h = (int)(m.fs * 20.f + .5f); need = m.fs * 28; break;
         case OVK_GAP: h = m.gapH; break;
         case OVK_DIV: h = m.divH; break;
         default: h = m.noteH; need = tw(g_pn.fReg, l.t); break;
@@ -541,6 +645,18 @@ static bool OvPanelRender(const std::vector<OvLine>& L, int px) {
         case OVK_GRAPH: {
             int g0 = Y + 2, g1 = Y + H - 2; double top = OvDrawGraph(L0, g0, R0, g1, m.fs);
             if (top > 0.0) { char tb[32]; snprintf(tb, sizeof tb, "%.0f ms", top); txt(g_pn.fHint, tb, L0 + 6, g0 + (int)(m.fsSm * 0.9f), 0, 138, 146, 164, 0.95f, 0); }
+            break; }
+        case OVK_HOLO: {   // v28: neural-network hologram drawn straight into the panel bitmap, labels through the normal text path
+            const int hx0 = L0, hw = R0 - L0; holo::Canvas cv{ (uint32_t*)g_pn.bits + (size_t)Y * g_pn.capW + hx0, g_pn.capW, hw, std::min(H, h - m.sh - Y) };
+            if (cv.w > 40 && cv.h > 40) {
+                holo::NodePos np[holo::N_COUNT]; int sel = g_ov.holoSel; holo::Render(cv, (double)GetTickCount(), sel, g_cfg.holoQuality, np);
+                for (int i = 0; i < holo::N_COUNT; i++) {
+                    const int stt = holo::g_state.shown[i]; const bool right = np[i].x >= cv.w * 0.5f; std::string nm = holo::kNodeName[i]; if (stt == holo::ST_ERR) nm += " - ERROR";
+                    int lr, lg, lb; if (stt == holo::ST_ERR) { lr = 255; lg = 120; lb = 110; } else if (stt == holo::ST_WARN) { lr = 250; lg = 204; lb = 72; } else if (i == sel) { lr = 244; lg = 247; lb = 252; } else { lr = 150; lg = 166; lb = 192; }
+                    float depthFade = 0.55f + 0.45f * std::min(1.f, std::max(0.f, (np[i].z + 1.1f) / 2.2f));
+                    txt(i == sel || stt == holo::ST_ERR ? g_pn.fSemi : g_pn.fHint, nm, hx0 + (int)(np[i].x + (right ? np[i].r + 6.f : -np[i].r - 6.f)), Y + (int)np[i].y, right ? 0 : 1, lr, lg, lb, (i == sel || stt == holo::ST_ERR) ? 1.f : depthFade, 0);
+                }
+            }
             break; }
         case OVK_GAP: break;
         default: if (l.col == C_TEXT) { cr = 214; cg = 219; cb = 230; } txt(g_pn.fReg, l.t, L0, cy, 0, cr, cg, cb, 1.f, 0); break;   // OVK_TEXT / OVK_NOTE
