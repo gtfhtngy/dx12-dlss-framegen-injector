@@ -83,6 +83,17 @@ showframetime=0
 overlaypos=0
 overlayscale=100
 overlayopacity=80
+# holoquality : density of the system hologram (menu > Tools > System hologram): 0 low, 1 medium, 2 high. It only runs while it is open.
+holoquality=1
+# brain : 1.1.8 1 = the brain adapts the motion-vector fade window (where large vectors start to fade) to the camera motion that is measured on the CPU. Safe limits, nothing is stored,
+#        it never touches the FG multiplier / pause limit. 0 = fixed values (exactly 1.1.7). Menu > Brain switches it live; compare both with the 'Brain:' lines in the log.
+brain=1
+# brainlearn : brain v1. 1 = a small model learns the camera motion online (from the camera itself, nothing stored) and opens the MV fade window one frame earlier when the camera accelerates.
+#               Same hard limits as brain=1, it can only RAISE the plain-rule value. 0 = the plain brain v0 rule. Needs brain=1.
+brainlearn=1
+# brainload : brain v1. 1 = the injector learns what its own periodic jobs (buffer prune, DLSS-G state poll, refresh-rate query, frame statistics) cost on this PC and runs them in calm frames,
+#             within a small time budget. Every job has a hard maximum wait; only WHEN internal jobs run changes. 0 = fixed cadence as before. Needs brain=1. Menu > Brain switches it live.
+brainload=1
 overlayblock=1
 overlayhook=1
 autosave=1
