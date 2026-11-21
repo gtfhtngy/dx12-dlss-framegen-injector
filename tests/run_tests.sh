@@ -8,6 +8,12 @@ $CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -o tests/bin/test_logic te
 $CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -o tests/bin/replay_viewbuf tests/replay_viewbuf.cpp
 $CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -o tests/bin/test_c2p tests/test_c2p.cpp
 $CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -o tests/bin/test_snpack tests/test_snpack.cpp
+$CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -o tests/bin/test_holo tests/test_holo.cpp
+echo "== system hologram (v28): geometry, error hold, render cost"
+tests/bin/test_holo tests/bin
+$CXX -std=c++17 -O1 -Wall -Wno-misleading-indentation -o tests/bin/test_brain tests/test_brain.cpp
+echo "== brain v0 + v1 (1.1.8): camera-motion sensor, safe limits, trouble hold, learned camera predictor, learned load governor (simulated game), fuzz"
+tests/bin/test_brain
 echo "== ClipToPrevClip reprojection tests (1.1.6)"
 tests/bin/test_c2p
 echo "== SNLZ shader-cache codec (1.1.7)"
