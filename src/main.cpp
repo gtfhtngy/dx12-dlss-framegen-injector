@@ -14,7 +14,7 @@
 //      HUD-less copy of the back buffer) every frame, sets Streamline common constants, Reflex/PCL markers and
 //      DLSS-G options (mode on, numFramesToGenerate = mult-1).
 // NOT verified on hardware by the author of this file - see README for the staged bring-up (stage=1,2,3).
-#define SN_VERSION "1.1.7"
+#define SN_VERSION "1.1.8"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -1023,37 +1023,17 @@ static void DeferRelease(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* 
 }
 
 // ------------------------------------------------------------------ MV compute pass: UE4 velocity (R16G16_UNORM, 0 = static) + depth + ClipToPrevClip -> pixel MVs (R16G16_FLOAT) + depth copy (R32_FLOAT)
-static const char* kMvHlsl =
-"cbuffer C : register(b0) { row_major float4x4 M; uint2 dim; float2 sgn; uint2 fdim; };\n"
-"Texture2D<float2> V : register(t0);\n"
-"Texture2D<float>  D : register(t1);\n"
-"RWTexture2D<float2> O : register(u0);\n"
-"RWTexture2D<float>  OD : register(u1);\n"
-"bool bad2(float2 a) { return any(isnan(a)) || any(isinf(a)); }\n"
-"[numthreads(8,8,1)]\n"
-"void main(uint3 t : SV_DispatchThreadID)\n"
-"{\n"
-"    if (t.x >= fdim.x || t.y >= fdim.y) return;\n"
-"    if (t.x >= dim.x || t.y >= dim.y) {   // outside the real view rect (dynamic resolution): never leave stale data in the buffer\n"
-"        O[t.xy] = float2(0.0, 0.0); OD[t.xy] = 0.0; return;\n"
-"    }\n"
-"    float2 v = V.Load(int3(t.xy, 0));\n"
-"    float z = D.Load(int3(t.xy, 0));\n"
-"    if (isnan(z) || isinf(z)) z = 0.0;\n"
-"    z = saturate(z);\n"
-"    float2 back = float2(0.0, 0.0);\n"
-"    if (v.x > 0.0) {\n"
-"        back = (v - 32767.0/65535.0) / (0.499*0.5);\n"
-"    } else {\n"
-"        float2 sp = float2((t.x + 0.5)/dim.x*2.0 - 1.0, 1.0 - (t.y + 0.5)/dim.y*2.0);\n"
-"        float4 pc = mul(float4(sp, z, 1.0), M);\n"
-"        if (pc.w > 1e-6) back = sp - pc.xy / pc.w;   // w <= 0: point behind the previous camera -> no usable reprojection\n"
-"    }\n"
-"    // guard: NaN / Inf / absurd vectors (> 25% of the screen in one frame) are what smears whole image regions in interpolated frames\n"
-"    if (bad2(back) || abs(back.x) > 0.5 || abs(back.y) > 0.5) back = float2(0.0, 0.0);\n"
-"    O[t.xy] = float2(-back.x * 0.5 * dim.x * sgn.x, back.y * 0.5 * dim.y * sgn.y);\n"
-"    OD[t.xy] = z;\n"
-"}\n";
+#include "brain.h"   // 1.1.8: brain v0 (pure C++): camera-motion sensor + safe adaptive MV falloff; brain v1: learned camera predictor + learned load governor
+static brain::Brain g_brain; static brain::Snapshot g_brainSnap; static brain::Sense g_brainIn;   // g_brainIn: per-frame flags filled in OnPresentBegin, the matrix part is added inside RunMvPass
+static brain::Governor g_gov; static brain::GovSnapshot g_govSnap;   // brain v1: learned load governor (cadence of the injector's own housekeeping jobs)
+#include "mv_shader.inc"   // kMvHlsl (v2: LDS tile, hybrid velocity/reprojection, reverse-Z aware, dilation, hole fill, soft falloff)
+
+// depth = zA + zB / viewZ  (ViewToClip[2][2], [3][2]); zB > 0 <=> reverse-Z. UE (infinite far, reverse-Z): zA = 0, zB = near. Falls back to that when the matrix is unusable.
+static void MvDepthParams(const float* vtc, float& A, float& B) {
+    A = vtc[10]; B = vtc[14];
+    if (!std::isfinite(A) || !std::isfinite(B) || fabsf(B) < 1e-6f) { A = 0.f; B = 10.f; }
+    static int s_l = 0; if (s_l++ < 2) Log("MV depth params: zA=%g zB=%g -> %s depth", (double)A, (double)B, B > 0.f ? "reverse-Z" : "standard-Z");
+}
 static ID3D12RootSignature* g_mvRS = nullptr; static ID3D12PipelineState* g_mvPSO = nullptr; static ID3D12DescriptorHeap* g_mvHeap = nullptr;
 static ID3D12Resource* g_mvOut = nullptr; static ID3D12Resource* g_depthOut = nullptr; static UINT g_mvInc = 0; static bool g_mvFailed = false; static int g_mvSlot = 0;
 // the MV / depth outputs are rotated over MV_BUFSETS sets: with frame generation the GPU may still be reading frame N's inputs while frame N+1 already writes its own
@@ -1197,12 +1177,24 @@ static bool RunMvPass(UINT W, UINT H, UINT VW, UINT VH, ID3D12Resource* vel, ID3
     c.ptr += g_mvInc; sv.Format = DepthSrvFormat(ResDesc(depth).Format); g_device->CreateShaderResourceView(depth, &sv, c);
     c.ptr += g_mvInc; D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; uv.Format = DXGI_FORMAT_R16G16_FLOAT; g_device->CreateUnorderedAccessView(g_mvOut, nullptr, &uv, c);
     c.ptr += g_mvInc; uv.Format = DXGI_FORMAT_R32_FLOAT; g_device->CreateUnorderedAccessView(g_depthOut, nullptr, &uv, c);
-    struct { float m[16]; UINT w, h; float sx, sy; UINT fw, fh; } k; { std::lock_guard<std::mutex> lk(g_cam.camMx); memcpy(k.m, g_cam.c2p, sizeof k.m); }
-    k.w = VW; k.h = VH; k.sx = (float)g_cfg.mvSX; k.sy = (float)g_cfg.mvSY; k.fw = W; k.fh = H;
+    struct { float m[16]; UINT dimP, fdimP; float sx, sy; float zA, zB; float f0, f1; } k; static_assert(sizeof k == 24 * 4, "24 root dwords");
+    { std::lock_guard<std::mutex> lk(g_cam.camMx); memcpy(k.m, g_cam.c2p, sizeof k.m); MvDepthParams(g_cam.vtcNoAA, k.zA, k.zB); }
+    k.dimP = VW | (VH << 16); k.fdimP = W | (H << 16); k.sx = (float)g_cfg.mvSX; k.sy = (float)g_cfg.mvSY;   // sizes < 65536
+    {   // 1.1.8 brain v0: the falloff window of the shader. try/catch: the brain must never be able to break the MV pass -> any problem = the fixed 1.1.7 values
+        k.f0 = 0.35f; k.f1 = 1.0f;
+        try {
+            brain::Sense bs = g_brainIn; memcpy(bs.c2p, k.m, sizeof bs.c2p); bs.zA = k.zA; bs.zB = k.zB; g_brain.enabled = g_cfg.brain != 0; g_brain.learn = g_cfg.brainLearn != 0;
+            const brain::Mode pm = g_brain.mode; brain::Out bo = g_brain.Step(bs); g_brain.Publish(g_brainSnap);
+            if (std::isfinite(bo.f0) && std::isfinite(bo.f1) && bo.f1 > bo.f0) { k.f0 = bo.f0; k.f1 = bo.f1; }
+            static int s_bn = 0, s_bl = 0;   // log: every mode change (first 40) + one summary line about every 10 s of MV frames
+            if ((g_brain.mode != pm && s_bn++ < 40) || (++s_bl % 600) == 0)
+                Log("Brain: %s cam=%.3f fall0=%.3f fall1=%.3f adapted=%d%% safe-holds=%d learn=%d predictor %s rms-error=%.4f (frame %d)", g_brain.mode == brain::MODE_OFF ? "OFF" : g_brain.mode == brain::MODE_SAFE ? "SAFE" : "ADAPT", g_brain.lastCam, k.f0, k.f1, (int)g_brainSnap.adaptedPct, (int)g_brainSnap.troubleHolds, (int)g_brainSnap.learnOn, g_brainSnap.predReady ? "ready" : "learning", (double)g_brainSnap.predErr, bs.frame);
+        } catch (...) { k.f0 = 0.35f; k.f1 = 1.0f; }
+    }
     ID3D12DescriptorHeap* hh[1] = { g_mvHeap }; cl->SetDescriptorHeaps(1, hh);
     cl->SetComputeRootSignature(g_mvRS); cl->SetPipelineState(g_mvPSO);
-    cl->SetComputeRoot32BitConstants(0, 22, &k, 0); cl->SetComputeRootDescriptorTable(1, g);
-    cl->Dispatch((W + 7) / 8, (H + 7) / 8, 1);   // v22: whole buffer (the part outside the view rect is zeroed by the shader)
+    cl->SetComputeRoot32BitConstants(0, 24, &k, 0); cl->SetComputeRootDescriptorTable(1, g);
+    cl->Dispatch((W + 15) / 16, (H + 7) / 8, 1);   // v22: whole buffer (the part outside the view rect is zeroed by the shader)
     D3D12_RESOURCE_BARRIER o[2] = {}; for (int i = 0; i < 2; i++) { o[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; o[i].Transition.pResource = i ? g_depthOut : g_mvOut; o[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; o[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; o[i].Transition.StateAfter = kOutState; }
     oResBarrier(cl, 2, o);
     if (nb) oResBarrier(cl, nb, post);
@@ -1346,11 +1338,12 @@ static bool BuildConstants(sl::Constants& c, bool reset) {
     c.mvecScale = sl::float2(1.0f / (float)EffW(), 1.0f / (float)EffH());
     c.cameraPinholeOffset = sl::float2(0.f, 0.f);
     c.cameraPos = sl::float3(0.f, 0.f, 0.f); c.cameraUp = sl::float3(0.f, 1.f, 0.f); c.cameraRight = sl::float3(1.f, 0.f, 0.f); c.cameraFwd = sl::float3(0.f, 0.f, 1.f);
-    float nearP = vtc[14]; if (!(nearP > 0.f) || !std::isfinite(nearP)) nearP = 10.f;
+    float zA, zB; MvDepthParams(vtc, zA, zB); const bool revZ = zB > 0.f;
+    float nearP = revZ ? zB / (1.f - zA) : -zB / zA; if (!(nearP > 0.f) || !std::isfinite(nearP)) nearP = 10.f;   // reverse: A + B/n = 1, standard: A + B/n = 0
     c.cameraNear = nearP; c.cameraFar = (float)g_cfg.farPlane;
     c.cameraFOV = 2.0f * atanf(1.0f / vtc[5]); c.cameraAspectRatio = vtc[5] / vtc[0];
-    c.depthInverted = sl::Boolean::eTrue; c.cameraMotionIncluded = sl::Boolean::eTrue; c.motionVectors3D = sl::Boolean::eFalse;
-    c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse; c.orthographicProjection = sl::Boolean::eFalse; c.motionVectorsDilated = sl::Boolean::eFalse; c.motionVectorsJittered = sl::Boolean::eFalse;
+    c.depthInverted = revZ ? sl::Boolean::eTrue : sl::Boolean::eFalse; c.cameraMotionIncluded = sl::Boolean::eTrue; c.motionVectors3D = sl::Boolean::eFalse;
+    c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse; c.orthographicProjection = sl::Boolean::eFalse; c.motionVectorsDilated = sl::Boolean::eTrue;   /* shader dilates silhouettes (SN_DILATE=1) */ c.motionVectorsJittered = sl::Boolean::eFalse;
     return true;
 }
 
@@ -1523,12 +1516,16 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     { LARGE_INTEGER n; QueryPerformanceCounter(&n); double dtMs = s_last.QuadPart ? (double)(n.QuadPart - s_last.QuadPart) * 1000.0 / (double)s_qf.QuadPart : 0.0; s_last = n;
       if (dtMs > 0.0 && dtMs < 1000.0) s_ema += (dtMs - s_ema) * 0.05;
       if (dtMs > 200.0) s_stallHold = 10;   // 1.1.2: the game is re-creating its render targets right now: do not touch its (possibly just destroyed / re-used) depth buffer, do not feed DLSS-G a half-built frame
-      if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); } }   // after a long stall the history is useless
+      if (dtMs > 250.0) { g_forceReset = true; static int nh = 0; if (nh++ < 20) Log("hitch %.0f ms at frame %d -> frame generation reset", dtMs, fr); }   // after a long stall the history is useless
+      g_gov.enabled = g_cfg.brain != 0 && g_cfg.brainLoad != 0; g_gov.Frame(fr, dtMs, s_ema);   // brain v1: learned load governor (pure math, a few dozen flops)
+      if ((fr % 30) == 0) g_gov.Publish(g_govSnap);
+      if (g_gov.enabled && fr > 0 && (fr % 3000) == 0) Log("Governor: pressure=%.2f jitter=%.2f credit=%.2fms own-jobs=%.3f ms/s | learned cost ms prune=%.3f state=%.3f refresh=%.3f rate=%.3f | runs %d/%d/%d/%d deferred %d/%d/%d/%d forced %d/%d/%d/%d (frame %d)", (double)g_govSnap.pressure, (double)g_govSnap.jitter, (double)g_govSnap.credit, (double)g_govSnap.spentMsPerSec, (double)g_govSnap.cost[0], (double)g_govSnap.cost[1], (double)g_govSnap.cost[2], (double)g_govSnap.cost[3], g_govSnap.runs[0], g_govSnap.runs[1], g_govSnap.runs[2], g_govSnap.runs[3], g_govSnap.defers[0], g_govSnap.defers[1], g_govSnap.defers[2], g_govSnap.defers[3], g_govSnap.forced[0], g_govSnap.forced[1], g_govSnap.forced[2], g_govSnap.forced[3], fr); }
     FlushDeferredRes();
     HudCalOnPresent(fr); AcLateCheck(fr); if (fr == 300 || fr == 1800) CrashChain();   // v27
-    if (fr == 10 || (fr % 300) == 0) UpdateRefreshRate(sc);
+    if (fr == 10 || g_gov.Due(brain::T_REFRESH, fr)) { double tg0 = NowMs(); UpdateRefreshRate(sc); g_gov.Done(brain::T_REFRESH, fr, NowMs() - tg0); }   // brain v1: cadence chosen by the governor (disabled = every 300 frames, as before)
     UpdateViewRect(fr);   // v20
-    if ((fr % 20) == 0) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(24); } g_tPrune = NowMs() - tp0; }   // v23: small slices (was: everything every 120 frames)
+    { const bool pruneUrgent = g_bufBytes > (UINT64)g_cfg.bufMaxMB * (1ull << 20) / 100 * 75;   // brain v1: registry above 75 % of its byte cap -> the governor must not delay the prune (unlocked read of a counter, only used as a hint)
+      if (g_gov.Due(brain::T_PRUNE, fr, pruneUrgent)) { double tp0 = NowMs(); { std::unique_lock<std::shared_mutex> lkb(g_bufMx); PruneBuffersLocked(24); } g_tPrune = NowMs() - tp0; g_gov.Done(brain::T_PRUNE, fr, g_tPrune); } }   // v23: small slices (was: everything every 120 frames)
     if (g_cfg.renderW <= 0 && (fr % 60) == 0) { DXGI_SWAP_CHAIN_DESC d = {}; if (SUCCEEDED(sc->GetDesc(&d)) && d.BufferDesc.Width && (d.BufferDesc.Width != g_autoW.load() || d.BufferDesc.Height != g_autoH.load())) { g_autoW = d.BufferDesc.Width; g_autoH = d.BufferDesc.Height; Log("auto render size: swap chain is now %ux%u", g_autoW.load(), g_autoH.load()); } }   // v18: follow resolution changes (renderw=0)
     if (fr == 600 || fr == 3000) CensusLog("periodic");
     if (fr == 3000 && g_cfg.hookFast) g_censusOn = false;   // 1.1.0: the census is only a diagnostic; it took a global mutex on every CreateRTV / CopyTextureRegion of an internal-size texture
@@ -1597,6 +1594,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         D3D12_RESOURCE_DESC vd = ResDesc(g_pinVel), dd = ResDesc(g_pinDepth); cachedVd = vd;   // v25: reused below (was queried again)
         if (vd.Width == dd.Width && vd.Height == dd.Height) {
             double tm0 = NowMs(); UINT bw = (UINT)vd.Width, bh = vd.Height, vw = bw, vh = bh; { int gw = g_viewW.load(), gh = g_viewH.load(); if (g_cfg.viewRect && gw > 0 && gh > 0 && (UINT)gw <= bw && (UINT)gh <= bh) { vw = (UINT)gw; vh = (UINT)gh; } }
+            g_brainIn.frame = fr; g_brainIn.emaMs = s_ema; g_brainIn.cut = cutNow; g_brainIn.stall = s_stallHold > 0; g_brainIn.susp = s_susp; g_brainIn.camOk = camOk; g_brainIn.mvFailed = g_mvFailed;
             bool mvok = RunMvPass(bw, bh, vw, vh, g_pinVel, g_pinDepth); g_tMv = NowMs() - tm0;
             if (mvok) {
                 bool reset = g_forceReset.exchange(false) || cutNow || !g_wasOn || (fr - g_lastOnFrame) > 1;   // v23: camera cut -> reset flag instead of FG off
@@ -1646,8 +1644,8 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
     sl::Result ro = sl::Result::eOk; if (!skipOpt) ro = p_DLSSGSetOptions(vp, opt);
     s_lastOff = (opt.mode == sl::DLSSGMode::eOff); g_lastOptRes = (ro == sl::Result::eOk) ? 0 : (int)ro;
     static int s_o = 0; if (ro != sl::Result::eOk && s_o++ < 20) Log("slDLSSGSetOptions(mode=%d gen=%u) -> %d %s", (int)opt.mode, opt.numFramesToGenerate, (int)ro, SlStr(ro));
-    if (p_DLSSGGetState && (g_stateLog < 6 || (fr % 30) == 0) && fr > g_cfg.warmup) {
-        sl::DLSSGState st{}; sl::Result rs = p_DLSSGGetState(vp, st, nullptr);
+    if (p_DLSSGGetState && fr > g_cfg.warmup && (g_stateLog < 6 || g_gov.Due(brain::T_STATE, fr))) {
+        const double tgs = NowMs(); sl::DLSSGState st{}; sl::Result rs = p_DLSSGGetState(vp, st, nullptr);
         static unsigned s_lastStatus = 0xFFFFFFFFu; bool chg = rs == sl::Result::eOk && (unsigned)st.status != s_lastStatus; if (rs == sl::Result::eOk) s_lastStatus = (unsigned)st.status;
         if (rs == sl::Result::eOk) {
             g_maxGen = st.numFramesToGenerateMax; g_haveState = true; g_lastStatus = (unsigned)st.status; g_stMinWH = st.minWidthOrHeight; if (st.estimatedVRAMUsageInBytes) g_stVramMB = st.estimatedVRAMUsageInBytes >> 20;
@@ -1662,7 +1660,7 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
             static unsigned s_lastPres = 0; static int s_lastPresFr = -100000; unsigned want = opt.numFramesToGenerate + 1;
             if (st.numFramesActuallyPresented != s_lastPres && st.numFramesActuallyPresented > 0 && fr - s_lastPresFr >= 30) { if (s_lastPres) Log("DLSS-G presents %u frame(s) per game frame (requested %u, GPU max %u) at frame %d, base fps %.1f", st.numFramesActuallyPresented, want, st.numFramesToGenerateMax + 1, fr, g_st.fps); s_lastPres = st.numFramesActuallyPresented; s_lastPresFr = fr; }
         }
-        g_stateLog++;
+        g_stateLog++; g_gov.Done(brain::T_STATE, fr, NowMs() - tgs);
     }
     // v30: the VRAM estimate is expensive (Streamline: "too expensive to do per frame") -> ask for it ONCE per FG start / size change / menu toggle, never every frame
     if (g_cfg.showVram && p_DLSSGGetState && inputs && opt.mode == sl::DLSSGMode::eOn && fr > g_cfg.warmup) {
@@ -1680,14 +1678,15 @@ static FrameCtx OnPresentBeginCore(IDXGISwapChain* sc) {
         static LARGE_INTEGER s_f = {}, s_t0 = {}; static int s_fr0 = 0; static UINT s_pc0 = 0; static bool s_have = false;
         if (!s_f.QuadPart) QueryPerformanceFrequency(&s_f);
         static bool s_retry = false;   // 1.1.7: GetFrameStatistics fails with DXGI_ERROR_FRAME_STATISTICS_DISJOINT (0x887A000B) right after start-up / a mode change -> try again in 30 frames instead of 300
-        if (fr > g_cfg.warmup && ((fr % 300) == 0 || (s_retry && (fr % 30) == 0))) {
-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (fr > g_cfg.warmup && (g_gov.Due(brain::T_RATE, fr) || (s_retry && (fr % 30) == 0))) {
+            const double tgr = NowMs(); LARGE_INTEGER now; QueryPerformanceCounter(&now);
             DXGI_FRAME_STATISTICS fs = {}; HRESULT hs = sc->GetFrameStatistics(&fs);
             if (s_have && SUCCEEDED(hs)) {
                 double dt = (double)(now.QuadPart - s_t0.QuadPart) / (double)s_f.QuadPart; int dFr = fr - s_fr0; UINT dPc = fs.PresentCount - s_pc0;
                 Log("RATE: game present %.1f/s | swapchain PresentCount %.1f/s | ratio %.2f (expected about %.1f with the current multiplier, 1.0 = not generating)", dFr / dt, dPc / dt, dFr ? (double)dPc / dFr : 0.0, SnExpectedRatio(g_wasOn ? CurMult() : 1));
             } else if (FAILED(hs)) { static int s_gf = 0; if (s_gf++ < 3) Log("RATE: GetFrameStatistics failed 0x%08X (will retry in 30 frames)", (unsigned)hs); }
             s_retry = FAILED(hs); s_t0 = now; s_fr0 = fr; s_pc0 = SUCCEEDED(hs) ? fs.PresentCount : 0; s_have = SUCCEEDED(hs);
+            g_gov.Done(brain::T_RATE, fr, NowMs() - tgr);
         }
     }
     Marker(sl::PCLMarker::ePresentStart, ctx);
